@@ -149,7 +149,6 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
     let work = mountpoint.join(&args.work_dir);
     let tmp = work.join("tmp");
     let _ = fs::create_dir_all(&tmp);
-    let _ = fs::create_dir_all(work.join("cwd"));
     // LTP's own runltp exports LTPROOT and prepends testcases/bin to PATH;
     // tests rely on both (shell tests `. fs_bind_lib.sh` / `. tst_test.sh`
     // resolve via PATH, and tst_test's resource copy plus *_child helper
@@ -175,7 +174,11 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
         let binpath = bin_dir.join(binname);
         let mut cmdc = Command::new(binpath.clone());
         cmdc.args(&binargs)
-            .current_dir(work.join("cwd"))
+            // keep the test's cwd off the filesystem under test: a chdir into
+            // a network/FUSE mount makes every spawn hostage to transient
+            // lookup errors there (observed batches of spurious ENOENT on
+            // drive9/FUSE under commit load); the mount is exercised through
+            // TMPDIR/LTP_TMPDIR instead, like runltp does
             .env("LTPROOT", ltp_dir)
             .env("PATH", &child_path)
             .env("TMPDIR", &tmp)
@@ -187,25 +190,39 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
                 Ok(())
             });
         }
-        let mut child = match cmdc
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                // binary missing from this install: count as broken
-                broken += 1;
-                results.push(json!({
-                    "name": name, "result": "broken", "exitCode": Value::Null,
-                    "error": format!("spawn {}: {e}", binpath.display()),
-                }));
-                continue;
-            }
-        };
         let deadline = Duration::from_secs(args.timeout.max(1));
         let t0 = Instant::now();
+        let mut child = None;
+        let mut spawn_err = None;
+        for attempt in 0..3 {
+            match cmdc
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    spawn_err = Some(e);
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+        let Some(mut child) = child else {
+            // binary missing from this install: count as broken
+            let e = spawn_err.unwrap();
+            broken += 1;
+            results.push(json!({
+                "name": name, "result": "broken", "exitCode": Value::Null,
+                "error": format!("spawn {}: {e}", binpath.display()),
+            }));
+            continue;
+        };
         let mut timed_out = false;
         let code = loop {
             match child.try_wait() {
