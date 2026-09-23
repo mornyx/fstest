@@ -1,10 +1,15 @@
 # fstest
 
-Filesystem functional & benchmark test suites for mount points, porting community test tools to Rust. Each suite is a subcommand with its own options: `fstest <suite> [OPTIONS] <MOUNTPOINT>` (see `fstest <suite> --help`). Logs go to stderr via `log`/`env_logger` (`RUST_LOG` overrides the level), the final result is printed to stdout as JSON, and `--json <file>` can additionally write it to a file. Exit code is 0 only when every phase reports ok.
+Filesystem functional & benchmark test suites.
 
-Defaults policy: ported suites (`smallfile`, `fsmark`) keep the upstream tools' defaults so results stay directly comparable with them; wrapped suites (`fio`) pick mount-point best-practice defaults instead of the engine's raw defaults (which assume local block devices — see the notes on FUSE/network filesystems below).
+One Rust binary that ports and wraps the community's filesystem test tools as uniform subcommands: `fstest <suite> [OPTIONS] <MOUNTPOINT>` (options via `fstest <suite> --help`). Logs go to stderr (level via `RUST_LOG`), the final result is emitted as JSON on stdout — `--json <file>` writes a copy — and the exit code is 0 only when every phase reports ok.
 
-Current suites: `smallfile`, `fsmark`, `fio`, `mdtest`, `mdworkbench`, `pjdfstest`, `fsx`, `fsstress`, `ltp`.
+| | suites |
+|---|---|
+| benchmark | [smallfile](#smallfile) · [fsmark](#fsmark) · [fio](#fio) · [mdtest](#mdtest) · [mdworkbench](#mdworkbench) |
+| functional | [pjdfstest](#pjdfstest) · [fsx](#fsx) · [fsstress](#fsstress) · [ltp](#ltp) · [stdfs](#stdfs) |
+
+Defaults policy: ported suites keep the upstream tools' defaults so numbers stay directly comparable; wrapped suites pick mount-point best-practice defaults instead of engine defaults that assume local block devices (see [Platform notes](#platform-notes)).
 
 ## smallfile
 
