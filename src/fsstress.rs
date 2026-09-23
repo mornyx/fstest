@@ -259,6 +259,7 @@ impl ThreadState {
 
 fn report_err(st: &mut ThreadState, op: &str, path: &Path, e: &std::io::Error, verbose: bool) {
     st.errors += 1;
+    SIGBUS_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if verbose {
         warn!("{}: {op} {}: {}", st.tid, path.display(), e);
     }
@@ -324,9 +325,56 @@ fn do_fallocate(st: &mut ThreadState, fd: i32, mode: i32, off: u64, len: u64, pa
 }
 
 extern "C" fn sigbus_handler(_: libc::c_int) {
-    eprintln!("fsstress: SIGBUS (concurrent truncate vs mmap race)");
-    unsafe { libc::_exit(139) };
+    // async-signal-safe: no allocation, no locks — fixed buffers, raw write(2)
+    const MSG: &[u8] = b"fsstress: SIGBUS (concurrent truncate vs mmap race); emitting failed report and exiting\n";
+    const CAUSE: &[u8] = b"SIGBUS: concurrent truncate vs mmap race aborted the run (upstream fsstress recovers per forked child; the threaded port cannot)";
+    let mut buf = [0u8; 512];
+    let mut w = 0usize;
+    w = push_bytes(&mut buf, w, b"{\"suite\":\"fsstress\",\"status\":\"failed\",\"failure\":\"");
+    w = push_bytes(&mut buf, w, CAUSE);
+    w = push_bytes(&mut buf, w, b"\",\"totalOps\":");
+    w = push_u64(&mut buf, w, SIGBUS_OPS.load(std::sync::atomic::Ordering::Relaxed));
+    w = push_bytes(&mut buf, w, b",\"totalErrors\":");
+    w = push_u64(&mut buf, w, SIGBUS_ERRORS.load(std::sync::atomic::Ordering::Relaxed));
+    w = push_bytes(&mut buf, w, b"}\n");
+    unsafe {
+        libc::write(2, MSG.as_ptr() as *const libc::c_void, MSG.len());
+        libc::write(1, buf.as_ptr() as *const libc::c_void, w);
+        let fd = SIGBUS_JSON_FD.load(std::sync::atomic::Ordering::Relaxed);
+        if fd >= 0 {
+            libc::lseek(fd, 0, 0);
+            libc::write(fd, buf.as_ptr() as *const libc::c_void, w);
+        }
+        libc::_exit(1);
+    }
 }
+
+fn push_bytes(buf: &mut [u8], mut w: usize, b: &[u8]) -> usize {
+    let n = (buf.len() - w).min(b.len());
+    buf[w..w + n].copy_from_slice(&b[..n]);
+    w + n
+}
+
+fn push_u64(buf: &mut [u8], mut w: usize, mut v: u64) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let n = (buf.len() - w).min(tmp.len() - i);
+    buf[w..w + n].copy_from_slice(&tmp[i..i + n]);
+    w + n
+}
+
+// progress counters the SIGBUS handler reads after a fault
+static SIGBUS_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGBUS_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGBUS_JSON_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn install_sigbus_guard() {
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -925,7 +973,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         .map(|(o, n, f, _)| {
             (
                 *n,
-                if linux
+                if (linux
                     || !matches!(
                         o,
                         Op::Fallocate
@@ -935,7 +983,12 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
                             | Op::Insert
                             | Op::CloneRange
                             | Op::CopyRange
-                    )
+                    ))
+                    // mmap ops race with concurrent truncate: upstream survives
+                    // the resulting SIGBUS per forked child, the threaded port
+                    // would abort the whole run, so they are opt-in via
+                    // `-f mread=N` / `-f mwrite=N`
+                    && !matches!(o, Op::MRead | Op::MWrite)
                 {
                     *f
                 } else {
@@ -982,6 +1035,14 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     if table.is_empty() {
         return Err("all op frequencies are zero".into());
     }
+    // pre-open the --json file so the async-signal-safe SIGBUS handler can
+    // still honor the "always emit a JSON report" contract
+    if let Some(path) = &args.json {
+        if let Ok(f) = fs::OpenOptions::new().create(true).write(true).truncate(true).open(path) {
+            use std::os::unix::io::IntoRawFd;
+            SIGBUS_JSON_FD.store(f.into_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     install_sigbus_guard();
     info!(
         "fsstress: top={} procs={threads} nops={} loops={} seed={seed} distinct_ops={}",
@@ -1022,6 +1083,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
                         let r = proc.st.rng.next() as u64;
                         proc.run_op(op, r);
                         current_index += 1;
+                        SIGBUS_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 let hist: Map<String, Value> = proc.st.hist.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();

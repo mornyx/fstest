@@ -74,7 +74,8 @@ enum Command {
     /// ltp suite: Linux Test Project adapter (syscalls/fs_bind/fs_perms/smoketest/locks)
     Ltp {
         /// mount point / directory under test
-        mountpoint: PathBuf,
+        #[arg(required_unless_present = "prepare_script")]
+        mountpoint: Option<PathBuf>,
 
         #[command(flatten)]
         args: ltp::Args,
@@ -196,7 +197,15 @@ fn main() -> ExitCode {
             emit(report)
         }
         Command::Ltp { mountpoint, args } => {
+            if args.prepare_script {
+                print!("{}", ltp::PREPARE_SCRIPT);
+                return ExitCode::SUCCESS;
+            }
             init_log(false);
+            let Some(mountpoint) = mountpoint else {
+                log::error!("mount point required (or pass --prepare-script to print the LTP setup script)");
+                return ExitCode::FAILURE;
+            };
             let json_path = args.json.clone();
             let report = ltp::run(&mountpoint, &args);
             if let Ok(r) = &report {

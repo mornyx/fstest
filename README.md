@@ -201,18 +201,31 @@ fstest fsstress -n 10000 -p 4 -c /mnt/workspace       # clean up created files a
 | `-c/--cleanup` | off | remove every file the run created |
 | `--duration <SEC>` | 0 | time-based run |
 
-The report carries per-thread op histograms and error counts. Concurrent truncate-vs-mmap races can SIGBUS a thread (upstream recovers per child via sigsetjmp, impossible across Rust threads); fstest installs a SIGBUS handler and reports such a run as failed with a clear cause instead of crashing silently.
+The report carries per-thread op histograms and error counts. Concurrent truncate-vs-mmap races can SIGBUS a thread (upstream recovers per child via sigsetjmp, impossible across Rust threads); fstest installs a SIGBUS handler that emits a failed JSON report (ops/errors completed so far) and exits 1 instead of crashing silently. Because one such race would abort the whole run, the mmap ops `mread`/`mwrite` are disabled by default (upstream frequencies kept for every other op) and are opt-in via `-f mread=N` / `-f mwrite=N`.
 
 ## ltp
 
-Adapter for the [Linux Test Project](https://github.com/linux-test-project/ltp) — the suite behind JuiceFS's official compatibility numbers. The test binaries come from your LTP installation (`--ltp-dir` pointing at a tree containing `runtest/` and `testcases/bin/`; built from source or a distro package). Suite selection maps to LTP's runtest files; the default suites are exactly JuiceFS's published selection:
+Adapter for the [Linux Test Project](https://github.com/linux-test-project/ltp) — the suite behind JuiceFS's official compatibility numbers. Suite selection maps to LTP's runtest files; the default suites are exactly JuiceFS's published selection:
 
 ```
 sudo fstest ltp --ltp-dir /opt/ltp /mnt/jfs
 sudo fstest ltp --suite syscalls,fs_bind,fs_perms_simple,smoketest,fcntl-locktests /mnt/jfs
 ```
 
-By default JuiceFS's published syscall removal list (vendored from their repo, 240+ tests their environment excludes) is applied, so `pass/fail` totals are directly comparable with their `1479 run / 1454 passed` numbers. LTP exit codes map: 0 pass, 1 fail, 2 broken, 32 skip, other warn; a per-test timeout (`--timeout`, default 120s) is reported as `timedout`. Tests run with `TMPDIR`/`LTP_TMPDIR` pointed inside the mount so file-based tests exercise it. `--runner kirk` delegates to the [runltp-ng](https://github.com/linux-test-project/runltp-ng) `kirk` runner instead of the built-in direct executor. Root is required by most FS tests, exactly as upstream.
+LTP ships no prebuilt binaries — the release tarball is source-only (a few MB) and most distributions, Ubuntu included, have no `ltp` package — so the test binaries must be compiled once and pointed at with `--ltp-dir` (a tree containing `runtest/` and `testcases/bin/`, i.e. an LTP `make install` prefix). fstest embeds a prepare script that does the whole job on a fresh machine, so you can bootstrap from the fstest binary alone:
+
+```
+fstest ltp --prepare-script | sh                     # fetch + build + install LTP
+LTP_PREFIX=/opt/ltp fstest ltp --prepare-script | sh # custom prefix
+```
+
+The script needs a C toolchain plus `bison flex m4` and `pkgconf` (header lists the apt/zypper/yum packages); it installs into `~/.cache/fstest/ltp/<version>` by default, prints the resulting prefix as the only thing on stdout (so it composes with `--ltp-dir "$(...)"`), and honours `LTP_VERSION`, `LTP_PREFIX`, `LTP_CACHE`, `LTP_URL`, `LTP_SHA256`, `LTP_JOBS` and `LTP_INSTALL_DEPS=1`. The same file lives at [scripts/prepare-ltp.sh](scripts/prepare-ltp.sh). Then point fstest at the prefix:
+
+```
+sudo fstest ltp --ltp-dir ~/.cache/fstest/ltp/20260529 /mnt/jfs
+```
+
+By default JuiceFS's published syscall removal list (vendored from their repo, 240+ tests their environment excludes) is applied, so `pass/fail` totals are directly comparable with their `1479 run / 1454 passed` numbers. LTP exit codes map: 0 pass, 1 fail, 2 broken, 32 skip, other warn; a per-test timeout (`--timeout`, default 120s) is reported as `timedout`. Tests run with `TMPDIR`/`LTP_TMPDIR` pointed inside the mount so file-based tests exercise it, and each test gets `LTPROOT` plus `testcases/bin` on `PATH` (as LTP's own runltp does) so shell and child-spawning tests resolve their helper libraries and binaries. The suite is executed by fstest itself — no external runner is involved. Root is required by most FS tests, exactly as upstream.
 
 ## stdfs
 

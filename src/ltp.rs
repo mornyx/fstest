@@ -4,11 +4,8 @@
 // own runtest files, and JuiceFS's published syscall removal list is applied by
 // default so results are directly comparable with their published numbers.
 //
-// Two runners:
-//   direct (default): fstest executes each filtered runtest line itself with a
-//                     per-test timeout and maps LTP exit codes to results.
-//   kirk:             delegates to the runltp-ng `kirk` runner and parses its
-//                     JSON report.
+// fstest executes each filtered runtest line itself with a per-test timeout and
+// maps LTP exit codes to results.
 
 use crate::smallfile::iso8601;
 use log::{info, warn};
@@ -21,7 +18,18 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 const JUICEFS_REMOVE_LIST: &str = include_str!("../vendor/ltp/rm_syscalls_juicefs.txt");
-const DEFAULT_SUITES: &str = "syscalls fs_bind fs_perms_simple smoketest fcntl-locktests";
+
+// LTP ships no prebuilt binaries (source-only tarball, no distro package), so a
+// fresh machine must compile it once. scripts/prepare-ltp.sh is the single
+// source of truth and is embedded here so that a fresh machine can bootstrap
+// from the fstest binary alone: `fstest ltp --prepare-script | sh`.
+pub const PREPARE_SCRIPT: &str = include_str!("../scripts/prepare-ltp.sh");
+
+// Comma-separated to match the `value_delimiter = ','` on --suite: with the
+// default carried as one space-separated string, clap treats the whole thing as
+// a single suite name and the default run dies with "cannot read runfile
+// .../runtest/syscalls fs_bind fs_perms_simple smoketest fcntl-locktests".
+const DEFAULT_SUITES: &str = "syscalls,fs_bind,fs_perms_simple,smoketest,fcntl-locktests";
 
 // LTP exit codes
 const TPASS: i32 = 0;
@@ -39,14 +47,6 @@ pub struct Args {
     #[arg(long)]
     pub ltp_dir: Option<PathBuf>,
 
-    /// runner: direct (fstest executes each test) or kirk (delegates to runltp-ng)
-    #[arg(long, default_value = "direct")]
-    pub runner: String,
-
-    /// kirk binary for --runner kirk
-    #[arg(long, default_value = "kirk")]
-    pub kirk: PathBuf,
-
     /// syscall removal list (defaults to JuiceFS's published list; empty = keep all)
     #[arg(long)]
     pub remove_list: Option<PathBuf>,
@@ -62,6 +62,11 @@ pub struct Args {
     /// only run tests whose name contains this substring (repeatable)
     #[arg(long = "filter")]
     pub filter: Vec<String>,
+
+    /// print the LTP prepare script (download + build + install) and exit;
+    /// run it on a fresh machine with: fstest ltp --prepare-script | sh
+    #[arg(long)]
+    pub prepare_script: bool,
 
     /// cap the number of tests (smoke runs)
     #[arg(long)]
@@ -145,6 +150,21 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
     let tmp = work.join("tmp");
     let _ = fs::create_dir_all(&tmp);
     let _ = fs::create_dir_all(work.join("cwd"));
+    // LTP's own runltp exports LTPROOT and prepends testcases/bin to PATH;
+    // tests rely on both (shell tests `. fs_bind_lib.sh` / `. tst_test.sh`
+    // resolve via PATH, and tst_test's resource copy plus *_child helper
+    // binaries are located relative to LTPROOT). Without them every shell and
+    // child-spawning test reports TBROK ("... not found" / "Failed to copy
+    // resource '..._child'") regardless of the filesystem under test.
+    let child_path = match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut joined = std::ffi::OsString::from(&bin_dir);
+            joined.push(":");
+            joined.push(p);
+            joined
+        }
+        None => bin_dir.as_os_str().to_os_string(),
+    };
     let mut results = Vec::new();
     let (mut pass, mut fail, mut broken, mut skip, mut warnn, mut tout) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let start = Instant::now();
@@ -156,6 +176,8 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
         let mut cmdc = Command::new(binpath.clone());
         cmdc.args(&binargs)
             .current_dir(work.join("cwd"))
+            .env("LTPROOT", ltp_dir)
+            .env("PATH", &child_path)
             .env("TMPDIR", &tmp)
             .env("LTP_TMPDIR", &tmp);
         unsafe {
@@ -247,7 +269,6 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
         }
     }
     json!({
-        "runner": "direct",
         "status": if fail == 0 && broken == 0 && tout == 0 { "ok" } else { "failed" },
         "summary": {
             "total": results.len(), "passed": pass, "failed": fail,
@@ -255,65 +276,6 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
         },
         "tests": results,
     })
-}
-
-fn run_kirk(mountpoint: &Path, args: &Args, ltp_dir: &Path, suites: &[String]) -> Result<Value, String> {
-    let work = mountpoint.join(&args.work_dir);
-    fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-    let mut cmd = Command::new(&args.kirk);
-    cmd.arg("--ltp-dir")
-        .arg(ltp_dir)
-        .arg("--run-suite")
-        .args(suites)
-        .current_dir(&work);
-    info!("kirk cmdline: {:?}", cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("failed to spawn {}: {e}", args.kirk.display()))?;
-    if !out.status.success() {
-        return Err(format!(
-            "kirk exited with {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    // kirk writes a JSON report; locate the newest under TMPDIR/runltp-*/latest
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(tmp) = std::env::var("TMPDIR") {
-        if let Ok(rd) = fs::read_dir(Path::new(&tmp)) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with("runltp-") || name.starts_with("kirk-") {
-                    let latest = e.path().join("latest");
-                    if let Ok(rd2) = fs::read_dir(latest) {
-                        for f in rd2.flatten() {
-                            if f.path().extension().map(|x| x == "json").unwrap_or(false) {
-                                candidates.push(f.path());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    candidates.sort_by_key(|p| {
-        fs::metadata(p)
-            .and_then(|m| m.modified())
-            .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default())
-            .unwrap_or_default()
-    });
-    let report_path = candidates.last().ok_or_else(|| {
-        "kirk JSON report not found; pass its path via --json-less debugging or check TMPDIR".to_string()
-    })?;
-    let raw: Value =
-        serde_json::from_str(&fs::read_to_string(report_path).map_err(|e| format!("{}: {e}", report_path.display()))?)
-            .map_err(|e| format!("kirk report is not valid JSON: {e}"))?;
-    Ok(json!({
-        "runner": "kirk",
-        "status": "ok",
-        "kirkReport": report_path.display().to_string(),
-        "raw": raw,
-    }))
 }
 
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
@@ -364,11 +326,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         if args.no_remove { 0 } else { remove.len() }
     );
     let started = SystemTime::now();
-    let mut body = match args.runner.as_str() {
-        "kirk" => run_kirk(mountpoint, args, &ltp_dir, &args.suite)?,
-        "direct" => run_direct(mountpoint, args, &ltp_dir, tests),
-        other => return Err(format!("unknown runner {other:?} (direct|kirk)")),
-    };
+    let body = run_direct(mountpoint, args, &ltp_dir, tests);
     let host = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "localhost".to_string());
@@ -380,7 +338,6 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         "params": {
             "ltp_dir": ltp_dir.display().to_string(),
             "suites": args.suite,
-            "runner": args.runner,
             "remove_list": if args.no_remove { Value::Null } else {
                 json!(args.remove_list.clone().unwrap_or_else(|| PathBuf::from("<built-in juicefs list>")).display().to_string())
             },
@@ -389,7 +346,6 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         "status": body["status"].clone(),
         "results": body,
     });
-    let _ = &mut body;
     if let Some(path) = &args.json {
         if let Err(e) = fs::write(path, serde_json::to_vec_pretty(&report).unwrap()) {
             warn!("failed to write {}: {e}", path.display());

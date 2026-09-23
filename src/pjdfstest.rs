@@ -56,6 +56,8 @@ pub struct Args {
 pub fn helper_main(argv: &[String]) -> i32 {
     let mut i = 0;
     let mut umsk: Option<u32> = None;
+    let mut want_uid: Option<libc::uid_t> = None;
+    let mut want_gids: Option<&str> = None;
     while i < argv.len() && argv[i].starts_with('-') && argv[i].len() == 2 {
         if argv[i] == "--" {
             i += 1;
@@ -69,21 +71,8 @@ pub fn helper_main(argv: &[String]) -> i32 {
                 };
                 match argv[i].as_str() {
                     "-U" => umsk = Some(parse_num(val) as u32),
-                    "-u" => {
-                        let uid = parse_num(val) as libc::uid_t;
-                        eprintln!("changing uid to {uid}");
-                        if unsafe { libc::setuid(uid) } < 0 {
-                            eprintln!("cannot change uid: {}", std::io::Error::last_os_error());
-                            return 1;
-                        }
-                    }
-                    "-g" => {
-                        eprintln!("changing groups to {val}");
-                        if let Err(e) = set_gids(val) {
-                            eprintln!("cannot change groups: {e}");
-                            return 1;
-                        }
-                    }
+                    "-u" => want_uid = Some(parse_num(val) as libc::uid_t),
+                    "-g" => want_gids = Some(val.as_str()),
                     _ => unreachable!(),
                 }
                 i += 2;
@@ -92,6 +81,25 @@ pub fn helper_main(argv: &[String]) -> i32 {
                 eprintln!("unknown option {}", argv[i]);
                 return 1;
             }
+        }
+    }
+    // Apply the credential changes only after the whole option list is parsed:
+    // setgroups(2)/setegid(2) require privilege, so they must run before the
+    // setuid(2) that drops it. The upstream .t files always write `-u` before
+    // `-g`, so acting on each option as it is seen would drop root at `-u` and
+    // fail the following `-g` with EPERM.
+    if let Some(spec) = want_gids {
+        eprintln!("changing groups to {spec}");
+        if let Err(e) = set_gids(spec) {
+            eprintln!("cannot change groups: {e}");
+            return 1;
+        }
+    }
+    if let Some(uid) = want_uid {
+        eprintln!("changing uid to {uid}");
+        if unsafe { libc::setuid(uid) } < 0 {
+            eprintln!("cannot change uid: {}", std::io::Error::last_os_error());
+            return 1;
         }
     }
     unsafe { libc::umask(umsk.unwrap_or(0) as libc::mode_t) };
@@ -808,9 +816,16 @@ fn run_one(scratch: &Path, name: &str, body: &str, conf: &str, misc_body: &str, 
         .collect::<Vec<_>>()
         .join("\n");
     let mut script = String::new();
-    script.push_str("fstest='");
+    // misc.sh's expect() invokes the helper as `${fstest} $*` (unquoted), but
+    // utimensat/05.t invokes it as `"$fstest" lstat ...` (quoted). Upstream
+    // defines fstest as a bare path so both forms work; if the variable carried
+    // the `__pjdfstest` subcommand in the same word, the quoted form would make
+    // sh exec a file literally named "<exe> __pjdfstest" and fail with a bogus
+    // "not found". Use a wrapper function and point the variable at its name so
+    // both expansions resolve to the wrapper.
+    script.push_str("fstest() { '");
     script.push_str(&exe.display().to_string().replace('\'', "'\\''"));
-    script.push_str(" __pjdfstest'\n");
+    script.push_str("' __pjdfstest \"$@\"; }\nfstest=fstest\n");
     script.push_str(conf);
     if let Some(fs_name) = &args.fs {
         script.push_str(&format!("\nfs='{fs_name}'\n"));

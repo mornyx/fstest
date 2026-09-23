@@ -1032,7 +1032,7 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
     if a.no_copy || !linux {
         enabled[idx(Op::CopyRange)] = false;
     }
-    let probe = FsxProbe { fd };
+    let probe = FsxProbe { fd, size: file_size };
     if linux && enabled[idx(Op::Fallocate)] && !probe.fa(0) {
         enabled[idx(Op::Fallocate)] = false;
         info!("fsx: filesystem does not support fallocate, disabling");
@@ -1052,6 +1052,18 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
     if linux && enabled[idx(Op::InsertRange)] && !probe.fa(FALLOC_FL_INSERT_RANGE) {
         enabled[idx(Op::InsertRange)] = false;
         info!("fsx: insert range unsupported, disabling");
+    }
+    if linux && enabled[idx(Op::WriteZeroes)] && !probe.fa(FALLOC_FL_WRITE_ZEROES) {
+        enabled[idx(Op::WriteZeroes)] = false;
+        info!("fsx: write zeroes unsupported, disabling");
+    }
+    if linux && enabled[idx(Op::CloneRange)] && !probe.clone_range() {
+        enabled[idx(Op::CloneRange)] = false;
+        info!("fsx: clone range unsupported, disabling");
+    }
+    if linux && enabled[idx(Op::CopyRange)] && !probe.copy_range() {
+        enabled[idx(Op::CopyRange)] = false;
+        info!("fsx: copy range unsupported, disabling");
     }
 
     let mut fsx = Fsx {
@@ -1375,18 +1387,83 @@ impl SystemTimeSeed {
 struct FsxProbe {
     #[allow(dead_code)] // unused on macOS where probing is disabled
     fd: RawFd,
+    // probe offset: upstream probes at EOF (offset = file_size, len = 1);
+    // filesystems (e.g. FUSE) reject len = 0 with EINVAL before they ever
+    // report EOPNOTSUPP, which would make the probe useless
+    size: u64,
 }
 impl FsxProbe {
     fn fa(&self, mode: i32) -> bool {
         #[cfg(target_os = "linux")]
         {
-            let r = unsafe { libc::fallocate(self.fd, mode, 0, 0) };
+            let r = unsafe { libc::fallocate(self.fd, mode, self.size as i64, 1) };
+            let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if r == 0 {
+                // undo the 1-byte probe reservation, as upstream does
+                if unsafe { libc::ftruncate(self.fd, self.size as i64) } != 0 {
+                    self.fail_ftruncate();
+                }
+                return true;
+            }
+            e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (mode, self.size);
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fail_ftruncate(&self) {
+        panic!(
+            "fsx: probe ftruncate failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    // upstream test_clone_range(): all-zero-range clone, unsupported on
+    // EOPNOTSUPP/ENOTTY only
+    fn clone_range(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            #[repr(C)]
+            struct FileCloneRange {
+                src_fd: i64,
+                src_offset: i64,
+                src_length: i64,
+                dest_offset: i64,
+            }
+            const FICLONERANGE: libc::c_ulong = 0x4020940D;
+            let fcr = FileCloneRange {
+                src_fd: self.fd as i64,
+                src_offset: 0,
+                src_length: 0,
+                dest_offset: 0,
+            };
+            let r = unsafe { libc::ioctl(self.fd, FICLONERANGE as libc::c_ulong, &fcr) };
             let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
             r == 0 || (e != libc::EOPNOTSUPP && e != libc::ENOTTY)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = mode;
+            false
+        }
+    }
+
+    // upstream test_copy_range(): 1-byte same-file copy, offset 0 -> 1,
+    // unsupported on ENOSYS/EOPNOTSUPP/ENOTTY
+    fn copy_range(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let mut o1: i64 = 0;
+            let mut o2: i64 = 1;
+            let r = unsafe { libc::copy_file_range(self.fd, &mut o1, self.fd, &mut o2, 1, 0) };
+            let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            r >= 0 || (e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
             false
         }
     }
