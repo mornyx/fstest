@@ -815,34 +815,41 @@ fn transform_rust_tests(src: &str) -> (String, Vec<(Vec<String>, String)>, Vec<S
             continue;
         }
         back_attrs.extend(attrs);
-        if RUST_EXCLUDE.iter().any(|(n, _)| *n == name) {
-            excluded.push(name.clone());
-            // skip the whole fn block by net brace depth (braces inside
-            // format strings come in balanced pairs, so they cancel out)
-            let mut depth: i32 = 0;
-            let mut seen_open = false;
-            while j < lines.len() {
-                for ch in lines[j].chars() {
-                    if ch == '{' {
-                        depth += 1;
-                        seen_open = true;
-                    } else if ch == '}' {
-                        depth -= 1;
-                    }
-                }
-                j += 1;
-                if seen_open && depth <= 0 {
-                    break;
+        // compute the fn block extent first so exclusion can inspect the body
+        // (braces inside format strings come in balanced pairs, so they cancel
+        // out in the net brace depth)
+        let mut depth: i32 = 0;
+        let mut seen_open = false;
+        let mut k = j;
+        while k < lines.len() {
+            for ch in lines[k].chars() {
+                if ch == '{' {
+                    depth += 1;
+                    seen_open = true;
+                } else if ch == '}' {
+                    depth -= 1;
                 }
             }
-            skip.push((back, j - 1));
-            i = j;
+            k += 1;
+            if seen_open && depth <= 0 {
+                break;
+            }
+        }
+        // named exclusions plus a body scan: any test touching `Dir::` uses
+        // std's internal dirfd type, which keeps growing new users across
+        // releases (test_dir_metadata joined in 1.98) — a body rule beats
+        // enumerating names
+        let uses_internal_dir = lines[j..k].iter().any(|l| l.contains("Dir::"));
+        if RUST_EXCLUDE.iter().any(|(n, _)| *n == name) || uses_internal_dir {
+            excluded.push(name.clone());
+            skip.push((back, k - 1));
+            i = k;
             continue;
         }
         drops.push(i);
         pubs.push(j);
         tests.push((back_attrs, name));
-        i = j;
+        i = k;
         continue;
     }
     // pass 2: emit, dropping excluded blocks and the #[test] lines, making

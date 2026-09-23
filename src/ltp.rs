@@ -258,6 +258,17 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
             "name": name, "result": result, "exitCode": code, "timedOut": timed_out,
             "outputTail": out_tail,
         }));
+        // per-test line: the only way to attribute a wedge/slowdown to a
+        // specific test after the fact (progress lines every 100 are too
+        // coarse for 1000+ test runs)
+        info!(
+            "ltp: test {} -> {} ({}m{}.{:03}s)",
+            name,
+            result,
+            t0.elapsed().as_secs() / 60,
+            t0.elapsed().as_secs() % 60,
+            t0.elapsed().subsec_millis()
+        );
         if (i + 1) % 100 == 0 {
             info!(
                 "ltp: {}/{} tests executed ({}m{}s elapsed)",
