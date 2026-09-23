@@ -879,14 +879,25 @@ fn transform_rust_tests(src: &str) -> (String, Vec<(Vec<String>, String)>, Vec<S
 const SHIM: &str = r#"
 mod shim {
     // assert_matches! is not exported by current stable std; reproduce the
-    // upstream macro (same match-and-panic semantics)
+    // upstream macro (same match-and-panic semantics, including the optional
+    // `if guard` and trailing format-message forms the std tests use)
     macro_rules! assert_matches {
-        ($left:expr, $($pattern:pat_param)|+ $(,)?) => {
+        ($left:expr, $($pattern:pat_param)|+ $(if $guard:expr)?) => {
             match $left {
-                $($pattern)|+ => {}
+                $($pattern)|+ $(if $guard)? => {}
                 left => panic!(
                     "assertion failed: `{:?}` does not match any of the expected patterns",
                     left
+                ),
+            }
+        };
+        ($left:expr, $($pattern:pat_param)|+ $(if $guard:expr)?, $($arg:tt)+) => {
+            match $left {
+                $($pattern)|+ $(if $guard)? => {}
+                left => panic!(
+                    "assertion failed: `{:?}` does not match any of the expected patterns: {}",
+                    left,
+                    format_args!($($arg)+)
                 ),
             }
         };
