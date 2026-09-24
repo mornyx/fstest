@@ -28,8 +28,14 @@ pub const PREPARE_SCRIPT: &str = include_str!("../scripts/prepare-ltp.sh");
 // Comma-separated to match the `value_delimiter = ','` on --suite: with the
 // default carried as one space-separated string, clap treats the whole thing as
 // a single suite name and the default run dies with "cannot read runfile
-// .../runtest/syscalls fs_bind fs_perms_simple smoketest fcntl-locktests".
-const DEFAULT_SUITES: &str = "syscalls,fs_bind,fs_perms_simple,smoketest,fcntl-locktests";
+// .../runtest/syscalls fs_perms_simple fcntl-locktests".
+//
+// Deliberately narrower than JuiceFS's published selection (which also runs
+// fs_bind and smoketest): fs_bind is 95 bind-mount/mount-namespace shell tests
+// that exercise kernel mount propagation rather than the filesystem under
+// test, and smoketest mixes in process- and network-only tests (fork/time/wait,
+// ping602/macsec02). Both are noise for a filesystem conformance run.
+const DEFAULT_SUITES: &str = "syscalls,fs_perms_simple,fcntl-locktests";
 
 // LTP exit codes
 const TPASS: i32 = 0;

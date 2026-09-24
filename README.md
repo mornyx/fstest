@@ -205,11 +205,11 @@ The report carries per-thread op histograms and error counts. Concurrent truncat
 
 ## ltp
 
-Adapter for the [Linux Test Project](https://github.com/linux-test-project/ltp) — the suite behind JuiceFS's official compatibility numbers. Suite selection maps to LTP's runtest files; the default suites are exactly JuiceFS's published selection:
+Adapter for the [Linux Test Project](https://github.com/linux-test-project/ltp) — the suite behind JuiceFS's official compatibility numbers. Suite selection maps to LTP's runtest files. The default suites are a narrowed subset of JuiceFS's published selection — `syscalls` (with JuiceFS's syscall removal list applied), `fs_perms_simple`, and `fcntl-locktests` — dropping `fs_bind` (95 bind-mount/mount-namespace shell tests that exercise kernel mount propagation, not the filesystem under test) and `smoketest` (mixes in process- and network-only tests):
 
 ```
 sudo fstest ltp --ltp-dir /opt/ltp /mnt/jfs
-sudo fstest ltp --suite syscalls,fs_bind,fs_perms_simple,smoketest,fcntl-locktests /mnt/jfs
+sudo fstest ltp --suite syscalls,fs_bind,fs_perms_simple,smoketest,fcntl-locktests /mnt/jfs  # JuiceFS's full published set
 ```
 
 LTP ships no prebuilt binaries — the release tarball is source-only (a few MB) and most distributions, Ubuntu included, have no `ltp` package — so the test binaries must be compiled once and pointed at with `--ltp-dir` (a tree containing `runtest/` and `testcases/bin/`, i.e. an LTP `make install` prefix). fstest embeds a prepare script that does the whole job on a fresh machine, so you can bootstrap from the fstest binary alone:
