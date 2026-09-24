@@ -242,6 +242,32 @@ fn unavailable(reason: String) -> Value {
     json!({"available": false, "reason": reason})
 }
 
+// remove_dir_all in a detached thread with a bounded wait: recursive removal
+// on a wedged network/FUSE mount can block forever, and the report must still
+// be emitted. On timeout the thread is simply abandoned (the process exits
+// shortly after, discarding it) and a warning records the leftover path.
+fn remove_dir_all_bounded(path: &Path, bound: Duration) {
+    if !path.exists() {
+        return;
+    }
+    let owned = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("fstest-cleanup".into())
+        .spawn(move || {
+            let _ = fs::remove_dir_all(&owned);
+            let _ = tx.send(());
+        })
+        .ok();
+    if rx.recv_timeout(bound).is_err() {
+        warn!(
+            "stdfs: cleanup of {} did not finish in {:?}; leaving it (the mount may be wedged)",
+            path.display(),
+            bound
+        );
+    }
+}
+
 // ---------- go ----------
 
 struct GoParsed {
@@ -1233,7 +1259,12 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         info!("stdfs: {lang} done in {}s", t0.elapsed().as_secs());
         languages.insert(lang.clone(), v);
     }
-    let _ = fs::remove_dir_all(&work_root);
+    // best-effort, bounded cleanup of the on-mount work tree: a recursive
+    // remove can block indefinitely on the very filesystem being tested
+    // (observed: a leftover tree from a wedged concurrency test pins the
+    // whole mount for rm/unlink/rename). Never let that cost us the report —
+    // wait a short bound, then leave the thread and continue to emit JSON.
+    remove_dir_all_bounded(&work_root, Duration::from_secs(20));
     if std::env::var("FSTEST_KEEP_TMP").map(|v| v == "1").unwrap_or(false) {
         warn!("FSTEST_KEEP_TMP=1: keeping {}", hosttmp.display());
     } else {
