@@ -96,6 +96,15 @@ pub struct Args {
     /// Rust: rust `library/` source dir (default: rustc sysroot's rust-src component)
     #[arg(long)]
     pub rust_src_dir: Option<PathBuf>,
+    /// Rust: skip tests whose name contains this substring (repeatable); they
+    /// are reported as `skipped` rather than failing the run
+    #[arg(long)]
+    pub rust_skip: Vec<String>,
+    /// Rust: per-test timeout in seconds inside the generated runner
+    /// (env STDFS_TEST_TIMEOUT overrides); a wedged test is reported as
+    /// `timedout` and the run continues
+    #[arg(long, default_value_t = 120)]
+    pub rust_test_timeout: u64,
 
     /// per-item timeout in seconds
     #[arg(long, default_value_t = 600)]
@@ -1004,7 +1013,25 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
     let src = std::fs::read_to_string(&tests_rs)
         .map_err(|e| format!("{}: {e}", tests_rs.display()))
         .unwrap();
-    let (body, tests, excluded) = transform_rust_tests(&src);
+    let (body, mut tests, mut excluded) = transform_rust_tests(&src);
+    // explicit --rust-skip: report matching tests as skipped instead of running
+    // them (e.g. a test known to deadlock on the filesystem under test)
+    let skip_pats: Vec<&String> = args.rust_skip.iter().filter(|s| !s.is_empty()).collect();
+    if !skip_pats.is_empty() {
+        let mut dropped: Vec<String> = Vec::new();
+        tests.retain(|(_, name)| {
+            if skip_pats.iter().any(|p| name.contains(p.as_str())) {
+                dropped.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for n in &dropped {
+            info!("stdfs[rust]: skipping {n} (--rust-skip)");
+        }
+        excluded.extend(dropped);
+    }
     if tests.is_empty() {
         return unavailable(format!("no #[test] fns found in {}", tests_rs.display()));
     }
@@ -1027,6 +1054,12 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
     runner.push_str(
         r#"fn main() {
     let filter = std::env::args().nth(1);
+    // Per-test wall-clock cap: a single wedged test (e.g. a recursive
+    // remove deadlocked on the filesystem under test) must not swallow the
+    // whole run. The worker thread is detached on timeout and the process
+    // exits at the end, so a stuck test costs one timeout slot, not the run.
+    let per_test: u64 = std::env::var("STDFS_TEST_TIMEOUT").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(120);
     for (name, func, ignored) in TESTS {
         if *ignored {
             println!("RES\t{name}\tskipped\t#[ignore]");
@@ -1039,10 +1072,11 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
             }
         }
         let n = *name;
-        let res = std::thread::Builder::new()
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)).map_err(|p| {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)).map_err(|p| {
                     if let Some(s) = p.downcast_ref::<&str>() {
                         (*s).to_string()
                     } else if let Some(s) = p.downcast_ref::<String>() {
@@ -1050,17 +1084,25 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
                     } else {
                         "panic".to_string()
                     }
-                })
+                });
+                let _ = tx.send(r);
             })
-            .expect("spawn test thread")
-            .join();
-        match res {
+            .expect("spawn test thread");
+        match rx.recv_timeout(std::time::Duration::from_secs(per_test)) {
             Ok(Ok(())) => println!("RES\t{n}\tok\t"),
             Ok(Err(msg)) => println!("RES\t{n}\tfail\t{}", msg),
-            Err(_) => println!("RES\t{n}\tfail\tthread panicked or aborted"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                println!("RES\t{n}\ttimedout\tno result in {per_test}s (deadlock or blocked syscall)");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                println!("RES\t{n}\tfail\tthread panicked or aborted");
+            }
         }
     }
     println!("DONE");
+    // exit explicitly: we may have detached threads still blocked in the
+    // filesystem under test and must not wait for them
+    std::process::exit(0);
 }
 "#,
     );
@@ -1099,10 +1141,15 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
     let wd = work_root.join("rust");
     let _ = std::fs::create_dir_all(&wd);
     let mut rc = Command::new(&runner_bin);
-    rc.current_dir(&wd).env("TMPDIR", &wd).env("RUST_BACKTRACE", "0");
+    rc.current_dir(&wd)
+        .env("TMPDIR", &wd)
+        .env("RUST_BACKTRACE", "0")
+        // per-test cap inside the generated runner; a single wedged test is
+        // reported as timedout and the run continues instead of stalling
+        .env("STDFS_TEST_TIMEOUT", std::env::var("STDFS_TEST_TIMEOUT").unwrap_or_else(|_| "120".into()));
     let t0 = Instant::now();
     let ex = exec_with_timeout(rc, Duration::from_secs(args.timeout.max(1)));
-    let (mut pass, mut fail) = (0u64, 0u64);
+    let (mut pass, mut fail, mut per_test_timeout) = (0u64, 0u64, 0u64);
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut seen = 0u64;
     for line in ex.out.lines() {
@@ -1116,6 +1163,13 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
         seen += 1;
         match status {
             "ok" | "skipped" => pass += 1,
+            "timedout" => {
+                per_test_timeout += 1;
+                fail += 1;
+                if failures.len() < 20 {
+                    failures.push((name.to_string(), format!("[timedout] {}", tail(msg, 400))));
+                }
+            }
             _ => {
                 fail += 1;
                 if failures.len() < 20 {
@@ -1126,9 +1180,9 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
     }
     let ok = ex.code == Some(0) && !ex.timed_out && fail == 0;
     if !ok {
-        warn!("stdfs[rust]: FAILED ({} pass {} fail)", pass, fail);
+        warn!("stdfs[rust]: FAILED ({} pass {} fail {} timedout)", pass, fail, per_test_timeout);
     }
-    info!("stdfs[rust]: {} pass={} fail={} ({}s)", if ok { "ok" } else { "fail" }, pass, fail, t0.elapsed().as_secs());
+    info!("stdfs[rust]: {} pass={} fail={} timedout={} ({}s)", if ok { "ok" } else { "fail" }, pass, fail, per_test_timeout, t0.elapsed().as_secs());
     let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "fail" };
     json!({
         "available": true,
@@ -1141,7 +1195,7 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
             "reported": seen,
             "pass": pass,
             "fail": fail,
-            "timedout": if ex.timed_out { json!(tests.len() as u64 - seen) } else { json!(0) },
+            "timedout": if ex.timed_out { tests.len() as u64 - seen } else { per_test_timeout },
         },
         "failures": failures.iter().map(|(n, t)| json!({"name": n, "tail": t})).collect::<Vec<_>>(),
         "durationMs": t0.elapsed().as_millis() as u64,

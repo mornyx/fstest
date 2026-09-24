@@ -349,13 +349,13 @@ extern "C" fn sigbus_handler(_: libc::c_int) {
     }
 }
 
-fn push_bytes(buf: &mut [u8], mut w: usize, b: &[u8]) -> usize {
+fn push_bytes(buf: &mut [u8], w: usize, b: &[u8]) -> usize {
     let n = (buf.len() - w).min(b.len());
     buf[w..w + n].copy_from_slice(&b[..n]);
     w + n
 }
 
-fn push_u64(buf: &mut [u8], mut w: usize, mut v: u64) -> usize {
+fn push_u64(buf: &mut [u8], w: usize, mut v: u64) -> usize {
     let mut tmp = [0u8; 20];
     let mut i = tmp.len();
     loop {
