@@ -2,6 +2,7 @@ mod fio;
 mod fsmark;
 mod fsstress;
 mod fsx;
+mod git;
 mod ltp;
 mod mdtest;
 mod mdworkbench;
@@ -115,6 +116,16 @@ enum Command {
 
         #[command(flatten)]
         args: stdfs::Args,
+    },
+
+    /// git suite: git's own t/ test suite run against the mount
+    Git {
+        /// mount point / directory under test
+        #[arg(required_unless_present_any = ["prepare_script", "list"])]
+        mountpoint: Option<PathBuf>,
+
+        #[command(flatten)]
+        args: git::Args,
     },
 }
 
@@ -260,6 +271,36 @@ fn main() -> ExitCode {
             init_log(false);
             let json_path = args.json.clone();
             let report = stdfs::run(&mountpoint, &args);
+            if let Ok(r) = &report {
+                if let Some(path) = &json_path {
+                    if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(r).unwrap()) {
+                        log::error!("failed to write {}: {e}", path.display());
+                    }
+                }
+            }
+            emit(report)
+        }
+        Command::Git { mountpoint, args } => {
+            if args.prepare_script {
+                print!("{}", git::PREPARE_SCRIPT);
+                return ExitCode::SUCCESS;
+            }
+            init_log(false);
+            if args.list {
+                return match git::list(&args) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        log::error!("{e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            let Some(mountpoint) = mountpoint else {
+                log::error!("mount point required (or pass --prepare-script to print the git setup script)");
+                return ExitCode::FAILURE;
+            };
+            let json_path = args.json.clone();
+            let report = git::run(&mountpoint, &args);
             if let Ok(r) = &report {
                 if let Some(path) = &json_path {
                     if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(r).unwrap()) {

@@ -1,6 +1,6 @@
 # Third-party notices
 
-Community test tools that fstest references or plans to reference. fstest does not include or link any source code from these projects: smallfile / fs_mark / mdtest / md-workbench are behavior-level ports (reimplemented from documentation and observed black-box behavior), fio / ior / ltp are invoked as standalone binaries provided by the user's environment, pjdfstest's BSD-2-Clause shell test suite is vendored and embedded verbatim with its license, and the stdfs adapter executes the Go / CPython / Node.js / Rust standard-library test suites shipped with the user's own toolchains in place. Upstream license texts are collected here for attribution.
+Community test tools that fstest references or plans to reference. fstest does not include or link any source code from these projects: smallfile / fs_mark / mdtest / md-workbench are behavior-level ports (reimplemented from documentation and observed black-box behavior), fio / ior / ltp are invoked as standalone binaries provided by the user's environment, pjdfstest's BSD-2-Clause shell test suite is vendored and embedded verbatim with its license, the stdfs adapter executes the Go / CPython / Node.js / Rust standard-library test suites shipped with the user's own toolchains in place, and the git adapter runs the t/ suite out of the user's own built git checkout. Upstream license texts are collected here for attribution.
 
 | Project | Upstream | License | Copyright |
 |---|---|---|---|
@@ -16,6 +16,7 @@ Community test tools that fstest references or plans to reference. fstest does n
 | CPython test suite (stdfs target) | https://github.com/python/cpython | PSF-2.0 | Python Software Foundation |
 | Node.js test suite (stdfs target) | https://github.com/nodejs/node | MIT | Node.js contributors |
 | Rust standard library tests (stdfs target) | https://github.com/rust-lang/rust | MIT OR Apache-2.0 | The Rust Project Developers |
+| git test suite (git adapter target) | https://github.com/git/git | GPL-2.0-only | Git contributors |
 
 License texts:
 
@@ -25,3 +26,4 @@ License texts:
 - [fio.COPYING-GPL-2.0](fio.COPYING-GPL-2.0)
 - [xfstests.COPYING-GPL-2.0](xfstests.COPYING-GPL-2.0)
 - [pjdfstest.COPYING-BSD-2](pjdfstest.COPYING-BSD-2)
+- [git.COPYING-GPL-2.0](git.COPYING-GPL-2.0)

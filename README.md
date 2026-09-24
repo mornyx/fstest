@@ -7,7 +7,7 @@ One Rust binary that ports and wraps the community's filesystem test tools as un
 | | suites |
 |---|---|
 | benchmark | [smallfile](#smallfile) · [fsmark](#fsmark) · [fio](#fio) · [mdtest](#mdtest) · [mdworkbench](#mdworkbench) |
-| functional | [pjdfstest](#pjdfstest) · [fsx](#fsx) · [fsstress](#fsstress) · [ltp](#ltp) · [stdfs](#stdfs) |
+| functional | [pjdfstest](#pjdfstest) · [fsx](#fsx) · [fsstress](#fsstress) · [ltp](#ltp) · [stdfs](#stdfs) · [git](#git) |
 
 Defaults policy: ported suites keep the upstream tools' defaults so numbers stay directly comparable; wrapped suites pick mount-point best-practice defaults instead of engine defaults that assume local block devices (see [Platform notes](#platform-notes)).
 
@@ -266,6 +266,43 @@ Languages whose toolchain or sources cannot be resolved are reported as `unavail
 | `--rust-src-dir <DIR>` | sysroot rust-src | rust `library/` source directory |
 | `--timeout <SEC>` | 600 | per-item timeout |
 | `--jobs <N>` | 4 | concurrent items within a language |
+
+## git
+
+Adapter for git's own test suite (`t/`) — the same suite upstream CI runs, pointed at the mount with `--root`. The suites before this one ask "does this filesystem conform to POSIX" (pjdfstest, LTP) and "do language runtimes work on it" (stdfs); the git suite asks whether the most filesystem-dependent application in wide use still works on it: repo init with the `core.filemode`/`core.ignorecase`/`core.symlinks`/`core.precomposeunicode` probes, lockfile+rename atomicity for the index and refs, loose-object fan-out and pack IO, symlink/case/NFD-NFC semantics through checkout/merge/status, racy-mtime index handling, hardlinked local clones.
+
+```
+fstest git --prepare-script | sh              # clone + build a pinned git release (once)
+fstest git /mnt/jfs                           # default tier a: the fs-coupled scripts, ~1 min
+fstest git --tier b /mnt/jfs                  # + the heavyweights (crlf matrix, sparse-checkout compat …)
+fstest git --tier all --jobs 8 /mnt/jfs       # the whole t/ suite (needs GBs of space on the mount)
+fstest git --tests t0050-filesystem,t1400 /mnt/jfs
+```
+
+The suite is version-locked to the binary: the scripts exercise their own version's options and usage text, so they are never vendored and never run against a different git build — one checkout provides both. The prepare script (embedded like the LTP one, also at [scripts/prepare-git.sh](scripts/prepare-git.sh)) clones a pinned release tag (`GIT_VERSION`, default v2.55.0; honours `GIT_REPO`, `GIT_CACHE`, `GIT_JOBS`, `GIT_MAKE_OPTS`) and builds it minimally (`NO_CURL NO_EXPAT NO_GETTEXT NO_TCLTK`) into `~/.cache/fstest/git/<tag>`; the only hard dependencies are a C toolchain, make, git and zlib. Network transports and i18n are out of scope for a filesystem suite, and the test suite's own prereq gating turns them into skips. Then point fstest at the tree — `--git-dir`, or the newest build under the cache is found automatically:
+
+```
+fstest git --git-dir ~/.cache/fstest/git/v2.55.0 /mnt/jfs
+```
+
+Each script runs with cwd at the build tree's `t/` (the invocation contract of test-lib.sh) and `--root` inside `<mount>/.fstest-git/` — its trash directory, the entire working repo including `.git`, lives on the filesystem under test — with `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main` and the harness' test-results bookkeeping pointed at the mount too, so a read-only build tree suffices. Scripts run in parallel (`--jobs`; each owns its trash directory) under a per-script timeout (`--timeout`, default 600) whose kill takes the whole process group. The TAP each script emits is parsed into pass/fail/skip/todo/fixed counts: the harness' capability probing turns missing features into `# skip` lines with the per-prereq reasons aggregated per script; `not ok … # TODO known breakage` is upstream's expected breakage and does not fail the run; a script that dies before emitting its trailing `1..N` plan is `broken`; `ok … # TODO known breakage vanished` is reported as `fixed` without failing (upstream exits 1 for it). Failed scripts keep their trash directory (upstream behavior), so the work directory is removed at the end under a time bound — a wedged mount can delay but never block the report; `--keep` preserves everything for diagnosis. Tier a is 44 scripts (~1524 assertions on APFS, about a minute at 4 jobs); tier b adds 11.
+
+| Option | Default | Description |
+|---|---|---|
+| `--git-dir <TREE>` | `$FSTEST_GIT_DIR`, else newest in `~/.cache/fstest/git` | built git source tree (needs `git`, `t/test-lib.sh`, `t/helper/test-tool`) |
+| `--tier <a\|b\|all>` | a | a = curated fs-coupled set; b = a + heavyweights; all = every `tNNNN` script |
+| `--tests <LIST>` | by tier | explicit scripts (comma list of `tNNNN` or `tNNNN-name`), overrides `--tier` |
+| `--filter <SUBSTR>` | all | only scripts whose name contains the substring (repeatable) |
+| `--list` | off | resolve the selection and print it, without running |
+| `--jobs <N>` | 4 | scripts in parallel |
+| `--timeout <SEC>` | 600 | per-script timeout |
+| `--work-dir <NAME>` | `.fstest-git` | work directory under the mount point |
+| `--test-arg <ARG>` | — | extra argument passed verbatim to every script (repeatable): `-x`, `--immediate`, `--debug`, `--run=<n>` … |
+| `--keep` | off | keep the work directory (and the trash directories failed scripts leave behind) |
+| `--json <FILE>` | — | also write the JSON report |
+| `--prepare-script` | — | print the git prepare script and exit |
+
+Selection entries resolve against the tree at runtime — exact name first, then unique number prefix (`t1410` finds `t1410-reflog`) — and an entry that matches nothing is reported as a warning rather than silently dropped, so upstream renames surface instead of losing coverage.
 
 ## Platform notes
 
