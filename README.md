@@ -7,7 +7,7 @@ One Rust binary that ports and wraps the community's filesystem test tools as un
 | | suites |
 |---|---|
 | benchmark | [smallfile](#smallfile) · [fsmark](#fsmark) · [fio](#fio) · [mdtest](#mdtest) · [mdworkbench](#mdworkbench) |
-| functional | [pjdfstest](#pjdfstest) · [fsx](#fsx) · [fsstress](#fsstress) · [ltp](#ltp) · [stdfs](#stdfs) · [git](#git) |
+| functional | [pjdfstest](#pjdfstest) · [fsx](#fsx) · [fsstress](#fsstress) · [ltp](#ltp) · [stdfs](#stdfs) · [git](#git) · [sqlite](#sqlite) |
 
 Defaults policy: ported suites keep the upstream tools' defaults so numbers stay directly comparable; wrapped suites pick mount-point best-practice defaults instead of engine defaults that assume local block devices (see [Platform notes](#platform-notes)).
 
@@ -303,6 +303,39 @@ Each script runs with cwd at the build tree's `t/` (the invocation contract of t
 | `--prepare-script` | — | print the git prepare script and exit |
 
 Selection entries resolve against the tree at runtime — exact name first, then unique number prefix (`t1410` finds `t1410-reflog`) — and an entry that matches nothing is reported as a warning rather than silently dropped, so upstream renames surface instead of losing coverage.
+
+## sqlite
+
+SQLite's [mptest](https://sqlite.org/mptest.html) suite run against the mount. mptest is SQLite's own tester "for testing the ability of independent processes to access the same SQLite database concurrently" — the filesystem's locking, atomic-rename, fsync and hot-journal recovery paths exercised by real client processes. The parent and its `--client` children (five in the embedded scripts) coordinate through task/client/counters tables inside the shared database itself, so wherever the database file lives is what gets tested: `config01`/`config02` run those clients under different journal modes (PERSIST/TRUNCATE/MEMORY/OFF) and mmap sizes concurrently and verify consistency after a VACUUM, `crash01` kills clients mid-transaction and checks the survivors recover the hot journal, `multiwrite01` is the concurrent write core both source.
+
+Like pjdfstest, everything ships inside the fstest binary — zero dependencies, zero preparation:
+
+```
+fstest sqlite /mnt/jfs                      # all four scripts, one fresh database each, ~13 s
+fstest sqlite --journalmode wal /mnt/jfs    # mptest's --journalmode knob
+fstest sqlite --vfs unix-dotfile /mnt/jfs   # exercise a different lock strategy
+fstest sqlite --list                        # show the embedded scripts
+```
+
+The four scripts (+ the `crash02.subtest` they `--source`) are embedded verbatim (SQLite is public domain), and the 1.4k-line mptest.c coordinator is ported behavior-for-behavior on top of the bundled SQLite engine (rusqlite "bundled" — sqlite3.c compiled in at build time; the engine is not ported, it *is* SQLite, the system under test). Upstream semantics are kept exactly: the BEGIN IMMEDIATE task-claim protocol with counter flushing, byte-exact `--match`/`--glob` comparisons, the 30s no-work give-up, the 2s shutdown grace, `--exit N>0` as a crash that leaves a hot journal, the busy-handler timeout, and real client *processes* (threads would share locks and test nothing — clients are spawned as `fstest __sqlite-mptest --client N`). The port is validated as an oracle twin of the C mptest: per script, identical assertion counts and exit codes (163/627/94/81, all 0 errors on APFS).
+
+Scripts run in parallel (`--jobs`, each with its own database and work directory under `<mount>/.fstest-sqlite/`) under a per-script process-group timeout (`--timeout`, default 300 — the kill takes the master and every client down together). Output parsing keys on the upstream `Summary: N errors out of M tests`/`END:` lines: errors > 0 is `fail`, a missing summary (master died, e.g. on a FATAL) is `broken`. The work directory is removed at the end under a time bound; `--keep` preserves it.
+
+| Option | Default | Description |
+|---|---|---|
+| `--script <LIST>` | config01,config02,crash01,multiwrite01 | embedded scripts to run (comma list, extension optional; a path runs an external mptest script) |
+| `--filter <SUBSTR>` | all | only scripts whose name contains the substring (repeatable) |
+| `--list` | off | list the embedded scripts and exit |
+| `--jobs <N>` | 4 | scripts in parallel |
+| `--timeout <SEC>` | 300 | per-script timeout (process group) |
+| `--repeat <N>` | 1 | mptest `--repeat`: cycles per script |
+| `--journalmode <MODE>` | — | mptest `--journalmode`: DELETE/TRUNCATE/PERSIST/MEMORY/WAL/OFF |
+| `--vfs <NAME>` | — | mptest `--vfs`: VFS under test (unix, unix-dotfile, unix-excl, unix-namedsem) |
+| `--sync` | off | keep synchronous=FULL (mptest `--sync`; default is synchronous=OFF like upstream) |
+| `--sqltrace` / `--quiet` / `--trace <N>` | — | mptest tracing knobs, passed through |
+| `--work-dir <NAME>` | `.fstest-sqlite` | work directory under the mount point |
+| `--keep` | off | keep the work directory when done |
+| `--json <FILE>` | — | also write the JSON report |
 
 ## Platform notes
 

@@ -1,6 +1,6 @@
 # Third-party notices
 
-Community test tools that fstest references or plans to reference. fstest does not include or link any source code from these projects: smallfile / fs_mark / mdtest / md-workbench are behavior-level ports (reimplemented from documentation and observed black-box behavior), fio / ior / ltp are invoked as standalone binaries provided by the user's environment, pjdfstest's BSD-2-Clause shell test suite is vendored and embedded verbatim with its license, the stdfs adapter executes the Go / CPython / Node.js / Rust standard-library test suites shipped with the user's own toolchains in place, and the git adapter runs the t/ suite out of the user's own built git checkout. Upstream license texts are collected here for attribution.
+Community test tools that fstest references. For every project except SQLite, fstest does not include or link any source code: smallfile / fs_mark / mdtest / md-workbench are behavior-level ports (reimplemented from documentation and observed black-box behavior), fio / ior / ltp are invoked as standalone binaries provided by the user's environment, pjdfstest's BSD-2-Clause shell test suite is vendored and embedded verbatim with its license, the stdfs adapter executes the Go / CPython / Node.js / Rust standard-library test suites shipped with the user's own toolchains in place, and the git adapter runs the t/ suite out of the user's own built git checkout. The sqlite adapter is the one exception: SQLite itself (the public-domain sqlite3.c engine, via rusqlite's "bundled" feature) is compiled into the binary — it is the system under test — while its mptest scripts are embedded verbatim and the mptest.c coordinator is a behavior-level port. Upstream license texts are collected here for attribution.
 
 | Project | Upstream | License | Copyright |
 |---|---|---|---|
@@ -17,6 +17,7 @@ Community test tools that fstest references or plans to reference. fstest does n
 | Node.js test suite (stdfs target) | https://github.com/nodejs/node | MIT | Node.js contributors |
 | Rust standard library tests (stdfs target) | https://github.com/rust-lang/rust | MIT OR Apache-2.0 | The Rust Project Developers |
 | git test suite (git adapter target) | https://github.com/git/git | GPL-2.0-only | Git contributors |
+| SQLite (sqlite adapter: bundled engine, embedded mptest scripts, ported coordinator) | https://www.sqlite.org | Public domain | The SQLite authors |
 
 License texts:
 
@@ -27,3 +28,5 @@ License texts:
 - [xfstests.COPYING-GPL-2.0](xfstests.COPYING-GPL-2.0)
 - [pjdfstest.COPYING-BSD-2](pjdfstest.COPYING-BSD-2)
 - [git.COPYING-GPL-2.0](git.COPYING-GPL-2.0)
+
+SQLite is public domain and ships no license text ("May you do good and not evil." — the blessing in every source file's header stands in for one).

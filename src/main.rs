@@ -8,6 +8,7 @@ mod mdtest;
 mod mdworkbench;
 mod pjdfstest;
 mod smallfile;
+mod sqlite;
 mod stdfs;
 
 use clap::{Parser, Subcommand};
@@ -127,6 +128,16 @@ enum Command {
         #[command(flatten)]
         args: git::Args,
     },
+
+    /// sqlite suite: SQLite's mptest multi-process database suite run against the mount
+    Sqlite {
+        /// mount point / directory under test
+        #[arg(required_unless_present = "list")]
+        mountpoint: Option<PathBuf>,
+
+        #[command(flatten)]
+        args: sqlite::Args,
+    },
 }
 
 fn init_log(verbose: bool) {
@@ -139,6 +150,11 @@ fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("__pjdfstest") {
         std::process::exit(pjdfstest::helper_main(&argv[1..]));
+    }
+    // hidden helper mode for the sqlite adapter: runs the mptest engine
+    // (master or --client N) inside this same binary
+    if argv.first().map(String::as_str) == Some("__sqlite-mptest") {
+        std::process::exit(sqlite::mptest_main(&argv[1..]));
     }
     let cli = Cli::parse();
     match cli.command {
@@ -301,6 +317,27 @@ fn main() -> ExitCode {
             };
             let json_path = args.json.clone();
             let report = git::run(&mountpoint, &args);
+            if let Ok(r) = &report {
+                if let Some(path) = &json_path {
+                    if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(r).unwrap()) {
+                        log::error!("failed to write {}: {e}", path.display());
+                    }
+                }
+            }
+            emit(report)
+        }
+        Command::Sqlite { mountpoint, args } => {
+            init_log(false);
+            if args.list {
+                sqlite::list(&args);
+                return ExitCode::SUCCESS;
+            }
+            let Some(mountpoint) = mountpoint else {
+                log::error!("mount point required (or pass --list to show the embedded scripts)");
+                return ExitCode::FAILURE;
+            };
+            let json_path = args.json.clone();
+            let report = sqlite::run(&mountpoint, &args);
             if let Ok(r) = &report {
                 if let Some(path) = &json_path {
                     if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(r).unwrap()) {
