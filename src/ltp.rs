@@ -19,6 +19,22 @@ use std::time::{Duration, Instant, SystemTime};
 
 const JUICEFS_REMOVE_LIST: &str = include_str!("../vendor/ltp/rm_syscalls_juicefs.txt");
 
+// Tests that drive a kernel subsystem a FUSE/network mount cannot back, so a
+// failure measures the kernel rather than the filesystem under test:
+//   - ioctl_loop05: attaches a loop device whose backing file lives on the
+//     mounted filesystem; loop requires a block-device-backed file.
+//   - init_module01/02: load a kernel module (.ko) — unrelated to the mount.
+//   - acct02: BSD process accounting, which writes through the kernel's own
+//     path rather than the VFS, so the accounting file on a FUSE mount is
+//     never populated.
+// Everything else that fails on a network filesystem (inotify/fanotify,
+// renameat2 flag support, latency-sensitive loops) is left in the run: those
+// are either genuinely supported or are filesystem behavior worth seeing.
+// Kept separate from the JuiceFS list so the two provenances stay
+// distinguishable.
+const FUSE_UNSUPPORTED_REMOVE_LIST: &str =
+    include_str!("../vendor/ltp/rm_fuse_unsupported.txt");
+
 // LTP ships no prebuilt binaries (source-only tarball, no distro package), so a
 // fresh machine must compile it once. scripts/prepare-ltp.sh is the single
 // source of truth and is embedded here so that a fresh machine can bootstrap
@@ -112,7 +128,16 @@ fn removal_set(args: &Args) -> HashSet<String> {
         }),
         None => JUICEFS_REMOVE_LIST.to_string(),
     };
-    text.split_whitespace().map(|w| w.to_string()).collect()
+    let mut set: HashSet<String> = text.split_whitespace().map(|w| w.to_string()).collect();
+    // The FUSE-structural exclusions always apply (only --no-remove disables
+    // them): they name kernel subsystems a FUSE mount cannot back, so counting
+    // them as failures would measure the kernel rather than the filesystem.
+    set.extend(
+        FUSE_UNSUPPORTED_REMOVE_LIST
+            .split_whitespace()
+            .map(|w| w.to_string()),
+    );
+    set
 }
 
 fn parse_runfile(text: &str, remove: &HashSet<String>) -> Vec<(String, String)> {
@@ -155,6 +180,16 @@ fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String
     let work = mountpoint.join(&args.work_dir);
     let tmp = work.join("tmp");
     let _ = fs::create_dir_all(&tmp);
+    // LTP's tst_tmpdir creates /tmp/LTP_* directly under TMPDIR and several
+    // tests (nftw01, symlink03, dirtyc0w …) drop privileges to nobody before
+    // doing so. A root-owned 0755 TMPDIR turns those into TBROK EACCES, while
+    // the real /tmp is 1777. Match /tmp's sticky world-writable mode so
+    // dropped-privilege tests can create their scratch dirs — this is a harness
+    // requirement, not a property of the filesystem under test.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o1777));
+    }
     // LTP's own runltp exports LTPROOT and prepends testcases/bin to PATH;
     // tests rely on both (shell tests `. fs_bind_lib.sh` / `. tst_test.sh`
     // resolve via PATH, and tst_test's resource copy plus *_child helper
