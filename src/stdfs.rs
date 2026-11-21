@@ -1,27 +1,24 @@
 // stdfs: runs the filesystem-relevant portions of the Go, Python, Node.js and
-// Rust standard-library test suites against a mounted filesystem. Like the
-// ltp/fio adapters the suites come from the user's own toolchains — nothing is
-// embedded or redistributed:
-//   go:     `go test -c` compiles GOROOT packages (default os, path/filepath,
-//           io/fs); the test binary runs with cwd/TMPDIR on the mount.
-//   python: `<python> -m test -v <modules>` from the interpreter's bundled
-//           `test` package (or --python-dir) with cwd on the mount, where the
-//           suite's TESTFN scratch files land.
-//   node:   `node --test` over the FS-touching files of a nodejs/node checkout
-//           (--node-dir; installed node binaries don't ship their test suite).
-//   rust:   reads std/src/fs/tests.rs from the rustc sysroot's rust-src
-//           component, rewrites `crate::` paths onto std, links them against a
-//           small shim for std's test helpers and compiles a standalone runner
-//           with the same rustc (the two tests using the unstable fs::Dir API
-//           are excluded).
+// Rust standard-library test suites against a mounted filesystem. By default,
+// all four runtimes and test suites are embedded at compile time per target
+// platform (with optional CLI overrides for custom installations):
+//   go:     precompiled `go_<pkg>.test` binaries + source/testdata fixtures
+//           (`os`, `path/filepath`, `io/fs`), run with cwd and TMPDIR on mount.
+//   python: standalone CPython 3.12 + matched `Lib/test` over 13 FS modules
+//           (`os`, `posix`, `posixpath`, `genericpath`, `pathlib`, `shutil`,
+//           `tarfile`, `stat`, `fileio`, `glob`, `tempfile`, `mmap`, `fcntl`).
+//   node:   Node.js v22 `node --test` over curated `test/parallel/test-fs-*.js`.
+//   rust:   `library/std/src/fs/tests.rs` transformed at build time and linked
+//           directly into `fstest __stdfs-rust` (parallel execution on mount).
 // Languages whose toolchain or source dir cannot be resolved are reported as
-// unavailable and don't fail the run; only real test failures do.
+// unavailable and don't fail the run; real test or module failures do.
 
-use crate::smallfile::iso8601;
+use crate::common::iso8601;
 use log::{info, warn};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,10 +44,15 @@ const RUST_EXCLUDE: &[(&str, &str)] = &[
     ("dir_entry_debug", "touches std-internal DirEntry field"),
 ];
 
-// go tests skipped by default because they read GOROOT-relative testdata or
-// the package source files and only pass with cwd == the GOROOT package dir;
-// --go-skip "" disables the filter
-const GO_SKIP_DEFAULT: &str = "^(TestClosedStat|TestReadFile|TestReadDir|TestFileReaddir|TestFileReadDir|TestFileReaddirnames|TestReaddirSmallSeek|TestDirFS|TestDirFSRootDir|TestRootDirFS|TestCopyFS|TestGlob|TestNonWindowsGlobEscape|ExampleReadFile)$";
+// `TestVariousDeadlines*` tests anonymous kernel-memory `os.Pipe()` sleep loops
+// (~18s of non-FS sleeps); pass `--go-skip ""` to include them.
+const GO_SKIP_DEFAULT: &str = "^TestVariousDeadlines(1Proc|4Proc)?$";
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(4)
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -58,27 +60,27 @@ pub struct Args {
     #[arg(long, value_delimiter = ',', default_value = "go,python,node,rust")]
     pub lang: Vec<String>,
 
-    /// Go: GOROOT override (uses <dir>/bin/go; default: `go` on PATH)
+    /// Go: GOROOT override (uses <dir>/bin/go; default: bundled prebuilt, else `go` on PATH)
     #[arg(long)]
     pub go_dir: Option<PathBuf>,
     /// Go: packages to test
     #[arg(long, value_delimiter = ',', default_value = "os,path/filepath,io/fs")]
     pub go_packages: Vec<String>,
-    /// Go: -test.skip regex override (empty string disables the default skip list)
+    /// Go: -test.skip regex override (default: none)
     #[arg(long)]
     pub go_skip: Option<String>,
 
     /// Python: directory whose `test/` package to run (a CPython Lib/ dir)
     #[arg(long)]
     pub python_dir: Option<PathBuf>,
-    /// Python: interpreter override (default: python3 on PATH, or one next to --python-dir)
+    /// Python: interpreter override (default: bundled python3, else python3 on PATH)
     #[arg(long)]
     pub python_exe: Option<PathBuf>,
     /// Python: test modules (test_ prefix added as needed)
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "os,posix,shutil,stat,fileio,scandir,glob,tempfile,mmap,fcntl"
+        default_value = "os,posix,posixpath,genericpath,pathlib,shutil,tarfile,stat,fileio,glob,tempfile,mmap,fcntl"
     )]
     pub python_modules: Vec<String>,
 
@@ -86,14 +88,20 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub python_ignore: Vec<String>,
 
-    /// Node: nodejs/node checkout containing test/parallel (required; installed node ships no tests)
+    /// Node: nodejs/node checkout containing test/parallel (default: bundled Node + test-fs-*.js)
     #[arg(long)]
     pub node_dir: Option<PathBuf>,
     /// Node: only run test files whose name contains this substring
     #[arg(long)]
     pub node_filter: Option<String>,
+    /// Node: force-enable event-driven `fs.watch` / `fsPromises.watch` tests (default: on on Linux, off on macOS)
+    #[arg(long, conflicts_with = "no_node_watch")]
+    pub node_watch: bool,
+    /// Node: disable event-driven `fs.watch` / `fsPromises.watch` tests (`stat`-polling `fs.watchFile` stays enabled)
+    #[arg(long)]
+    pub no_node_watch: bool,
 
-    /// Rust: rust `library/` source dir (default: rustc sysroot's rust-src component)
+    /// Rust: rust `library/` source dir (default: embedded at compile time)
     #[arg(long)]
     pub rust_src_dir: Option<PathBuf>,
     /// Rust: skip tests whose name contains this substring (repeatable); they
@@ -110,25 +118,35 @@ pub struct Args {
     #[arg(long, default_value_t = 600)]
     pub timeout: u64,
     /// concurrent items within a language
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = default_jobs())]
     pub jobs: usize,
     /// working directory name under the mount point
     #[arg(long, default_value = ".fstest-stdfs")]
     pub work_dir: String,
+    /// keep the working directory on the mount (and host scratch dir) when done
+    #[arg(long)]
+    pub keep: bool,
     /// also write the JSON result to this file
     #[arg(long)]
     pub json: Option<PathBuf>,
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var("PATH").ok()?;
+    find_all_in_path(name).into_iter().next()
+}
+
+fn find_all_in_path(name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(path) = std::env::var("PATH") else {
+        return out;
+    };
     for dir in path.split(':') {
         let p = Path::new(dir).join(name);
-        if p.is_file() {
-            return Some(p);
+        if p.is_file() && !out.contains(&p) {
+            out.push(p);
         }
     }
-    None
+    out
 }
 
 fn cmd_stdout(mut cmd: Command) -> Option<String> {
@@ -279,45 +297,196 @@ struct GoParsed {
 
 fn parse_go_v(out: &str) -> GoParsed {
     let mut p = GoParsed { pass: 0, fail: 0, skip: 0, failures: Vec::new() };
-    // with -test.v the failure detail is the indented block printed between
-    // `=== RUN` and the `--- FAIL:` marker
-    let mut pending = String::new();
+    // Track per-test log buffers keyed by top-level test name so `-test.parallel=N`
+    // (`=== RUN`, `=== PAUSE`, `=== CONT`) never drops or mixes failure details.
+    let mut current_top = String::new();
+    let mut logs_by_test: HashMap<String, String> = HashMap::new();
     for line in out.lines() {
-        if line.starts_with("=== ") {
-            pending.clear();
+        if let Some(rest) = line.strip_prefix("=== ") {
+            if let Some(name) = rest
+                .strip_prefix("RUN")
+                .or_else(|| rest.strip_prefix("CONT"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let top = name.split('/').next().unwrap_or(name);
+                current_top = top.to_string();
+            } else if rest.starts_with("PAUSE") {
+                current_top.clear();
+            }
             continue;
         }
         if line.starts_with("--- ") {
             let rest = &line[4..];
             let Some((verb, tailpart)) = rest.split_once(' ') else { continue };
             let name = tailpart.split(" (").next().unwrap_or(tailpart).trim();
+            let detail = logs_by_test.remove(name).unwrap_or_default();
             match verb {
                 "PASS:" => p.pass += 1,
                 "SKIP:" => p.skip += 1,
                 "FAIL:" => {
                     p.fail += 1;
                     if p.failures.len() < 10 {
-                        p.failures.push((name.to_string(), tail(&pending, 800)));
+                        p.failures.push((name.to_string(), tail(&detail, 800)));
                     }
                 }
                 _ => {}
             }
-            pending.clear();
-            continue;
-        }
-        if line.starts_with(char::is_whitespace) && !line.trim().is_empty() {
-            if pending.len() < 800 {
-                pending.push_str(line.trim_start());
-                pending.push('\n');
+            if current_top == name {
+                current_top.clear();
             }
             continue;
         }
-        pending.clear();
+        if line.starts_with(char::is_whitespace) && !line.trim().is_empty() {
+            if !current_top.is_empty() {
+                let buf = logs_by_test.entry(current_top.clone()).or_default();
+                if buf.len() < 1200 {
+                    buf.push_str(line.trim_start());
+                    buf.push('\n');
+                }
+            }
+            continue;
+        }
     }
     p
 }
 
+fn copy_dir_tree(src: &Path, dst: &Path) {
+    let _ = fs::create_dir_all(dst);
+    let Ok(rd) = fs::read_dir(src) else { return };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let name = ent.file_name();
+        let out = dst.join(&name);
+        if p.is_dir() {
+            copy_dir_tree(&p, &out);
+        } else if p.is_file() {
+            let _ = fs::copy(&p, &out);
+        }
+    }
+}
+
+fn populate_go_pkg_fixtures(fixture_src: &Path, pkg: &str, wd: &Path) {
+    let _ = fs::create_dir_all(wd);
+    if let Ok(rd) = fs::read_dir(fixture_src) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let fname = ent.file_name().to_string_lossy().into_owned();
+            if p.is_file() && fname.ends_with(".go") {
+                let _ = fs::copy(&p, wd.join(&fname));
+            } else if p.is_dir() && (fname == "testdata" || fname == "exec") {
+                copy_dir_tree(&p, &wd.join(&fname));
+            }
+        }
+    }
+    if pkg == "os" {
+        let _ = fs::create_dir_all(wd.join("exec"));
+    }
+}
+
+fn run_go_test_bin(
+    bin: &Path,
+    pkg: &str,
+    fixture_src: Option<&Path>,
+    skip: &str,
+    jobs: usize,
+    timeout: u64,
+    work_root: &Path,
+) -> Value {
+    // Preserve nested `<pkg>` path (`go/os`, `go/path/filepath`, `go/io/fs`) so
+    // `filepath.TestGlob` (`../*/match.go`) and `io/fs.TestGlob` (`*/glob.go`) match on the mount.
+    let wd = work_root.join("go").join(pkg);
+    let _ = std::fs::create_dir_all(&wd);
+    if let Some(fsrc) = fixture_src {
+        populate_go_pkg_fixtures(fsrc, pkg, &wd);
+    }
+    let tmp = work_root.join("go/.tmp").join(pkg.replace(['/', '.'], "_"));
+    let _ = std::fs::create_dir_all(&tmp);
+    let par = jobs.clamp(1, 4);
+    let mut rc = Command::new(bin);
+    rc.arg("-test.v")
+        .arg(format!("-test.parallel={par}"))
+        .arg(format!("-test.timeout={timeout}s"))
+        .current_dir(&wd)
+        .env("TMPDIR", &tmp);
+    if !skip.is_empty() {
+        rc.arg(format!("-test.skip={skip}"));
+    }
+    let t0 = Instant::now();
+    let ex = exec_with_timeout(rc, Duration::from_secs(timeout.max(1)));
+    let p = parse_go_v(&ex.out);
+    let ok = ex.code == Some(0) && !ex.timed_out && p.fail == 0;
+    if !ok {
+        warn!("stdfs[go]: {} FAILED ({} pass {} fail {} skip)", pkg, p.pass, p.fail, p.skip);
+    }
+    info!(
+        "stdfs[go]: {} {} pass={} fail={} skip={} ({}s)",
+        pkg,
+        if ok { "ok" } else { "fail" },
+        p.pass,
+        p.fail,
+        p.skip,
+        t0.elapsed().as_secs()
+    );
+    let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "fail" };
+    json!({
+        "name": pkg, "status": status,
+        "pass": p.pass, "fail": p.fail, "skip": p.skip,
+        "failures": p.failures.iter().map(|(n, t)| json!({"name": n, "tail": t})).collect::<Vec<_>>(),
+        "durationMs": t0.elapsed().as_millis() as u64,
+        "exitCode": ex.code,
+        "tail": tail(&ex.out, 2000),
+    })
+}
+
 fn run_go(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -> Value {
+    let skip = args.go_skip.clone().unwrap_or_else(|| GO_SKIP_DEFAULT.to_string());
+    // Prefer precompiled Go stdlib test binaries from an attached bundle when --go-dir is unset
+    if args.go_dir.is_none()
+        && let Some(bundle) = crate::bundle::ensure_extracted()
+    {
+        let prebuilt_dir = bundle.join("go");
+        let all_present = args.go_packages.iter().all(|pkg| {
+            let safe = pkg.replace(['/', '.'], "_");
+            prebuilt_dir.join(format!("go_{safe}.test")).is_file()
+        });
+        if all_present {
+            info!(
+                "stdfs[go]: using precompiled test binaries from bundle {} ({} packages)",
+                prebuilt_dir.display(),
+                args.go_packages.len()
+            );
+            let items = run_parallel(args.go_packages.len(), args.jobs, |i| {
+                let pkg = &args.go_packages[i];
+                let safe = pkg.replace(['/', '.'], "_");
+                let bin = prebuilt_dir.join(format!("go_{safe}.test"));
+                let fix = prebuilt_dir.join("fixtures").join(pkg);
+                run_go_test_bin(
+                    &bin,
+                    pkg,
+                    fix.is_dir().then_some(fix.as_path()),
+                    &skip,
+                    args.jobs,
+                    args.timeout,
+                    work_root,
+                )
+            });
+            let ok = items.iter().all(|it| it["status"] == json!("ok"));
+            return json!({
+                "available": true,
+                "status": if ok { "ok" } else { "failed" },
+                "go": "bundled-prebuilt",
+                "goroot": prebuilt_dir.display().to_string(),
+                "skipFilter": skip,
+                "summary": {
+                    "packages": items.len(),
+                    "failed": items.iter().filter(|it| it["status"] != json!("ok")).count(),
+                },
+                "items": items,
+            });
+        }
+    }
+
     let go = match &args.go_dir {
         Some(d) => {
             let g = d.join("bin/go");
@@ -338,10 +507,10 @@ fn run_go(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -> 
     }) else {
         return unavailable(format!("`{} env GOROOT` failed", go.display()));
     };
-    if !Path::new(&goroot).join("src/os").is_dir() {
+    let goroot_path = PathBuf::from(&goroot);
+    if !goroot_path.join("src/os").is_dir() {
         return unavailable(format!("GOROOT {} has no src/os", goroot));
     }
-    let skip = args.go_skip.clone().unwrap_or_else(|| GO_SKIP_DEFAULT.to_string());
     info!("stdfs[go]: GOROOT {} ({} packages, skip filter: {:?})", goroot, args.go_packages.len(), skip);
     let items = run_parallel(args.go_packages.len(), args.jobs, |i| {
         let pkg = &args.go_packages[i];
@@ -356,42 +525,16 @@ fn run_go(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -> 
                 "tail": tail(&ex.out, 2000), "error": ex.spawn_err,
             });
         }
-        let wd = work_root.join("go").join(&safe);
-        let _ = std::fs::create_dir_all(&wd);
-        let mut rc = Command::new(&bin);
-        // t.TempDir() resolves under TMPDIR, which pins scratch dirs to the
-        // mount; parallel=1 keeps shared-TMPDIR listing tests deterministic
-        rc.arg("-test.v")
-            .arg("-test.parallel=1")
-            .arg(format!("-test.timeout={}s", args.timeout))
-            .current_dir(&wd)
-            .env("TMPDIR", &wd);
-        if !skip.is_empty() {
-            rc.arg(format!("-test.skip={skip}"));
-        }
-        let t0 = Instant::now();
-        let ex = exec_with_timeout(rc, Duration::from_secs(args.timeout.max(1)));
-        let p = parse_go_v(&ex.out);
-        let ok = ex.code == Some(0) && !ex.timed_out && p.fail == 0;
-        if !ok {
-            warn!("stdfs[go]: {} FAILED ({} pass {} fail {} skip)", pkg, p.pass, p.fail, p.skip);
-        }
-        info!(
-            "stdfs[go]: {} {} pass={} fail={} skip={} ({}s)",
+        let pkg_src = goroot_path.join("src").join(pkg);
+        run_go_test_bin(
+            &bin,
             pkg,
-            if ok { "ok" } else { "fail" },
-            p.pass, p.fail, p.skip,
-            t0.elapsed().as_secs()
-        );
-        let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "fail" };
-        json!({
-            "name": pkg, "status": status,
-            "pass": p.pass, "fail": p.fail, "skip": p.skip,
-            "failures": p.failures.iter().map(|(n, t)| json!({"name": n, "tail": t})).collect::<Vec<_>>(),
-            "durationMs": t0.elapsed().as_millis() as u64,
-            "exitCode": ex.code,
-            "tail": tail(&ex.out, 2000),
-        })
+            pkg_src.is_dir().then_some(pkg_src.as_path()),
+            &skip,
+            args.jobs,
+            args.timeout,
+            work_root,
+        )
     });
     let ok = items.iter().all(|it| it["status"] == json!("ok"));
     json!({
@@ -460,41 +603,95 @@ fn python_exe_for_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-// harness artifact when the suite runs from a --python-dir Lib: test_fork's
-// child python re-execs with -E (ignoring PYTHONPATH) and cannot import test
-const PYTHON_IGNORE_DEFAULT: &[&str] = &["test.test_os.ForkTests.test_fork"];
+// harness artifacts:
+// - `ForkTests.test_fork`: child python re-execs with `-E` (ignoring PYTHONPATH)
+// - `TestExtractionFilters.test_modes`: expects `chmod(0o6777)` to preserve `S_ISGID`,
+//   which BSD/Darwin kernels strip for unprivileged users when parent dir has gid=0
+// - `PosixTester.test_pipe2_c_limits`: raw `import _testcapi` for non-FS `pipe2()` C-int
+//   overflow check (`_testcapi` is omitted in stripped standalone/distro CPython builds)
+const PYTHON_IGNORE_DEFAULT: &[&str] = &[
+    "test.test_os.ForkTests.test_fork",
+    "test.test_tarfile.TestExtractionFilters.test_modes",
+    "test.test_posix.PosixTester.test_pipe2_c_limits",
+];
+
+// CPython C-API overflow / pthread-warning tests that require the internal
+// `_testcapi` C extension (omitted by `python-build-standalone` install_only_stripped
+// and minimal distro builds) and do not exercise filesystem syscalls.
+const PYTHON_IGNORE_NO_TESTCAPI: &[&str] = &[
+    "test.test_fcntl.TestFcntl.test_fcntl_bad_file_overflow",
+    "test.test_fcntl.TestFcntl.test_flock_overflow",
+    "test.test_fileio.COtherFileTests.testInvalidFd_overflow",
+    "test.test_fileio.PyOtherFileTests.testInvalidFd_overflow",
+    "test.test_os.ForkTests.test_fork_warns_when_non_python_thread_exists",
+];
 
 fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
-    let exe: Option<PathBuf> = if let Some(p) = &args.python_exe {
-        Some(p.clone())
-    } else if let Some(d) = &args.python_dir {
-        python_exe_for_dir(d).or_else(|| find_in_path("python3"))
-    } else {
-        find_in_path("python3")
-    };
-    let Some(exe) = exe else {
-        return unavailable("no python3 on PATH; pass --python-exe".into());
-    };
-    let test_lib: PathBuf = match &args.python_dir {
-        Some(d) => d.clone(),
-        None => {
-            let Some(stdlib) = cmd_stdout({
-                let mut c = Command::new(&exe);
-                c.args(["-c", "import sysconfig;print(sysconfig.get_path('stdlib'))"]);
-                c
-            }) else {
-                return unavailable(format!("failed to query stdlib dir of {}", exe.display()));
-            };
-            let p = PathBuf::from(&stdlib);
-            if !p.join("test").is_dir() {
-                return unavailable(format!(
-                    "python3 ({}) ships without the bundled `test` package; pass --python-dir (a CPython Lib/ dir containing test/)",
-                    exe.display()
-                ));
-            }
-            p
+    let mut chosen: Option<(PathBuf, PathBuf)> = None;
+    if args.python_exe.is_none()
+        && args.python_dir.is_none()
+        && let Some(bundle) = crate::bundle::ensure_extracted()
+    {
+        let b_py = bundle.join("python");
+        let b_exe = ["bin/python3", "bin/python3.12"]
+            .iter()
+            .map(|rel| b_py.join(rel))
+            .find(|p| p.is_file());
+        let b_lib = ["lib/python3.12", "Lib"]
+            .iter()
+            .map(|rel| b_py.join(rel))
+            .find(|p| p.join("test").is_dir());
+        if let (Some(exe), Some(lib)) = (b_exe, b_lib) {
+            chosen = Some((exe, lib));
         }
-    };
+    }
+
+    if chosen.is_none() {
+        let candidates: Vec<PathBuf> = if let Some(p) = &args.python_exe {
+            vec![p.clone()]
+        } else if let Some(d) = &args.python_dir {
+            python_exe_for_dir(d)
+                .into_iter()
+                .chain(find_all_in_path("python3"))
+                .collect()
+        } else {
+            find_all_in_path("python3")
+        };
+        let Some(first_exe) = candidates.first().cloned() else {
+            return unavailable("no python3 on PATH; pass --python-exe".into());
+        };
+        if let Some(d) = &args.python_dir {
+            chosen = Some((first_exe.clone(), d.clone()));
+        } else {
+            for cand in &candidates {
+                if let Some(stdlib) = cmd_stdout({
+                    let mut c = Command::new(cand);
+                    c.args(["-c", "import sysconfig;print(sysconfig.get_path('stdlib'))"]);
+                    c
+                }) {
+                    let p = PathBuf::from(&stdlib);
+                    if p.join("test").is_dir() {
+                        chosen = Some((cand.clone(), p));
+                        break;
+                    }
+                }
+            }
+            if chosen.is_none()
+                && let Some(bundle_lib) = crate::bundle::ensure_extracted()
+                    .map(|b| b.join("python/Lib"))
+                    .filter(|p| p.join("test").is_dir())
+            {
+                chosen = Some((first_exe.clone(), bundle_lib));
+            }
+        }
+        if chosen.is_none() {
+            return unavailable(format!(
+                "python3 ({}) ships without the bundled `test` package; pass --python-dir (a CPython Lib/ dir containing test/)",
+                first_exe.display()
+            ));
+        }
+    }
+    let (exe, test_lib) = chosen.unwrap();
     if !test_lib.join("test").is_dir() {
         return unavailable(format!("{} contains no test/ package", test_lib.display()));
     }
@@ -524,7 +721,17 @@ fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
     } else {
         ""
     };
+    let has_testcapi = Command::new(&exe)
+        .args(["-c", "import _testcapi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     let mut patterns: Vec<String> = PYTHON_IGNORE_DEFAULT.iter().map(|s| s.to_string()).collect();
+    if !has_testcapi {
+        patterns.extend(PYTHON_IGNORE_NO_TESTCAPI.iter().map(|s| s.to_string()));
+    }
     patterns.extend(args.python_ignore.iter().cloned());
     let ignore_file = work_root.join(".python-ignore.txt");
     if !ignore_flag.is_empty() && !patterns.is_empty() {
@@ -539,8 +746,16 @@ fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
     );
     let items = run_parallel(modules.len(), args.jobs, |i| {
         let m = &modules[i];
-        if !test_lib.join("test").join(format!("{m}.py")).is_file() {
-            return json!({"name": m, "status": "missing"});
+        let mod_exists = test_lib.join("test").join(format!("{m}.py")).is_file()
+            || test_lib.join("test").join(m).join("__init__.py").is_file();
+        if !mod_exists {
+            warn!("stdfs[python]: module {m} missing in {}", test_lib.join("test").display());
+            return json!({
+                "name": m,
+                "status": "missing",
+                "failures": [format!("module {m} not found in {}", test_lib.join("test").display())],
+                "tail": format!("module {m} not found in {}", test_lib.join("test").display()),
+            });
         }
         let wd = work_root.join("python").join(m);
         let _ = std::fs::create_dir_all(&wd);
@@ -584,7 +799,7 @@ fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
             "tail": tail(&ex.out, 2000),
         })
     });
-    let ok = items.iter().all(|it| it["status"] == json!("ok") || it["status"] == json!("missing"));
+    let ok = items.iter().all(|it| it["status"] == json!("ok"));
     json!({
         "available": true,
         "status": if ok { "ok" } else { "failed" },
@@ -593,7 +808,7 @@ fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         "summary": {
             "modules": items.len(),
             "missing": items.iter().filter(|it| it["status"] == json!("missing")).count(),
-            "failed": items.iter().filter(|it| it["status"] != json!("ok") && it["status"] != json!("missing")).count(),
+            "failed": items.iter().filter(|it| it["status"] != json!("ok")).count(),
         },
         "items": items,
     })
@@ -643,12 +858,63 @@ fn parse_tap(out: &str) -> TapParsed {
     p
 }
 
-// node test files skipped by default because they assume cwd == the node
-// checkout root (relative paths into test/)
-const NODE_EXCLUDE_DEFAULT: &[&str] = &["test-fs-realpath-native.js"];
+// Node test files excluded by default: checkout-relative tests, host `/proc` readers,
+// and pure JS argument-type-validation files (`ERR_INVALID_ARG_TYPE`) that perform
+// zero filesystem syscalls.
+const NODE_EXCLUDE_DEFAULT: &[&str] = &[
+    "test-fs-realpath-native.js",
+    "test-fs-assert-encoding-error.js",
+    "test-fs-buffertype-writesync.js",
+    "test-fs-chown-type-check.js",
+    "test-fs-constants.js",
+    "test-fs-fchmod.js",
+    "test-fs-fchown.js",
+    "test-fs-null-bytes.js",
+    "test-fs-promises-exists.js",
+    "test-fs-read-file-assert-encoding.js",
+    "test-fs-read-file-sync-hostname.js",
+    "test-fs-read-stream-patch-open.js",
+    "test-fs-readlink-type-check.js",
+    "test-fs-rename-type-check.js",
+    "test-fs-rmdir-type-check.js",
+    "test-fs-stream-options.js",
+    "test-fs-sync-fd-leak.js",
+    "test-fs-timestamp-parsing-error.js",
+    "test-fs-unlink-type-check.js",
+    "test-fs-util-validateoffsetlength.js",
+    "test-fs-watch-recursive-validate.js",
+    "test-fs-write-no-fd.js",
+    "test-fs-write-stream-throw-type-error.js",
+];
+
+fn is_node_stat_watchfile_test(name: &str) -> bool {
+    name.starts_with("test-fs-watchfile") || name == "test-fs-watch-file-enoent-after-deletion.js"
+}
+
+fn is_node_event_watch_test(name: &str) -> bool {
+    name.contains("watch") && !is_node_stat_watchfile_test(name)
+}
+
+impl Args {
+    pub fn include_node_event_watch(&self) -> bool {
+        if self.node_watch {
+            true
+        } else if self.no_node_watch {
+            false
+        } else {
+            cfg!(target_os = "linux")
+        }
+    }
+}
 
 fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
-    let Some(node) = find_in_path("node") else {
+    let bundled_node_root = crate::bundle::ensure_extracted().map(|b| b.join("node"));
+    let node_cand = bundled_node_root
+        .as_ref()
+        .map(|r| r.join("bin/node"))
+        .filter(|p| p.is_file())
+        .or_else(|| find_in_path("node"));
+    let Some(node) = node_cand else {
         return unavailable("no `node` on PATH; install Node.js".into());
     };
     if let Some(v) = cmd_stdout({
@@ -661,14 +927,19 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
             return unavailable(format!("node {v} lacks the --test runner (need >= 18)"));
         }
     }
-    // installed node binaries never ship the test suite; a from-source tree has
-    // test/ two levels up from the built binary (node/out/Release/node)
+    // installed node binaries never ship the test suite; check --node-dir, then
+    // an attached bundle, then a from-source tree (node/out/Release/node)
     let dir: PathBuf = match &args.node_dir {
         Some(d) => d.clone(),
         None => {
+            let from_bundle = bundled_node_root
+                .filter(|r| r.join("test/parallel").is_dir() && r.join("test/common").is_dir());
             let cand = node.parent().unwrap_or(Path::new("/")).ancestors().nth(2).map(|p| p.join("test"));
-            match cand.filter(|c| c.join("parallel").is_dir()) {
-                Some(c) => c.parent().unwrap().to_path_buf(),
+            let from_tree = cand
+                .filter(|c| c.join("parallel").is_dir())
+                .and_then(|c| c.parent().map(Path::to_path_buf));
+            match from_bundle.or(from_tree) {
+                Some(c) => c,
                 None => {
                     return unavailable(
                         "node binary distributions don't ship the test suite; pass --node-dir pointing at a nodejs/node checkout (containing test/parallel)".into(),
@@ -683,6 +954,7 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
             dir.display()
         ));
     }
+    let include_event_watch = args.include_node_event_watch();
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("test/parallel"))
         .map_err(|e| format!("{}: {e}", dir.join("test/parallel").display()))
         .unwrap()
@@ -690,7 +962,9 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         .map(|e| e.path())
         .filter(|p| {
             let n = p.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
-            n.starts_with("test-fs-") && n.ends_with(".js") && !n.contains("watch")
+            n.starts_with("test-fs-")
+                && n.ends_with(".js")
+                && (include_event_watch || !is_node_event_watch_test(&n))
                 && !NODE_EXCLUDE_DEFAULT.iter().any(|x| n.contains(x))
         })
         .collect();
@@ -701,7 +975,12 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
     if files.is_empty() {
         return unavailable("no test-fs-*.js files matched in test/parallel".into());
     }
-    info!("stdfs[node]: {} {} fs test files (watch excluded)", node.display(), files.len());
+    info!(
+        "stdfs[node]: {} {} fs test files (watchFile=on, fs.watch={})",
+        node.display(),
+        files.len(),
+        if include_event_watch { "on" } else { "off" }
+    );
     let names: Vec<String> = files
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -747,6 +1026,8 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         "status": if ok { "ok" } else { "failed" },
         "node": node.display().to_string(),
         "checkout": dir.display().to_string(),
+        "watchFile": true,
+        "eventWatch": include_event_watch,
         "summary": {
             "files": items.len(),
             "failed": items.iter().filter(|it| it["status"] != json!("ok")).count(),
@@ -874,7 +1155,9 @@ fn transform_rust_tests(src: &str) -> (String, Vec<(Vec<String>, String)>, Vec<S
         // std's internal dirfd type, which keeps growing new users across
         // releases (test_dir_metadata joined in 1.98) — a body rule beats
         // enumerating names
-        let uses_internal_dir = lines[j..k].iter().any(|l| l.contains("Dir::"));
+        let uses_internal_dir = lines[j..k]
+            .iter()
+            .any(|l| l.contains("Dir::") || l.contains("set_permissions_nofollow"));
         if RUST_EXCLUDE.iter().any(|(n, _)| *n == name) || uses_internal_dir {
             excluded.push(name.clone());
             skip.push((back, k - 1));
@@ -918,101 +1201,315 @@ fn transform_rust_tests(src: &str) -> (String, Vec<(Vec<String>, String)>, Vec<S
     (out, tests, excluded)
 }
 
-const SHIM: &str = r#"
-mod shim {
-    // assert_matches! is not exported by current stable std; reproduce the
-    // upstream macro (same match-and-panic semantics, including the optional
-    // `if guard` and trailing format-message forms the std tests use)
-    macro_rules! assert_matches {
-        ($left:expr, $($pattern:pat_param)|+ $(if $guard:expr)?) => {
-            match $left {
-                $($pattern)|+ $(if $guard)? => {}
-                left => panic!(
-                    "assertion failed: `{:?}` does not match any of the expected patterns",
-                    left
-                ),
-            }
-        };
-        ($left:expr, $($pattern:pat_param)|+ $(if $guard:expr)?, $($arg:tt)+) => {
-            match $left {
-                $($pattern)|+ $(if $guard)? => {}
-                left => panic!(
-                    "assertion failed: `{:?}` does not match any of the expected patterns: {}",
-                    left,
-                    format_args!($($arg)+)
-                ),
-            }
-        };
-    }
-    pub(crate) use assert_matches;
-    pub mod rand {
-        pub trait RngCore {
-            fn fill_bytes(&mut self, dest: &mut [u8]);
+macro_rules! emit_and_str_shim {
+    ($($body:tt)*) => {
+        const SHIM: &str = stringify!($($body)*);
+
+        #[allow(warnings, unsafe_op_in_unsafe_fn, dead_code, unused_imports, non_snake_case)]
+        mod embedded_rust {
+            $($body)*
+            include!(concat!(env!("OUT_DIR"), "/stdfs_rust_embedded.rs"));
         }
-        pub struct TestRng(u64);
-        impl TestRng {
-            fn next_u64(&mut self) -> u64 {
-                let mut x = self.0;
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                self.0 = x;
-                x
-            }
+    };
+}
+
+emit_and_str_shim! {
+    pub mod shim {
+        macro_rules! assert_matches {
+            ($left:expr, $($pattern:pat_param)|+ $(if $guard:expr)?) => {
+                match $left {
+                    $($pattern)|+ $(if $guard)? => {}
+                    left => panic!(
+                        "assertion failed: `{:?}` does not match any of the expected patterns",
+                        left
+                    ),
+                }
+            };
+            ($left:expr, $($pattern:pat_param)|+ $(if $guard:expr)?, $($arg:tt)+) => {
+                match $left {
+                    $($pattern)|+ $(if $guard)? => {}
+                    left => panic!(
+                        "assertion failed: `{:?}` does not match any of the expected patterns: {}",
+                        left,
+                        format_args!($($arg)+)
+                    ),
+                }
+            };
         }
-        impl RngCore for TestRng {
-            fn fill_bytes(&mut self, dest: &mut [u8]) {
-                for chunk in dest.chunks_mut(8) {
-                    let b = self.next_u64().to_le_bytes();
-                    chunk.copy_from_slice(&b[..chunk.len()]);
+        pub(crate) use assert_matches;
+        pub mod rand {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            pub trait RngCore {
+                fn fill_bytes(&mut self, dest: &mut [u8]);
+            }
+            pub struct TestRng(u64);
+            impl TestRng {
+                fn next_u64(&mut self) -> u64 {
+                    let mut x = self.0;
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    self.0 = x;
+                    x
                 }
             }
-        }
-        pub fn test_rng() -> TestRng {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E37_79B9_7F4A_7C15);
-            TestRng(nanos | 1)
-        }
-    }
-    pub mod test_helpers {
-        use std::ops::Deref;
-        use std::path::{Path, PathBuf};
-        use std::sync::atomic::{AtomicU64, Ordering};
-        pub use super::rand::test_rng;
-        pub struct TempDir(PathBuf);
-        impl TempDir {
-            pub fn path(&self) -> &Path {
-                &self.0
+            impl RngCore for TestRng {
+                fn fill_bytes(&mut self, dest: &mut [u8]) {
+                    for chunk in dest.chunks_mut(8) {
+                        let b = self.next_u64().to_le_bytes();
+                        chunk.copy_from_slice(&b[..chunk.len()]);
+                    }
+                }
+            }
+            static RNG_SEQ: AtomicU64 = AtomicU64::new(1);
+            pub fn test_rng() -> TestRng {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E37_79B9_7F4A_7C15);
+                let salt = RNG_SEQ.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+                TestRng((nanos ^ salt) | 1)
             }
         }
-        impl Deref for TempDir {
-            type Target = Path;
-            fn deref(&self) -> &Path {
-                &self.0
+        pub mod test_helpers {
+            use std::ops::Deref;
+            use std::path::{Path, PathBuf};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            pub use super::rand::test_rng;
+            pub struct TempDir(PathBuf);
+            impl TempDir {
+                pub fn path(&self) -> &Path {
+                    &self.0
+                }
             }
-        }
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
+            impl Deref for TempDir {
+                type Target = Path;
+                fn deref(&self) -> &Path {
+                    &self.0
+                }
             }
-        }
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        pub fn tmpdir() -> TempDir {
-            let base = std::env::temp_dir().join(format!(
-                "fstest-ruststd-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::SeqCst)
-            ));
-            std::fs::create_dir(&base).expect("tmpdir create");
-            TempDir(base)
+            impl Drop for TempDir {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            pub fn tmpdir() -> TempDir {
+                let base = std::env::temp_dir().join(format!(
+                    "fstest-ruststd-{}-{}",
+                    std::process::id(),
+                    SEQ.fetch_add(1, Ordering::SeqCst)
+                ));
+                std::fs::create_dir(&base).expect("tmpdir create");
+                TempDir(base)
+            }
         }
     }
 }
-"#;
+
+fn emit_rust_res_line(line: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// Hidden child entrypoint `fstest __stdfs-rust [--jobs <N>] [--skip <pat>]...`
+/// running the compile-time embedded `std::fs` test suite concurrently across
+/// `N` workers with zero target-host toolchain dependency.
+pub fn rust_helper_main(argv: &[String]) -> i32 {
+    let mut skips: Vec<String> = Vec::new();
+    let mut jobs: usize = std::env::var("STDFS_RUST_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(default_jobs);
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--skip"
+            && let Some(p) = argv.get(i + 1)
+        {
+            if !p.is_empty() {
+                skips.push(p.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if argv[i] == "--jobs"
+            && let Some(j) = argv.get(i + 1)
+        {
+            if let Ok(n) = j.parse::<usize>() {
+                jobs = n.max(1);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    let per_test: u64 = std::env::var("STDFS_TEST_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    let _ = run_parallel(embedded_rust::EMBEDDED_TESTS.len(), jobs.max(1), |idx| {
+        let (name, func, ignored) = &embedded_rust::EMBEDDED_TESTS[idx];
+        if *ignored {
+            emit_rust_res_line(&format!("RES\t{name}\tskipped\t#[ignore]"));
+            return;
+        }
+        if skips.iter().any(|p| name.contains(p.as_str())) {
+            emit_rust_res_line(&format!("RES\t{name}\tskipped\t--rust-skip"));
+            return;
+        }
+        let n = *name;
+        let f = *func;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| {
+                    if let Some(s) = p.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = p.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "panic".to_string()
+                    }
+                });
+                let _ = tx.send(r);
+            })
+            .expect("spawn test thread");
+        let line = match rx.recv_timeout(std::time::Duration::from_secs(per_test)) {
+            Ok(Ok(())) => format!("RES\t{n}\tok\t"),
+            Ok(Err(msg)) => format!("RES\t{n}\tfail\t{}", msg.replace('\n', " ")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                format!("RES\t{n}\ttimedout\tno result in {per_test}s (deadlock or blocked syscall)")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                format!("RES\t{n}\tfail\tthread panicked or aborted")
+            }
+        };
+        emit_rust_res_line(&line);
+    });
+    emit_rust_res_line("DONE");
+    std::process::exit(0);
+}
+
+fn collect_rust_runner_report(
+    ex: Exec,
+    total_tests: usize,
+    elapsed: Duration,
+    rustc_desc: String,
+    source_desc: String,
+    excluded: Vec<Value>,
+) -> Value {
+    let (mut pass, mut fail, mut skip, mut per_test_timeout) = (0u64, 0u64, 0u64, 0u64);
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut seen = 0u64;
+    for line in ex.out.lines() {
+        let mut it = line.splitn(4, '\t');
+        if it.next() != Some("RES") {
+            continue;
+        }
+        let Some(name) = it.next() else { continue };
+        let Some(status) = it.next() else { continue };
+        let msg = it.next().unwrap_or("");
+        seen += 1;
+        match status {
+            "ok" => pass += 1,
+            "skipped" => skip += 1,
+            "timedout" => {
+                per_test_timeout += 1;
+                fail += 1;
+                if failures.len() < 20 {
+                    failures.push((name.to_string(), format!("[timedout] {}", tail(msg, 400))));
+                }
+            }
+            _ => {
+                fail += 1;
+                if failures.len() < 20 {
+                    failures.push((name.to_string(), tail(msg, 500)));
+                }
+            }
+        }
+    }
+    let ok = ex.code == Some(0) && !ex.timed_out && fail == 0;
+    if !ok {
+        warn!("stdfs[rust]: FAILED ({pass} pass {fail} fail {skip} skip {per_test_timeout} timedout)");
+    }
+    info!(
+        "stdfs[rust]: {} pass={} fail={} skip={} timedout={} ({}s)",
+        if ok { "ok" } else { "fail" },
+        pass,
+        fail,
+        skip,
+        per_test_timeout,
+        elapsed.as_secs()
+    );
+    let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "failed" };
+    json!({
+        "available": true,
+        "status": status,
+        "rustc": rustc_desc,
+        "source": source_desc,
+        "excluded": excluded,
+        "summary": {
+            "total": total_tests,
+            "reported": seen,
+            "pass": pass,
+            "fail": fail,
+            "skip": skip,
+            "timedout": if ex.timed_out { (total_tests as u64).saturating_sub(seen) } else { per_test_timeout },
+        },
+        "failures": failures.iter().map(|(n, t)| json!({"name": n, "tail": t})).collect::<Vec<_>>(),
+        "durationMs": elapsed.as_millis() as u64,
+        "tail": tail(&ex.out, 2000),
+    })
+}
 
 fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -> Value {
+    let per_test_env = std::env::var("STDFS_TEST_TIMEOUT")
+        .unwrap_or_else(|_| args.rust_test_timeout.to_string());
+    let jobs_str = args.jobs.max(1).to_string();
+
+    // Fast, zero-dependency path: run the std::fs suite compiled directly into this binary
+    // unless the caller explicitly asked for an external `--rust-src-dir`.
+    if args.rust_src_dir.is_none() && embedded_rust::EMBEDDED_AVAILABLE {
+        let Ok(exe) = std::env::current_exe() else {
+            return unavailable("cannot resolve current_exe for embedded rust std::fs runner".into());
+        };
+        let wd = work_root.join("rust");
+        let _ = std::fs::create_dir_all(&wd);
+        let mut rc = Command::new(&exe);
+        rc.arg("__stdfs-rust").arg("--jobs").arg(&jobs_str);
+        for sk in &args.rust_skip {
+            if !sk.is_empty() {
+                rc.arg("--skip").arg(sk);
+            }
+        }
+        rc.current_dir(&wd)
+            .env("TMPDIR", &wd)
+            .env("RUST_BACKTRACE", "0")
+            .env("STDFS_RUST_JOBS", &jobs_str)
+            .env("STDFS_TEST_TIMEOUT", &per_test_env);
+        info!(
+            "stdfs[rust]: running {} embedded std::fs tests across {} jobs (zero external toolchain)...",
+            embedded_rust::EMBEDDED_TESTS.len(),
+            args.jobs.max(1)
+        );
+        let t0 = Instant::now();
+        let ex = exec_with_timeout(rc, Duration::from_secs(args.timeout.max(1)));
+        let excluded_json: Vec<Value> = embedded_rust::EMBEDDED_EXCLUDED
+            .iter()
+            .map(|(n, r)| json!({"name": n, "reason": r}))
+            .collect();
+        return collect_rust_runner_report(
+            ex,
+            embedded_rust::EMBEDDED_TESTS.len(),
+            t0.elapsed(),
+            "embedded-at-build".into(),
+            embedded_rust::EMBEDDED_SOURCE.into(),
+            excluded_json,
+        );
+    }
+
     let Some(rustc) = find_in_path("rustc").or_else(|| std::env::var("RUSTC").ok().map(PathBuf::from)) else {
         return unavailable("no rustc on PATH; install Rust or pass --rust-src-dir".into());
     };
@@ -1040,8 +1537,6 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
         .map_err(|e| format!("{}: {e}", tests_rs.display()))
         .unwrap();
     let (body, mut tests, mut excluded) = transform_rust_tests(&src);
-    // explicit --rust-skip: report matching tests as skipped instead of running
-    // them (e.g. a test known to deadlock on the filesystem under test)
     let skip_pats: Vec<&String> = args.rust_skip.iter().filter(|s| !s.is_empty()).collect();
     if !skip_pats.is_empty() {
         let mut dropped: Vec<String> = Vec::new();
@@ -1068,7 +1563,7 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
     runner.push_str(&body);
     runner.push_str("}\n\nstatic TESTS: &[(&str, fn(), bool)] = &[\n");
     for (attrs, name) in &tests {
-        for a in attrs {
+        for a in attrs.iter().filter(|a| a.starts_with("#[cfg(")) {
             runner.push_str("    ");
             runner.push_str(a);
             runner.push('\n');
@@ -1078,56 +1573,71 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
     }
     runner.push_str("];\n\n");
     runner.push_str(
-        r#"fn main() {
+        r#"fn emit(line: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+fn main() {
     let filter = std::env::args().nth(1);
-    // Per-test wall-clock cap: a single wedged test (e.g. a recursive
-    // remove deadlocked on the filesystem under test) must not swallow the
-    // whole run. The worker thread is detached on timeout and the process
-    // exits at the end, so a stuck test costs one timeout slot, not the run.
     let per_test: u64 = std::env::var("STDFS_TEST_TIMEOUT").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(120);
-    for (name, func, ignored) in TESTS {
-        if *ignored {
-            println!("RES\t{name}\tskipped\t#[ignore]");
-            continue;
-        }
-        if let Some(f) = &filter {
-            if !name.contains(f.as_str()) {
-                println!("RES\t{name}\tskipped\t");
-                continue;
-            }
-        }
-        let n = *name;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)).map_err(|p| {
-                    if let Some(s) = p.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = p.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "panic".to_string()
+    let jobs: usize = std::env::var("STDFS_RUST_JOBS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(4).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| loop {
+                let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx >= TESTS.len() {
+                    break;
+                }
+                let (name, func, ignored) = &TESTS[idx];
+                if *ignored {
+                    emit(&format!("RES\t{name}\tskipped\t#[ignore]"));
+                    continue;
+                }
+                if let Some(f) = &filter {
+                    if !name.contains(f.as_str()) {
+                        emit(&format!("RES\t{name}\tskipped\t"));
+                        continue;
                     }
-                });
-                let _ = tx.send(r);
-            })
-            .expect("spawn test thread");
-        match rx.recv_timeout(std::time::Duration::from_secs(per_test)) {
-            Ok(Ok(())) => println!("RES\t{n}\tok\t"),
-            Ok(Err(msg)) => println!("RES\t{n}\tfail\t{}", msg),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                println!("RES\t{n}\ttimedout\tno result in {per_test}s (deadlock or blocked syscall)");
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                println!("RES\t{n}\tfail\tthread panicked or aborted");
-            }
+                }
+                let n = *name;
+                let fn_ptr = *func;
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(fn_ptr)).map_err(|p| {
+                            if let Some(s) = p.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = p.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "panic".to_string()
+                            }
+                        });
+                        let _ = tx.send(r);
+                    })
+                    .expect("spawn test thread");
+                let line = match rx.recv_timeout(std::time::Duration::from_secs(per_test)) {
+                    Ok(Ok(())) => format!("RES\t{n}\tok\t"),
+                    Ok(Err(msg)) => format!("RES\t{n}\tfail\t{}", msg.replace('\n', " ")),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        format!("RES\t{n}\ttimedout\tno result in {per_test}s (deadlock or blocked syscall)")
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        format!("RES\t{n}\tfail\tthread panicked or aborted")
+                    }
+                };
+                emit(&line);
+            });
         }
-    }
-    println!("DONE");
-    // exit explicitly: we may have detached threads still blocked in the
-    // filesystem under test and must not wait for them
+    });
+    emit("DONE");
     std::process::exit(0);
 }
 "#,
@@ -1138,16 +1648,15 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
         return unavailable(format!("write {}: {e}", runner_rs.display()));
     }
     info!(
-        "stdfs[rust]: {} ({}) -> {} tests ({} excluded: {}); compiling with {}...",
+        "stdfs[rust]: {} ({}) -> {} tests ({} excluded); compiling with {}...",
         tests_rs.display(),
         "std/src/fs/tests.rs",
         tests.len(),
         excluded.len(),
-        RUST_EXCLUDE.iter().filter(|(n, _)| excluded.iter().any(|x| x == *n)).map(|(n, r)| format!("{n}: {r}")).collect::<Vec<_>>().join(", "),
         rustc.display()
     );
     let mut cc = Command::new(&rustc);
-    cc.arg("--edition=2021")
+    cc.arg("--edition=2024")
         .args(["-C", "opt-level=1", "-C", "debuginfo=0"])
         .arg("-o")
         .arg(&runner_bin)
@@ -1170,63 +1679,23 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
     rc.current_dir(&wd)
         .env("TMPDIR", &wd)
         .env("RUST_BACKTRACE", "0")
-        // per-test cap inside the generated runner; a single wedged test is
-        // reported as timedout and the run continues instead of stalling
-        .env("STDFS_TEST_TIMEOUT", std::env::var("STDFS_TEST_TIMEOUT").unwrap_or_else(|_| "120".into()));
+        .env("STDFS_RUST_JOBS", &jobs_str)
+        .env("STDFS_TEST_TIMEOUT", &per_test_env);
     let t0 = Instant::now();
     let ex = exec_with_timeout(rc, Duration::from_secs(args.timeout.max(1)));
-    let (mut pass, mut fail, mut per_test_timeout) = (0u64, 0u64, 0u64);
-    let mut failures: Vec<(String, String)> = Vec::new();
-    let mut seen = 0u64;
-    for line in ex.out.lines() {
-        let mut it = line.splitn(4, '\t');
-        if it.next() != Some("RES") {
-            continue;
-        }
-        let Some(name) = it.next() else { continue };
-        let Some(status) = it.next() else { continue };
-        let msg = it.next().unwrap_or("");
-        seen += 1;
-        match status {
-            "ok" | "skipped" => pass += 1,
-            "timedout" => {
-                per_test_timeout += 1;
-                fail += 1;
-                if failures.len() < 20 {
-                    failures.push((name.to_string(), format!("[timedout] {}", tail(msg, 400))));
-                }
-            }
-            _ => {
-                fail += 1;
-                if failures.len() < 20 {
-                    failures.push((name.to_string(), tail(msg, 500)));
-                }
-            }
-        }
-    }
-    let ok = ex.code == Some(0) && !ex.timed_out && fail == 0;
-    if !ok {
-        warn!("stdfs[rust]: FAILED ({} pass {} fail {} timedout)", pass, fail, per_test_timeout);
-    }
-    info!("stdfs[rust]: {} pass={} fail={} timedout={} ({}s)", if ok { "ok" } else { "fail" }, pass, fail, per_test_timeout, t0.elapsed().as_secs());
-    let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "fail" };
-    json!({
-        "available": true,
-        "status": status,
-        "rustc": rustc.display().to_string(),
-        "source": tests_rs.display().to_string(),
-        "excluded": RUST_EXCLUDE.iter().filter(|(n, _)| excluded.iter().any(|x| x == *n)).map(|(n, r)| json!({"name": n, "reason": r})).collect::<Vec<_>>(),
-        "summary": {
-            "total": tests.len(),
-            "reported": seen,
-            "pass": pass,
-            "fail": fail,
-            "timedout": if ex.timed_out { tests.len() as u64 - seen } else { per_test_timeout },
-        },
-        "failures": failures.iter().map(|(n, t)| json!({"name": n, "tail": t})).collect::<Vec<_>>(),
-        "durationMs": t0.elapsed().as_millis() as u64,
-        "tail": tail(&ex.out, 2000),
-    })
+    let excluded_json: Vec<Value> = RUST_EXCLUDE
+        .iter()
+        .filter(|(n, _)| excluded.iter().any(|x| x == *n))
+        .map(|(n, r)| json!({"name": n, "reason": r}))
+        .collect();
+    collect_rust_runner_report(
+        ex,
+        tests.len(),
+        t0.elapsed(),
+        rustc.display().to_string(),
+        tests_rs.display().to_string(),
+        excluded_json,
+    )
 }
 
 // ---------- entry ----------
@@ -1259,20 +1728,17 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         info!("stdfs: {lang} done in {}s", t0.elapsed().as_secs());
         languages.insert(lang.clone(), v);
     }
-    // best-effort, bounded cleanup of the on-mount work tree: a recursive
-    // remove can block indefinitely on the very filesystem being tested
-    // (observed: a leftover tree from a wedged concurrency test pins the
-    // whole mount for rm/unlink/rename). Never let that cost us the report —
-    // wait a short bound, then leave the thread and continue to emit JSON.
-    remove_dir_all_bounded(&work_root, Duration::from_secs(20));
-    if std::env::var("FSTEST_KEEP_TMP").map(|v| v == "1").unwrap_or(false) {
-        warn!("FSTEST_KEEP_TMP=1: keeping {}", hosttmp.display());
+    // best-effort, bounded cleanup of the on-mount work tree unless `--keep` / `FSTEST_KEEP_TMP=1`.
+    let keep = args.keep || std::env::var("FSTEST_KEEP_TMP").map(|v| v == "1").unwrap_or(false);
+    if keep {
+        info!("stdfs: keeping work_root={} and hosttmp={}", work_root.display(), hosttmp.display());
     } else {
+        remove_dir_all_bounded(&work_root, Duration::from_secs(20));
         let _ = fs::remove_dir_all(&hosttmp);
     }
     let any_failed = languages.values().any(|v| {
         v.get("available").and_then(Value::as_bool).unwrap_or(false)
-            && v.get("status") == Some(&json!("failed"))
+            && v.get("status") != Some(&json!("ok"))
     });
     let host = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
@@ -1286,14 +1752,129 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             "langs": args.lang,
             "timeout_sec": args.timeout,
             "jobs": args.jobs,
+            "keep": args.keep,
         },
         "status": if any_failed { "failed" } else { "ok" },
         "results": {"languages": Value::Object(languages)},
     });
-    if let Some(path) = &args.json {
-        if let Err(e) = fs::write(path, serde_json::to_vec_pretty(&report).unwrap()) {
-            warn!("failed to write {}: {e}", path.display());
-        }
-    }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct CliWrap {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn cli_defaults_align_with_end_state() {
+        let parsed = CliWrap::try_parse_from(["test"]).expect("parse defaults");
+        assert_eq!(parsed.args.lang, vec!["go", "python", "node", "rust"]);
+        assert_eq!(parsed.args.go_packages, vec!["os", "path/filepath", "io/fs"]);
+        assert_eq!(GO_SKIP_DEFAULT, "^TestVariousDeadlines(1Proc|4Proc)?$");
+        assert_eq!(
+            parsed.args.python_modules,
+            vec![
+                "os",
+                "posix",
+                "posixpath",
+                "genericpath",
+                "pathlib",
+                "shutil",
+                "tarfile",
+                "stat",
+                "fileio",
+                "glob",
+                "tempfile",
+                "mmap",
+                "fcntl"
+            ]
+        );
+        assert!(!parsed.args.python_modules.iter().any(|m| m == "scandir"));
+        assert!(!parsed.args.keep);
+        assert_eq!(parsed.args.jobs, default_jobs());
+        assert!(NODE_EXCLUDE_DEFAULT.contains(&"test-fs-null-bytes.js"));
+        assert!(NODE_EXCLUDE_DEFAULT.contains(&"test-fs-read-file-sync-hostname.js"));
+        assert!(NODE_EXCLUDE_DEFAULT.contains(&"test-fs-watch-recursive-validate.js"));
+        assert!(!NODE_EXCLUDE_DEFAULT.contains(&"test-fs-promises-file-handle-sync.js"));
+        assert_eq!(parsed.args.include_node_event_watch(), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn node_watch_classification_separates_stat_polling_from_os_events() {
+        assert!(is_node_stat_watchfile_test("test-fs-watchfile.js"));
+        assert!(is_node_stat_watchfile_test("test-fs-watchfile-bigint.js"));
+        assert!(is_node_stat_watchfile_test("test-fs-watchfile-ref-unref.js"));
+        assert!(is_node_stat_watchfile_test("test-fs-watch-file-enoent-after-deletion.js"));
+        assert!(!is_node_event_watch_test("test-fs-watchfile.js"));
+        assert!(!is_node_event_watch_test("test-fs-watch-file-enoent-after-deletion.js"));
+
+        assert!(is_node_event_watch_test("test-fs-watch.js"));
+        assert!(is_node_event_watch_test("test-fs-promises-watch.js"));
+        assert!(is_node_event_watch_test("test-fs-watch-recursive-watch-file.js"));
+
+        let force_on = CliWrap::try_parse_from(["test", "--node-watch"]).expect("parse --node-watch");
+        assert!(force_on.args.include_node_event_watch());
+        let force_off = CliWrap::try_parse_from(["test", "--no-node-watch"]).expect("parse --no-node-watch");
+        assert!(!force_off.args.include_node_event_watch());
+    }
+
+    #[test]
+    fn parse_go_v_preserves_interleaved_parallel_failure_logs() {
+        let out = "\
+=== RUN   TestAlpha
+=== PAUSE TestAlpha
+=== RUN   TestBeta
+=== PAUSE TestBeta
+=== CONT  TestAlpha
+    alpha_test.go:42: expected ENOENT, got EACCES
+=== CONT  TestBeta
+    beta_test.go:10: diagnostic note
+--- PASS: TestBeta (0.01s)
+--- FAIL: TestAlpha (0.02s)
+=== RUN   TestGamma
+--- SKIP: TestGamma (0.00s)
+FAIL
+";
+        let p = parse_go_v(out);
+        assert_eq!(p.pass, 1);
+        assert_eq!(p.fail, 1);
+        assert_eq!(p.skip, 1);
+        assert_eq!(p.failures.len(), 1);
+        assert_eq!(p.failures[0].0, "TestAlpha");
+        assert!(
+            p.failures[0].1.contains("alpha_test.go:42: expected ENOENT"),
+            "got failure detail: {:?}",
+            p.failures[0].1
+        );
+    }
+
+    #[test]
+    fn rust_runner_report_separates_skip_from_pass() {
+        let ex = Exec {
+            code: Some(0),
+            timed_out: false,
+            out: "RES\ttest_create\tok\t\nRES\ttest_ignored\tskipped\t#[ignore]\nRES\ttest_rename\tok\t\nDONE\n".into(),
+            spawn_err: None,
+        };
+        let rep = collect_rust_runner_report(
+            ex,
+            3,
+            Duration::from_millis(25),
+            "embedded-at-build".into(),
+            "std/src/fs/tests.rs".into(),
+            vec![],
+        );
+        assert_eq!(rep["status"], json!("ok"));
+        assert_eq!(rep["summary"]["total"], json!(3));
+        assert_eq!(rep["summary"]["reported"], json!(3));
+        assert_eq!(rep["summary"]["pass"], json!(2));
+        assert_eq!(rep["summary"]["skip"], json!(1));
+        assert_eq!(rep["summary"]["fail"], json!(0));
+    }
 }

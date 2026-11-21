@@ -1,22 +1,29 @@
-// pjdfstest functional suite (https://github.com/pjd/pjdfstest, BSD-2-Clause).
-// The upstream shell tests (tests/*.t + misc.sh + conf) are embedded at compile
-// time and piped to `sh -s` at runtime — nothing but the tests' own scratch
-// files ever touches the filesystem under test. The privileged-operation helper
-// that upstream ships as the setuid `pjdfstest` C binary is reimplemented as a
-// hidden `fstest __pjdfstest` mode invoked through the current executable, so
-// distribution stays a single binary.
+// pjdfstest POSIX conformance suite (https://github.com/pjd/pjdfstest, BSD-2-Clause).
+// Upstream `.t` scripts and `misc.sh` are embedded at compile time; the privileged
+// C syscall helper is implemented as `fstest __pjdfstest` inside the same binary.
 
-use crate::smallfile::iso8601;
+use crate::common::{
+     detect_fstype, exec_with_timeout, host_name, iso8601, posix_fallocate_fd,
+    remove_dir_all_bounded, tail_utf8,
+};
 use log::{info, warn};
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 include!(concat!(env!("OUT_DIR"), "/pjdfstest_files.rs"));
+
+fn default_jobs() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(4)
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -24,8 +31,7 @@ pub struct Args {
     #[arg(long = "filter")]
     pub filter: Vec<String>,
 
-    /// override the detected filesystem type passed to the suite's `supported()`
-    /// gating (e.g. FUSE.JUICEFS, APFS, EXT4)
+    /// override the detected filesystem type passed to `supported()` (e.g. FUSE.JUICEFS, APFS, EXT4)
     #[arg(long)]
     pub fs: Option<String>,
 
@@ -33,25 +39,26 @@ pub struct Args {
     #[arg(long)]
     pub os: Option<String>,
 
+    /// parallel test-file worker count
+    #[arg(short = 'j', long, default_value_t = default_jobs())]
+    pub jobs: usize,
+
     /// per-test-file timeout in seconds
     #[arg(long, default_value_t = 120)]
     pub timeout: u64,
 
-    /// keep the per-file scratch directories (left under <mount>/.fstest-pjdfstest/)
+    /// keep per-file scratch directories under <mount>/.fstest-pjdfstest/
     #[arg(long)]
     pub keep: bool,
 
-    /// also write the JSON result to this file
+    /// debug logging
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
+    /// write the enriched JSON result to this file
     #[arg(long)]
     pub json: Option<PathBuf>,
 }
-
-// ---------------------------------------------------------------------------
-// helper protocol: `fstest __pjdfstest [-U umask] [-u uid] [-g gids] syscall args...`
-// Multiple syscalls chain in one invocation separated by ":". On success the
-// helper prints "0" (stat/pathconf variants print field values); on failure it
-// prints the errno name and exits 1 — exactly what upstream's expect() matches.
-// ---------------------------------------------------------------------------
 
 pub fn helper_main(argv: &[String]) -> i32 {
     let mut i = 0;
@@ -83,20 +90,15 @@ pub fn helper_main(argv: &[String]) -> i32 {
             }
         }
     }
-    // Apply the credential changes only after the whole option list is parsed:
-    // setgroups(2)/setegid(2) require privilege, so they must run before the
-    // setuid(2) that drops it. The upstream .t files always write `-u` before
-    // `-g`, so acting on each option as it is seen would drop root at `-u` and
-    // fail the following `-g` with EPERM.
+    // Upstream `.t` scripts pass `-u <uid> -g <gid>`; apply group changes before
+    // `setuid` drops root, otherwise `setgroups`/`setegid` fail with EPERM.
     if let Some(spec) = want_gids {
-        eprintln!("changing groups to {spec}");
         if let Err(e) = set_gids(spec) {
             eprintln!("cannot change groups: {e}");
             return 1;
         }
     }
     if let Some(uid) = want_uid {
-        eprintln!("changing uid to {uid}");
         if unsafe { libc::setuid(uid) } < 0 {
             eprintln!("cannot change uid: {}", std::io::Error::last_os_error());
             return 1;
@@ -115,7 +117,7 @@ pub fn helper_main(argv: &[String]) -> i32 {
             sargs.push(a);
             i += 1;
         }
-        i += 1; // consume ':' or run past end
+        i += 1;
         match exec_syscall(name, &sargs, &mut fds) {
             Ok(out) => println!("{out}"),
             Err(errno) => {
@@ -141,7 +143,6 @@ fn set_gids(spec: &str) -> Result<(), String> {
     Ok(())
 }
 
-// strtol(..., 0) semantics: 0x hex, leading-0 octal, else decimal
 fn parse_num(s: &str) -> i64 {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -150,6 +151,17 @@ fn parse_num(s: &str) -> i64 {
         i64::from_str_radix(&s[1..], 8).unwrap_or(0)
     } else {
         s.parse().unwrap_or(0)
+    }
+}
+
+fn set_errno_zero() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error() = 0;
     }
 }
 
@@ -222,30 +234,107 @@ fn cstr(p: &str) -> std::ffi::CString {
     std::ffi::CString::new(p).unwrap_or_default()
 }
 
-// protocol special path values: "NULL" -> null pointer, "DEADCODE" -> 0xdeadc0de
+// Protocol sentinel pointers: "NULL" -> null, "DEADCODE" -> 0xdeadc0de (EFAULT probe).
 fn cptr(p: &str) -> *const libc::c_char {
     match p {
         "NULL" => std::ptr::null(),
         "DEADCODE" => 0xdeadc0de as *const libc::c_char,
-        // leak intentionally: the helper is one-shot, owned storage would be
-        // dangling right after this expression
         _ => cstr(p).into_raw(),
     }
 }
 
-fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, i32> {
+fn parse_at_flag(s: &str) -> i32 {
+    let mut out = 0i32;
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() || part == "0" {
+            continue;
+        }
+        let v = match part {
+            "AT_SYMLINK_NOFOLLOW" => libc::AT_SYMLINK_NOFOLLOW,
+            "AT_SYMLINK_FOLLOW" => libc::AT_SYMLINK_FOLLOW,
+            "AT_REMOVEDIR" => libc::AT_REMOVEDIR,
+            #[cfg(target_os = "linux")]
+            "AT_EMPTY_PATH" => 0x1000,
+            _ => parse_num(part) as i32,
+        };
+        out |= v;
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn parse_chflags_mask(s: &str) -> Result<libc::c_uint, i32> {
+    if s == "none" || s == "0" {
+        return Ok(0);
+    }
+    let mut flags: libc::c_uint = 0;
+    for tok in s.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let bit: libc::c_uint = match tok {
+            "UF_NODUMP" => libc::UF_NODUMP,
+            "UF_IMMUTABLE" => libc::UF_IMMUTABLE,
+            "UF_APPEND" => libc::UF_APPEND,
+            "UF_OPAQUE" => libc::UF_OPAQUE,
+            "UF_HIDDEN" => libc::UF_HIDDEN,
+            "SF_ARCHIVED" => libc::SF_ARCHIVED,
+            "SF_IMMUTABLE" => libc::SF_IMMUTABLE,
+            "SF_APPEND" => libc::SF_APPEND,
+            "UF_NOUNLINK" => 0x0000_0010,
+            "SF_NOUNLINK" => 0x0010_0000,
+            _ => parse_num(tok) as libc::c_uint,
+        };
+        flags |= bit;
+    }
+    Ok(flags)
+}
+
+#[cfg(target_os = "macos")]
+fn format_chflags(flags: u32) -> String {
+    if flags == 0 {
+        return "none".into();
+    }
+    let table: &[(u32, &str)] = &[
+        (libc::UF_NODUMP, "UF_NODUMP"),
+        (libc::UF_IMMUTABLE, "UF_IMMUTABLE"),
+        (libc::UF_APPEND, "UF_APPEND"),
+        (0x0000_0010, "UF_NOUNLINK"),
+        (libc::UF_OPAQUE, "UF_OPAQUE"),
+        (libc::UF_HIDDEN, "UF_HIDDEN"),
+        (libc::SF_ARCHIVED, "SF_ARCHIVED"),
+        (libc::SF_IMMUTABLE, "SF_IMMUTABLE"),
+        (libc::SF_APPEND, "SF_APPEND"),
+        (0x0010_0000, "SF_NOUNLINK"),
+    ];
+    let mut names = Vec::new();
+    for &(bit, label) in table {
+        if flags & bit != 0 {
+            names.push(label);
+        }
+    }
+    if names.is_empty() {
+        format!("0x{flags:x}")
+    } else {
+        names.join(",")
+    }
+}
+
+pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, i32> {
     let arg = |i: usize| -> &str { a.get(i).copied().unwrap_or("") };
     let num = |i: usize| -> i64 { parse_num(arg(i)) };
     match name {
         "open" | "openat" => {
             let (dirfd, path, flags_str, mode_idx) = if name == "openat" {
-                (fd_get(fds, num(0))?, arg(1), arg(2), 3)
+                (dirfd_get(fds, arg(0))?, arg(1), arg(2), 3)
             } else {
                 (libc::AT_FDCWD, arg(0), arg(1), 2)
             };
             let flags = parse_open_flags(flags_str)?;
             #[cfg(target_os = "linux")]
-            let flags = flags | libc::O_CLOEXEC; // keep descriptors out of leaked state
+            let flags = flags | libc::O_CLOEXEC;
             let fd = if flags & libc::O_CREAT != 0 {
                 unsafe { libc::openat(dirfd, cptr(path), flags, num(mode_idx) as libc::c_uint) }
             } else {
@@ -273,52 +362,138 @@ fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, 
         }
         "unlink" => cvt(unsafe { libc::unlink(cptr(arg(0))) }),
         "unlinkat" => {
-            let flag = if arg(2) == "AT_REMOVEDIR" {
-                libc::AT_REMOVEDIR
-            } else {
-                parse_num(arg(2)) as i32
-            };
-            cvt(unsafe { libc::unlinkat(fd_get(fds, num(0))?, cptr(arg(1)), flag) })
+            let flag = parse_at_flag(arg(2));
+            cvt(unsafe { libc::unlinkat(dirfd_get(fds, arg(0))?, cptr(arg(1)), flag) })
         }
         "mkdir" => cvt(unsafe { libc::mkdir(cptr(arg(0)), num(1) as libc::mode_t) }),
-        "mkdirat" => cvt(unsafe { libc::mkdirat(fd_get(fds, num(0))?, cptr(arg(1)), num(2) as libc::mode_t) }),
+        "mkdirat" => cvt(unsafe {
+            libc::mkdirat(dirfd_get(fds, arg(0))?, cptr(arg(1)), num(2) as libc::mode_t)
+        }),
         "rmdir" => cvt(unsafe { libc::rmdir(cptr(arg(0))) }),
         "link" => cvt(unsafe { libc::link(cptr(arg(0)), cptr(arg(1))) }),
         "linkat" => {
-            let flag = if arg(4) == "AT_SYMLINK_FOLLOW" {
-                libc::AT_SYMLINK_FOLLOW
-            } else {
-                parse_num(arg(4)) as i32
-            };
+            let flag = parse_at_flag(arg(4));
             cvt(unsafe {
                 libc::linkat(
-                    fd_get(fds, num(0))?,
+                    dirfd_get(fds, arg(0))?,
                     cptr(arg(1)),
-                    fd_get(fds, num(2))?,
+                    dirfd_get(fds, arg(2))?,
                     cptr(arg(3)),
                     flag,
                 )
             })
         }
         "symlink" => cvt(unsafe { libc::symlink(cptr(arg(0)), cptr(arg(1))) }),
-        "symlinkat" => cvt(unsafe { libc::symlinkat(cptr(arg(0)), fd_get(fds, num(1))?, cptr(arg(2))) }),
+        "symlinkat" => cvt(unsafe {
+            libc::symlinkat(cptr(arg(0)), dirfd_get(fds, arg(1))?, cptr(arg(2)))
+        }),
+        "readlink" | "readlinkat" => {
+            let mut buf = vec![0u8; 4096];
+            let n = if name == "readlinkat" {
+                unsafe {
+                    libc::readlinkat(
+                        dirfd_get(fds, arg(0))?,
+                        cptr(arg(1)),
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len(),
+                    )
+                }
+            } else {
+                unsafe {
+                    libc::readlink(
+                        cptr(arg(0)),
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len(),
+                    )
+                }
+            };
+            if n < 0 {
+                return Err(last_errno());
+            }
+            Ok(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+        }
         "rename" => cvt(unsafe { libc::rename(cptr(arg(0)), cptr(arg(1))) }),
-        "renameat" => {
-            cvt(unsafe { libc::renameat(fd_get(fds, num(0))?, cptr(arg(1)), fd_get(fds, num(2))?, cptr(arg(3))) })
+        "renameat" => cvt(unsafe {
+            libc::renameat(
+                dirfd_get(fds, arg(0))?,
+                cptr(arg(1)),
+                dirfd_get(fds, arg(2))?,
+                cptr(arg(3)),
+            )
+        }),
+        "renameat2" => {
+            let mut rflags = 0u32;
+            for tok in arg(4).split(',') {
+                let tok = tok.trim();
+                if tok.is_empty() || tok == "0" {
+                    continue;
+                }
+                rflags |= match tok {
+                    "RENAME_NOREPLACE" => 1,
+                    "RENAME_EXCHANGE" => 2,
+                    "RENAME_WHITEOUT" => 4,
+                    _ => parse_num(tok) as u32,
+                };
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        dirfd_get(fds, arg(0))?,
+                        cptr(arg(1)),
+                        dirfd_get(fds, arg(2))?,
+                        cptr(arg(3)),
+                        rflags as libc::c_uint,
+                    )
+                };
+                cvt_ssize(rc as isize)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let mut dflags: libc::c_uint = 0;
+                if rflags & 1 != 0 {
+                    dflags |= libc::RENAME_EXCL;
+                }
+                if rflags & 2 != 0 {
+                    dflags |= libc::RENAME_SWAP;
+                }
+                if rflags & !3 != 0 {
+                    return Err(libc::EINVAL);
+                }
+                cvt(unsafe {
+                    libc::renameatx_np(
+                        dirfd_get(fds, arg(0))?,
+                        cptr(arg(1)),
+                        dirfd_get(fds, arg(2))?,
+                        cptr(arg(3)),
+                        dflags,
+                    )
+                })
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = rflags;
+                Err(libc::ENOSYS)
+            }
         }
         "mkfifo" => cvt(unsafe { libc::mkfifo(cptr(arg(0)), num(1) as libc::mode_t) }),
-        "mkfifoat" => cvt(unsafe { libc::mkfifoat(fd_get(fds, num(0))?, cptr(arg(1)), num(2) as libc::mode_t) }),
+        "mkfifoat" => cvt(unsafe {
+            libc::mkfifoat(dirfd_get(fds, arg(0))?, cptr(arg(1)), num(2) as libc::mode_t)
+        }),
         "mknod" | "mknodat" => {
-            let mode = num(2) as libc::mode_t
-                | match arg(1) {
-                    "b" => libc::S_IFBLK,
-                    "c" | "u" => libc::S_IFCHR,
-                    "f" => libc::S_IFIFO,
-                    _ => libc::S_IFREG,
-                };
-            let dev = makedev(num(3), num(4));
+            let base = if name == "mknodat" { 1 } else { 0 };
+            let ftype = match arg(base + 1) {
+                "b" => libc::S_IFBLK,
+                "c" | "u" => libc::S_IFCHR,
+                "f" => libc::S_IFIFO,
+                "s" => libc::S_IFSOCK,
+                _ => libc::S_IFREG,
+            };
+            let mode = (parse_num(arg(base + 2)) as libc::mode_t) | ftype;
+            let dev = makedev(parse_num(arg(base + 3)), parse_num(arg(base + 4)));
             let r = if name == "mknodat" {
-                unsafe { libc::mknodat(fd_get(fds, num(0))?, cptr(arg(1)), mode, dev) }
+                unsafe { libc::mknodat(dirfd_get(fds, arg(0))?, cptr(arg(1)), mode, dev) }
             } else {
                 unsafe { libc::mknod(cptr(arg(0)), mode, dev) }
             };
@@ -337,9 +512,17 @@ fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, 
                 unsafe { libc::close(fd) };
                 return Err(libc::ENAMETOOLONG);
             }
+            let len = 2 + bytes.len();
+            #[cfg(target_os = "macos")]
+            {
+                sa.sun_len = len as u8;
+            }
             unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), sa.sun_path.as_mut_ptr() as *mut u8, bytes.len());
-                let len = 2 + bytes.len();
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    sa.sun_path.as_mut_ptr() as *mut u8,
+                    bytes.len(),
+                );
                 let r = if name == "bind" {
                     libc::bind(fd, &sa as *const _ as *const libc::sockaddr, len as libc::socklen_t)
                 } else {
@@ -350,33 +533,77 @@ fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, 
                     libc::close(fd);
                     return Err(e);
                 }
+                libc::close(fd);
             }
             Ok("0".into())
         }
         "chmod" => cvt(unsafe { libc::chmod(cptr(arg(0)), num(1) as libc::mode_t) }),
+        "lchmod" => {
+            #[cfg(target_os = "macos")]
+            {
+                cvt(unsafe {
+                    libc::fchmodat(
+                        libc::AT_FDCWD,
+                        cptr(arg(0)),
+                        num(1) as libc::mode_t,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(libc::ENOSYS)
+            }
+        }
         "fchmod" => cvt(unsafe { libc::fchmod(fd_get(fds, num(0))?, num(1) as libc::mode_t) }),
         "fchmodat" => {
-            let flag = if arg(3) == "AT_SYMLINK_NOFOLLOW" {
-                libc::AT_SYMLINK_NOFOLLOW
-            } else {
-                parse_num(arg(3)) as i32
-            };
-            cvt(unsafe { libc::fchmodat(fd_get(fds, num(0))?, cptr(arg(1)), num(2) as libc::mode_t, flag) })
+            let flag = parse_at_flag(arg(3));
+            cvt(unsafe {
+                libc::fchmodat(
+                    dirfd_get(fds, arg(0))?,
+                    cptr(arg(1)),
+                    num(2) as libc::mode_t,
+                    flag,
+                )
+            })
         }
-        "chown" => cvt(unsafe { libc::chown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t) }),
-        "lchown" => cvt(unsafe { libc::lchown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t) }),
-        "fchown" => cvt(unsafe { libc::fchown(fd_get(fds, num(0))?, num(1) as libc::uid_t, num(2) as libc::gid_t) }),
+        "chflags" | "lchflags" | "fchflags" => {
+            #[cfg(target_os = "macos")]
+            {
+                unsafe extern "C" {
+                    fn lchflags(path: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
+                }
+                let mask = parse_chflags_mask(arg(1))?;
+                let rc = match name {
+                    "chflags" => unsafe { libc::chflags(cptr(arg(0)), mask) },
+                    "lchflags" => unsafe { lchflags(cptr(arg(0)), mask) },
+                    _ => unsafe { libc::fchflags(fd_get(fds, num(0))?, mask) },
+                };
+                cvt(rc)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(libc::ENOSYS)
+            }
+        }
+        "chown" => cvt(unsafe {
+            libc::chown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t)
+        }),
+        "lchown" => cvt(unsafe {
+            libc::lchown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t)
+        }),
+        "fchown" => cvt(unsafe {
+            libc::fchown(
+                fd_get(fds, num(0))?,
+                num(1) as libc::uid_t,
+                num(2) as libc::gid_t,
+            )
+        }),
         "fchownat" => {
-            let flag: i32 = if arg(4) == "AT_SYMLINK_NOFOLLOW" {
-                libc::AT_SYMLINK_NOFOLLOW
-            } else if arg(4) == "AT_EMPTY_PATH" && cfg!(target_os = "linux") {
-                0x1000
-            } else {
-                parse_num(arg(4)) as i32
-            };
+            let flag = parse_at_flag(arg(4));
             cvt(unsafe {
                 libc::fchownat(
-                    fd_get(fds, num(0))?,
+                    dirfd_get(fds, arg(0))?,
                     cptr(arg(1)),
                     num(2) as libc::uid_t,
                     num(3) as libc::gid_t,
@@ -384,72 +611,116 @@ fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, 
                 )
             })
         }
+        "access" | "faccessat" => {
+            let parse_amode = |s: &str| -> i32 {
+                let mut m = 0;
+                for tok in s.split(',') {
+                    m |= match tok.trim() {
+                        "F_OK" => libc::F_OK,
+                        "R_OK" => libc::R_OK,
+                        "W_OK" => libc::W_OK,
+                        "X_OK" => libc::X_OK,
+                        other => parse_num(other) as i32,
+                    };
+                }
+                m
+            };
+            if name == "faccessat" {
+                cvt(unsafe {
+                    libc::faccessat(
+                        dirfd_get(fds, arg(0))?,
+                        cptr(arg(1)),
+                        parse_amode(arg(2)),
+                        parse_at_flag(arg(3)),
+                    )
+                })
+            } else {
+                cvt(unsafe { libc::access(cptr(arg(0)), parse_amode(arg(1))) })
+            }
+        }
         "truncate" => cvt(unsafe { libc::truncate(cptr(arg(0)), num(1) as libc::off_t) }),
-        "ftruncate" => cvt(unsafe { libc::ftruncate(fd_get(fds, num(0))?, num(1) as libc::off_t) }),
+        "ftruncate" => cvt(unsafe {
+            libc::ftruncate(fd_get(fds, num(0))?, num(1) as libc::off_t)
+        }),
         "posix_fallocate" => {
-            crate::smallfile::preallocate(fd_get(fds, num(0))?, num(2))
+            posix_fallocate_fd(fd_get(fds, num(0))?, num(1), num(2))
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
             Ok("0".into())
         }
         "stat" | "lstat" | "fstat" | "fstatat" => {
             let mut sb: libc::stat = unsafe { std::mem::zeroed() };
-            let r = match name {
-                "stat" => unsafe { libc::stat(cptr(arg(0)), &mut sb) },
-                "lstat" => unsafe { libc::lstat(cptr(arg(0)), &mut sb) },
-                "fstat" => unsafe { libc::fstat(fd_get(fds, num(0))?, &mut sb) },
+            let (r, what) = match name {
+                "stat" => (unsafe { libc::stat(cptr(arg(0)), &mut sb) }, arg(1)),
+                "lstat" => (unsafe { libc::lstat(cptr(arg(0)), &mut sb) }, arg(1)),
+                "fstat" => (unsafe { libc::fstat(fd_get(fds, num(0))?, &mut sb) }, arg(1)),
                 _ => {
-                    let flag = if arg(3) == "AT_SYMLINK_NOFOLLOW" {
-                        libc::AT_SYMLINK_NOFOLLOW
-                    } else {
-                        parse_num(arg(3)) as i32
-                    };
-                    unsafe { libc::fstatat(fd_get(fds, num(0))?, cptr(arg(1)), &mut sb, flag) }
+                    let flag = parse_at_flag(arg(3));
+                    (
+                        unsafe {
+                            libc::fstatat(dirfd_get(fds, arg(0))?, cptr(arg(1)), &mut sb, flag)
+                        },
+                        arg(2),
+                    )
                 }
             };
             if r < 0 {
                 return Err(last_errno());
             }
-            Ok(show_stats(
-                &sb,
-                match name {
-                    "stat" | "lstat" => arg(1),
-                    _ => arg(1),
-                },
-            ))
+            Ok(show_stats(&sb, what))
         }
-        "pathconf" | "lpathconf" | "fpathconf" => {
+        "pathconf" | "fpathconf" => {
             let pc = pathconf_id(arg(1));
-            let r = match name {
-                "fpathconf" => unsafe { libc::fpathconf(fd_get(fds, num(0))?, pc) },
-                _ => unsafe { libc::pathconf(cptr(arg(0)), pc) },
+            set_errno_zero();
+            let r = if name == "fpathconf" {
+                unsafe { libc::fpathconf(fd_get(fds, num(0))?, pc) }
+            } else {
+                unsafe { libc::pathconf(cptr(arg(0)), pc) }
             };
             if r < 0 {
-                return Err(last_errno());
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if e != 0 {
+                    return Err(e);
+                }
             }
             Ok(format!("{r}"))
         }
+        "lpathconf" => Err(libc::ENOSYS),
         "utimensat" => {
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                let _ = a;
-                return Err(libc::ENOSYS);
-            }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 let times = [timespec_arg(num(2), arg(3)), timespec_arg(num(4), arg(5))];
-                let flag = if arg(6) == "AT_SYMLINK_NOFOLLOW" {
-                    libc::AT_SYMLINK_NOFOLLOW
-                } else {
-                    parse_num(arg(6)) as i32
+                let flag = parse_at_flag(arg(6));
+                let r = unsafe {
+                    libc::utimensat(dirfd_get(fds, arg(0))?, cptr(arg(1)), times.as_ptr(), flag)
                 };
-                let r = unsafe { libc::utimensat(fd_get(fds, num(0))?, cptr(arg(1)), times.as_ptr(), flag) };
                 cvt(r)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                Err(libc::ENOSYS)
+            }
+        }
+        "futimens" => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let times = [timespec_arg(num(1), arg(2)), timespec_arg(num(3), arg(4))];
+                cvt(unsafe { libc::futimens(fd_get(fds, num(0))?, times.as_ptr()) })
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                Err(libc::ENOSYS)
             }
         }
         "write" => {
             let data = arg(1).as_bytes();
-            let r = unsafe { libc::write(fd_get(fds, num(0))?, data.as_ptr() as *const libc::c_void, data.len()) };
-            cvt(r as i32)
+            let r = unsafe {
+                libc::write(
+                    fd_get(fds, num(0))?,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                )
+            };
+            cvt_ssize(r)
         }
         "pwrite" => {
             let data = arg(1).as_bytes();
@@ -461,15 +732,15 @@ fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, 
                     num(2) as libc::off_t,
                 )
             };
-            cvt(r as i32)
+            cvt_ssize(r)
         }
         "pread" => {
             let fd = fd_get(fds, num(0))?;
-            let count = (num(1) as usize).min(1024);
+            let count = (num(1) as usize).min(65536);
             let off = num(2) as libc::off_t;
             let mut buf = vec![0u8; count];
             let mut got = 0usize;
-            loop {
+            while got < count {
                 let r = unsafe {
                     libc::pread(
                         fd,
@@ -478,17 +749,39 @@ fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Result<String, 
                         off + got as libc::off_t,
                     )
                 };
-                if r <= 0 {
+                if r < 0 {
+                    return Err(last_errno());
+                }
+                if r == 0 {
                     break;
                 }
                 got += r as usize;
             }
-            return Ok(String::from_utf8_lossy(&buf[..got]).to_string());
+            Ok(String::from_utf8_lossy(&buf[..got]).to_string())
         }
-        "mksyscalls" => {
-            // upstream prints the syscall list for CI docs; the runner never calls it
-            println!("# syscall list not required by the fstest runner");
-            Ok(String::new())
+        "fsync" => cvt(unsafe { libc::fsync(fd_get(fds, num(0))?) }),
+        "close" => cvt(unsafe { libc::close(fd_get(fds, num(0))?) }),
+        "mksyscalls" => Ok(String::new()),
+        "randhex" => {
+            let nchars = a.first().map(|s| parse_num(s) as usize).unwrap_or(32).max(1);
+            let nbytes = nchars.div_ceil(2);
+            let mut buf = vec![0u8; nbytes];
+            if let Ok(mut f) = fs::File::open("/dev/urandom") {
+                use std::io::Read;
+                let _ = f.read_exact(&mut buf);
+            } else {
+                let mut rng = crate::common::SplitMix64::new(
+                    (std::process::id() as u64)
+                        ^ SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0x9e37_79b9_7f4a_7c15),
+                );
+                rng.fill_bytes(&mut buf);
+            }
+            let mut hex_str = hex::encode(&buf);
+            hex_str.truncate(nchars);
+            Ok(hex_str)
         }
         _ => {
             eprintln!("syscall '{name}' not supported");
@@ -501,10 +794,23 @@ fn cvt(r: i32) -> Result<String, i32> {
     if r < 0 { Err(last_errno()) } else { Ok("0".into()) }
 }
 
+fn cvt_ssize(r: isize) -> Result<String, i32> {
+    if r < 0 { Err(last_errno()) } else { Ok("0".into()) }
+}
+
 fn fd_get(fds: &[RawFd], pos: i64) -> Result<RawFd, i32> {
-    // "0" also means stdin when no descriptor was opened yet (upstream keeps
-    // stdin at slot 0 implicitly through the same table)
+    if pos < 0 {
+        return Err(libc::EBADF);
+    }
     fds.get(pos as usize).copied().ok_or(libc::EBADF)
+}
+
+fn dirfd_get(fds: &[RawFd], s: &str) -> Result<RawFd, i32> {
+    if s == "AT_FDCWD" {
+        Ok(libc::AT_FDCWD)
+    } else {
+        fd_get(fds, parse_num(s))
+    }
 }
 
 fn makedev(major: i64, minor: i64) -> libc::dev_t {
@@ -514,46 +820,30 @@ fn makedev(major: i64, minor: i64) -> libc::dev_t {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // BSD/dev_t encoding used by Darwin
-        (((major as u64 & 0xff_ffff) << 24) | (minor as u64 & 0xff_ffff)) as libc::dev_t
+        ((((major as u32) & 0xff) << 24) | ((minor as u32) & 0x00ff_ffff)) as libc::dev_t
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn timespec_arg(sec: i64, nsec_str: &str) -> libc::timespec {
-    let nsec: i64 = if nsec_str == "UTIME_NOW" {
-        utime_now()
+    let nsec: libc::c_long = if nsec_str == "UTIME_NOW" {
+        libc::UTIME_NOW as libc::c_long
     } else if nsec_str == "UTIME_OMIT" {
-        utime_omit()
+        libc::UTIME_OMIT as libc::c_long
     } else {
-        parse_num(nsec_str)
+        parse_num(nsec_str) as libc::c_long
     };
     libc::timespec {
         tv_sec: sec as libc::time_t,
-        tv_nsec: nsec as libc::c_long,
+        tv_nsec: nsec,
     }
-}
-
-#[cfg(target_os = "linux")]
-fn utime_now() -> i64 {
-    libc::UTIME_NOW
-}
-#[cfg(target_os = "linux")]
-fn utime_omit() -> i64 {
-    libc::UTIME_OMIT
-}
-#[cfg(not(target_os = "linux"))]
-fn utime_now() -> i64 {
-    -2
-}
-#[cfg(not(target_os = "linux"))]
-fn utime_omit() -> i64 {
-    -1
 }
 
 fn parse_open_flags(s: &str) -> Result<i32, i32> {
     let mut flags = 0i32;
     for f in s.split(',') {
-        if f.is_empty() {
+        let f = f.trim();
+        if f.is_empty() || f == "0" {
             continue;
         }
         let v = match f {
@@ -567,7 +857,24 @@ fn parse_open_flags(s: &str) -> Result<i32, i32> {
             "O_EXCL" => libc::O_EXCL,
             "O_NOFOLLOW" => libc::O_NOFOLLOW,
             "O_SYNC" => libc::O_SYNC,
-            "O_SHLOCK" | "O_EXLOCK" | "O_EVTONLY" | "O_SYMLINK" => 0, // BSD-only, unused
+            "O_DSYNC" => libc::O_DSYNC,
+            "O_DIRECTORY" => libc::O_DIRECTORY,
+            "O_NOCTTY" => libc::O_NOCTTY,
+            "O_CLOEXEC" => libc::O_CLOEXEC,
+            #[cfg(target_os = "macos")]
+            "O_SHLOCK" => libc::O_SHLOCK,
+            #[cfg(target_os = "macos")]
+            "O_EXLOCK" => libc::O_EXLOCK,
+            #[cfg(target_os = "macos")]
+            "O_EVTONLY" => libc::O_EVTONLY,
+            #[cfg(target_os = "macos")]
+            "O_SYMLINK" => libc::O_SYMLINK,
+            #[cfg(not(target_os = "macos"))]
+            "O_SHLOCK" | "O_EXLOCK" | "O_EVTONLY" | "O_SYMLINK" => 0,
+            #[cfg(target_os = "linux")]
+            "O_DIRECT" => libc::O_DIRECT,
+            #[cfg(target_os = "linux")]
+            "O_PATH" => libc::O_PATH,
             _ => {
                 eprintln!("unknown open flag {f}");
                 return Err(libc::EINVAL);
@@ -590,11 +897,41 @@ fn show_stats(sb: &libc::stat, what: &str) -> String {
             "size" => format!("{}", sb.st_size),
             "blocks" => format!("{}", sb.st_blocks),
             "atime" => format!("{}", sb.st_atime),
-            "atime_ns" => format!("{}", st_atime_nsec(sb)),
+            "atime_ns" => format!("{}", sb.st_atime_nsec),
             "mtime" => format!("{}", sb.st_mtime),
-            "mtime_ns" => format!("{}", st_mtime_nsec(sb)),
+            "mtime_ns" => format!("{}", sb.st_mtime_nsec),
             "ctime" => format!("{}", sb.st_ctime),
-            "ctime_ns" => format!("{}", st_ctime_nsec(sb)),
+            "ctime_ns" => format!("{}", sb.st_ctime_nsec),
+            "birthtime" => {
+                #[cfg(target_os = "macos")]
+                {
+                    format!("{}", sb.st_birthtime)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    "unknown".into()
+                }
+            }
+            "birthtime_ns" => {
+                #[cfg(target_os = "macos")]
+                {
+                    format!("{}", sb.st_birthtime_nsec)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    "unknown".into()
+                }
+            }
+            "flags" => {
+                #[cfg(target_os = "macos")]
+                {
+                    format_chflags(sb.st_flags)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    "none".into()
+                }
+            }
             "major" => {
                 #[cfg(target_os = "linux")]
                 {
@@ -602,7 +939,7 @@ fn show_stats(sb: &libc::stat, what: &str) -> String {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    format!("{}", (sb.st_rdev >> 24) & 0xff_ffff)
+                    format!("{}", ((sb.st_rdev as u32) >> 24) & 0xff)
                 }
             }
             "minor" => {
@@ -612,7 +949,7 @@ fn show_stats(sb: &libc::stat, what: &str) -> String {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    format!("{}", sb.st_rdev & 0xff_ffff)
+                    format!("{}", (sb.st_rdev as u32) & 0x00ff_ffff)
                 }
             }
             "type" => match sb.st_mode & libc::S_IFMT {
@@ -632,31 +969,6 @@ fn show_stats(sb: &libc::stat, what: &str) -> String {
     out.join(",")
 }
 
-#[cfg(target_os = "macos")]
-fn st_atime_nsec(sb: &libc::stat) -> i64 {
-    sb.st_atime_nsec
-}
-#[cfg(target_os = "macos")]
-fn st_mtime_nsec(sb: &libc::stat) -> i64 {
-    sb.st_mtime_nsec
-}
-#[cfg(target_os = "macos")]
-fn st_ctime_nsec(sb: &libc::stat) -> i64 {
-    sb.st_ctime_nsec
-}
-#[cfg(not(target_os = "macos"))]
-fn st_atime_nsec(sb: &libc::stat) -> i64 {
-    sb.st_atime_nsec
-}
-#[cfg(not(target_os = "macos"))]
-fn st_mtime_nsec(sb: &libc::stat) -> i64 {
-    sb.st_mtime_nsec
-}
-#[cfg(not(target_os = "macos"))]
-fn st_ctime_nsec(sb: &libc::stat) -> i64 {
-    sb.st_ctime_nsec
-}
-
 fn pathconf_id(name: &str) -> i32 {
     match name {
         "_PC_LINK_MAX" => libc::_PC_LINK_MAX,
@@ -669,16 +981,14 @@ fn pathconf_id(name: &str) -> i32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// runner: execute each embedded .t through `sh -s` with an inline prelude
-// ---------------------------------------------------------------------------
-
 struct FileResult {
     name: String,
     tests: u64,
     passed: u64,
     failed: u64,
     todo: u64,
+    skipped: bool,
+    skip_reason: String,
     failures: Vec<String>,
     bail: bool,
     stderr_tail: String,
@@ -686,107 +996,179 @@ struct FileResult {
     timed_out: bool,
 }
 
+fn detect_os_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Darwin"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "freebsd") {
+        "FreeBSD"
+    } else {
+        "Linux"
+    }
+}
+
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
-    let meta = fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let meta = fs::symlink_metadata(mountpoint)
+        .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate own executable: {e}"))?;
     let misc = embedded("misc.sh").ok_or("misc.sh missing from embedded suite")?;
-    let conf = embedded("conf").ok_or("conf missing from embedded suite")?;
-    // misc.sh's prologue locates conf/pjdfstest on disk; we inline everything,
-    // so keep the file body starting at requires_root()
     let misc_body = misc
         .splitn(2, "\nrequires_root()")
         .nth(1)
         .ok_or("unexpected misc.sh layout")?;
+
+    let resolved_os = args
+        .os
+        .clone()
+        .unwrap_or_else(|| detect_os_name().to_string());
+    let resolved_fs = args
+        .fs
+        .clone()
+        .unwrap_or_else(|| detect_fstype(mountpoint).to_ascii_uppercase());
+
     let selected: Vec<&(&str, &str)> = TEST_FILES
         .iter()
         .filter(|(name, _)| name.ends_with(".t"))
         .filter(|(name, _)| args.filter.is_empty() || args.filter.iter().any(|f| name.contains(f)))
         .collect();
+
+    let jobs = args.jobs.max(1).min(selected.len().max(1));
     info!(
-        "pjdfstest: {} test files selected, top={}{}{}",
+        "pjdfstest: {} test files selected, jobs={jobs}, top={}, os={resolved_os}, fs={resolved_fs}",
         selected.len(),
         mountpoint.display(),
-        args.fs.as_ref().map(|f| format!(", fs={f}")).unwrap_or_default(),
-        args.os.as_ref().map(|o| format!(", os={o}")).unwrap_or_default(),
     );
     if !nix_euid_is_root() {
         warn!("not running as root: chown/mknod/permission cases will fail (upstream behaves the same)");
     }
+
+    let started = SystemTime::now();
+    let t0 = Instant::now();
     let scratch_root = mountpoint.join(".fstest-pjdfstest");
     fs::create_dir_all(&scratch_root).map_err(|e| e.to_string())?;
-    let mut results = Vec::new();
-    for (idx, (name, body)) in selected.iter().enumerate() {
-        let scratch = scratch_root.join(format!("{idx:03}-{}", name.replace('/', "_")));
-        results.push(run_one(&scratch, name, body, conf, misc_body, &exe, args));
-        if !args.keep {
-            let _ = fs::remove_dir_all(&scratch);
+
+    let cursor = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<FileResult>>> = (0..selected.len()).map(|_| Mutex::new(None)).collect();
+
+    thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| {
+                loop {
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    if idx >= selected.len() {
+                        break;
+                    }
+                    let (name, body) = selected[idx];
+                    let scratch = scratch_root.join(format!("{idx:03}-{}", name.replace('/', "_")));
+                    let res = run_one(
+                        &scratch,
+                        name,
+                        body,
+                        &resolved_os,
+                        &resolved_fs,
+                        misc_body,
+                        &exe,
+                        args,
+                    );
+                    if !args.keep {
+                        remove_dir_all_bounded(&scratch, Duration::from_secs(10));
+                    }
+                    *slots[idx].lock().unwrap() = Some(res);
+                }
+            });
         }
-    }
+    });
+
     if !args.keep {
-        let _ = fs::remove_dir_all(&scratch_root);
+        remove_dir_all_bounded(&scratch_root, Duration::from_secs(30));
     }
+
+    let results: Vec<FileResult> = slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap().unwrap())
+        .collect();
+
     let total_tests: u64 = results.iter().map(|r| r.tests).sum();
+    let total_passed: u64 = results.iter().map(|r| r.passed).sum();
     let total_failed: u64 = results.iter().map(|r| r.failed).sum();
     let total_todo: u64 = results.iter().map(|r| r.todo).sum();
+    let skipped_files = results.iter().filter(|r| r.skipped).count();
     let bailed = results.iter().any(|r| r.bail);
+    let timed_out_any = results.iter().any(|r| r.timed_out);
     let mut failures = Vec::new();
     for r in &results {
         for f in &r.failures {
             failures.push(format!("{}: {f}", r.name));
         }
     }
+    let duration_ms = t0.elapsed().as_millis() as u64;
     info!(
-        "pjdfstest: files={} tests={} failed={} todo-passed={}",
+        "pjdfstest: files={} skipped={} tests={} failed={} todo={} in {:.2}s",
         results.len(),
+        skipped_files,
         total_tests,
         total_failed,
-        total_todo
+        total_todo,
+        duration_ms as f64 / 1000.0,
     );
-    let host = hostname::get()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "localhost".to_string());
-    let report = json!({
+
+    Ok(json!({
         "suite": "pjdfstest",
-        "host": host,
-        "date": iso8601(SystemTime::now()),
+        "host": host_name(),
+        "date": iso8601(started),
         "top": mountpoint.display().to_string(),
+        "durationMs": duration_ms,
         "params": {
             "files_selected": selected.len(),
+            "jobs": jobs,
             "filter": args.filter,
-            "fs_override": args.fs,
-            "os_override": args.os,
+            "os": resolved_os,
+            "fs": resolved_fs,
             "timeout_sec": args.timeout,
             "euid": unsafe { libc::geteuid() },
         },
-        "status": if total_failed == 0 && !bailed { "ok" } else { "failed" },
+        "status": if total_failed == 0 && !bailed && !timed_out_any { "ok" } else { "failed" },
         "summary": {
             "files": results.len(),
+            "skippedFiles": skipped_files,
             "tests": total_tests,
-            "passed": total_tests - total_failed,
+            "passed": total_passed,
             "failed": total_failed,
             "todoPassed": total_todo,
         },
         "failures": failures,
         "files": results.iter().map(|r| json!({
             "name": r.name,
-            "tests": r.tests, "passed": r.passed, "failed": r.failed, "todo": r.todo,
-            "bail": r.bail, "timedOut": r.timed_out, "exitCode": r.exit_code,
+            "tests": r.tests,
+            "passed": r.passed,
+            "failed": r.failed,
+            "todo": r.todo,
+            "skipped": r.skipped,
+            "skipReason": r.skip_reason,
+            "bail": r.bail,
+            "timedOut": r.timed_out,
+            "exitCode": r.exit_code,
             "failures": r.failures,
             "stderrTail": r.stderr_tail,
         })).collect::<Vec<_>>(),
-    });
-    if let Some(path) = &args.json {
-        if let Err(e) = fs::write(path, serde_json::to_vec_pretty(&report).unwrap()) {
-            warn!("failed to write {}: {e}", path.display());
-        }
-    }
-    Ok(report)
+    }))
 }
 
-fn run_one(scratch: &Path, name: &str, body: &str, conf: &str, misc_body: &str, exe: &Path, args: &Args) -> FileResult {
+#[allow(clippy::too_many_arguments)]
+fn run_one(
+    scratch: &Path,
+    name: &str,
+    body: &str,
+    os_name: &str,
+    fs_name: &str,
+    misc_body: &str,
+    exe: &Path,
+    args: &Args,
+) -> FileResult {
     let _ = fs::remove_dir_all(scratch);
     let mut r = FileResult {
         name: name.to_string(),
@@ -794,6 +1176,8 @@ fn run_one(scratch: &Path, name: &str, body: &str, conf: &str, misc_body: &str, 
         passed: 0,
         failed: 0,
         todo: 0,
+        skipped: false,
+        skip_reason: String::new(),
         failures: Vec::new(),
         bail: false,
         stderr_tail: String::new(),
@@ -806,7 +1190,7 @@ fn run_one(scratch: &Path, name: &str, body: &str, conf: &str, misc_body: &str, 
         r.tests = 1;
         return r;
     }
-    // strip the on-disk sourcing header; misc.sh is already inlined
+
     let body = body
         .lines()
         .filter(|l| {
@@ -815,107 +1199,61 @@ fn run_one(scratch: &Path, name: &str, body: &str, conf: &str, misc_body: &str, 
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut script = String::new();
-    // misc.sh's expect() invokes the helper as `${fstest} $*` (unquoted), but
-    // utimensat/05.t invokes it as `"$fstest" lstat ...` (quoted). Upstream
-    // defines fstest as a bare path so both forms work; if the variable carried
-    // the `__pjdfstest` subcommand in the same word, the quoted form would make
-    // sh exec a file literally named "<exe> __pjdfstest" and fail with a bogus
-    // "not found". Use a wrapper function and point the variable at its name so
-    // both expansions resolve to the wrapper.
-    script.push_str("fstest() { '");
-    script.push_str(&exe.display().to_string().replace('\'', "'\\''"));
-    script.push_str("' __pjdfstest \"$@\"; }\nfstest=fstest\n");
-    script.push_str(conf);
-    if let Some(fs_name) = &args.fs {
-        script.push_str(&format!("\nfs='{fs_name}'\n"));
+
+    let esc_exe = exe.display().to_string().replace('\'', "'\\''");
+    let esc_os = os_name.replace('\'', "");
+    let esc_fs = fs_name.replace('\'', "");
+
+    // Define `fstest` as a shell function and set `fstest=fstest` so both unquoted
+    // `${fstest} $*` (in `misc.sh`) and quoted `"$fstest" ...` (in `utimensat/05.t`) work.
+    let mut script = String::with_capacity(misc_body.len() + body.len() + 512);
+    script.push_str(&format!(
+        "ntest=1\nGREP=grep\nos='{esc_os}'\nfs='{esc_fs}'\n\
+         fstest() {{ '{esc_exe}' __pjdfstest \"$@\"; }}\nfstest=fstest\n\
+         requires_root(){misc_body}\n\
+         namegen() {{ printf 'pjdfstest_%s\\n' \"$(${{fstest}} randhex 32)\"; }}\n\
+         namegen_len() {{ printf '%s' \"$(${{fstest}} randhex \"$1\")\"; }}\n\
+         {body}\n"
+    ));
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(&script).current_dir(scratch);
+    let exec = exec_with_timeout(cmd, Duration::from_secs(args.timeout.max(1)));
+    if let Some(err) = exec.spawn_err {
+        r.failures.push(format!("cannot spawn sh: {err}"));
+        r.tests = 1;
+        r.failed = 1;
+        return r;
     }
-    if let Some(os_name) = &args.os {
-        script.push_str(&format!("\nos='{os_name}'\n"));
-    }
-    script.push_str("\ntest -n \"${fstest}\" || { echo 'not ok - fstest helper not set'; exit 1; }\n");
-    script.push_str("\nrequires_root()");
-    script.push_str(misc_body);
-    script.push('\n');
-    script.push_str(&body);
-    script.push('\n');
-    // the script travels as a single argv element (max ~14KB, well under the
-    // per-argument limit) — piping it via stdin lets any command that inherits
-    // stdin eat the remaining script stream, which stalled the big matrix tests
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(&script)
-        .current_dir(scratch)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            r.failures.push(format!("cannot spawn sh: {e}"));
-            r.tests = 1;
-            r.failed = 1;
-            return r;
-        }
-    };
-    // drain stdout/stderr concurrently: failing assertions print long lines and
-    // a full 64KB pipe would deadlock the child against our unread buffers
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let stdout_reader = thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = String::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ = p.read_to_string(&mut buf);
-        }
-        buf
-    });
-    let stderr_reader = thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = String::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_string(&mut buf);
-        }
-        buf
-    });
-    let deadline = Duration::from_secs(args.timeout.max(1));
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                r.exit_code = status.code();
-                break;
-            }
-            Ok(None) => {
-                if start.elapsed() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    r.timed_out = true;
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break,
-        }
-    }
-    let _ = child.wait();
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    r.stderr_tail = truncate(&stderr, 2000);
+    r.exit_code = exec.code;
+    r.timed_out = exec.timed_out;
+    r.stderr_tail = tail_utf8(&exec.stderr, 2000);
+
+    parse_tap_output(&exec.stdout, &exec.stderr, args.timeout, &mut r);
+    r
+}
+
+fn parse_tap_output(stdout: &str, stderr: &str, timeout_sec: u64, r: &mut FileResult) {
     let mut plan: Option<u64> = None;
     for line in stdout.lines() {
         let line = line.trim_end();
-        if line.starts_with("1..") {
-            if let Ok(n) = line[3..].trim().parse() {
+        if let Some(after) = line.strip_prefix("1..") {
+            let (num_part, comment_part) = match after.split_once('#') {
+                Some((n, c)) => (n.trim(), Some(c.trim())),
+                None => (after.trim(), None),
+            };
+            if let Ok(n) = num_part.parse::<u64>() {
                 plan = Some(n);
+                if n == 0 {
+                    r.skipped = true;
+                    r.skip_reason = comment_part.unwrap_or("1..0").to_string();
+                }
             }
             continue;
         }
-        if let Some(rest) = line.strip_prefix("Bail out!") {
+        if line.starts_with("Bail out!") {
             r.bail = true;
             r.failures.push(line.to_string());
-            let _ = rest;
             continue;
         }
         let (ok, rest) = if let Some(rest) = line.strip_prefix("ok ") {
@@ -937,25 +1275,45 @@ fn run_one(scratch: &Path, name: &str, body: &str, conf: &str, misc_body: &str, 
                 r.todo += 1;
             }
         } else if is_todo {
-            // TODO failures count as passed in TAP
             r.passed += 1;
         } else {
             r.failed += 1;
             r.failures.push(line.to_string());
         }
     }
-    if let Some(n) = plan {
-        if n > r.tests && r.failed == 0 && !r.timed_out {
-            // script died before finishing the plan
-            r.failed += n - r.tests;
-            r.failures
-                .push(format!("script stopped early: declared {n} tests, ran {}", r.tests));
-        }
-    }
+
     if r.timed_out {
-        r.failures.push(format!("timed out after {}s", args.timeout));
+        r.failed = r.failed.max(1);
+        r.failures.push(format!("timed out after {timeout_sec}s"));
+        return;
     }
-    r
+    if r.skipped {
+        return;
+    }
+    if let Some(n) = plan {
+        if n > r.tests {
+            let missing = n - r.tests;
+            r.failed += missing;
+            r.failures.push(format!(
+                "script stopped early: declared {n} tests, ran {}",
+                r.tests
+            ));
+        }
+    } else if r.tests == 0 {
+        r.failed += 1;
+        let detail = if !stderr.trim().is_empty() {
+            tail_utf8(stderr.trim(), 240)
+        } else {
+            format!("exit_code={:?} with zero TAP assertions", r.exit_code)
+        };
+        r.failures.push(format!("no TAP output produced ({detail})"));
+    } else if r.exit_code.unwrap_or(1) != 0 && r.failed == 0 {
+        r.failed += 1;
+        r.failures.push(format!(
+            "script exited with {:?} despite passing TAP lines",
+            r.exit_code
+        ));
+    }
 }
 
 fn embedded(name: &str) -> Option<&'static str> {
@@ -969,15 +1327,79 @@ fn nix_euid_is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let start = s.len() - max;
-        let mut off = 0;
-        while !s.is_char_boundary(off) {
-            off += 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fstatat_and_at_fdcwd_and_pread_error_work_correctly() {
+        let dir = std::env::temp_dir().join(format!("fstest-pjd-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.txt");
+        fs::write(&file, b"hello-world").unwrap();
+
+        let mut fds = Vec::new();
+        let d_str = dir.to_str().unwrap();
+        assert_eq!(exec_syscall("open", &[d_str, "O_RDONLY,O_DIRECTORY"], &mut fds).unwrap(), "0");
+        assert_eq!(
+            exec_syscall("fstatat", &["0", "probe.txt", "type,size", "0"], &mut fds).unwrap(),
+            "regular,11"
+        );
+        assert_eq!(
+            exec_syscall("fstatat", &["AT_FDCWD", file.to_str().unwrap(), "type,size", "0"], &mut fds).unwrap(),
+            "regular,11"
+        );
+        // Reading from directory fd (`0`) or bad fd (`99`) must fail rather than returning `Ok("")`.
+        assert_eq!(exec_syscall("pread", &["99", "8", "0"], &mut fds), Err(libc::EBADF));
+
+        let f_str = file.to_str().unwrap();
+        assert_eq!(exec_syscall("open", &[f_str, "O_RDWR"], &mut fds).unwrap(), "0");
+        assert_eq!(exec_syscall("posix_fallocate", &["1", "1000", "234"], &mut fds).unwrap(), "0");
+        assert_eq!(exec_syscall("fstat", &["1", "size"], &mut fds).unwrap(), "1234");
+
+        for fd in fds {
+            unsafe { libc::close(fd) };
         }
-        format!("...{}", &s[start + off..])
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tap_parser_catches_skip_and_silent_crash() {
+        let mut skip_res = FileResult {
+            name: "open/24.t".into(),
+            tests: 0,
+            passed: 0,
+            failed: 0,
+            todo: 0,
+            skipped: false,
+            skip_reason: String::new(),
+            failures: Vec::new(),
+            bail: false,
+            stderr_tail: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+        };
+        parse_tap_output("1..0 # SKIP: unsupported OS\n", "", 30, &mut skip_res);
+        assert!(skip_res.skipped);
+        assert_eq!(skip_res.failed, 0);
+
+        let mut crash_res = FileResult {
+            name: "broken/00.t".into(),
+            tests: 0,
+            passed: 0,
+            failed: 0,
+            todo: 0,
+            skipped: false,
+            skip_reason: String::new(),
+            failures: Vec::new(),
+            bail: false,
+            stderr_tail: String::new(),
+            exit_code: Some(1),
+            timed_out: false,
+        };
+        parse_tap_output("", "conf failed", 30, &mut crash_res);
+        assert!(!crash_res.skipped);
+        assert_eq!(crash_res.failed, 1);
     }
 }

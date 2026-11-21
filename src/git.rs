@@ -1,39 +1,7 @@
-// git adapter: runs git's own t/ test suite against a mounted filesystem —
-// the same suite upstream CI runs, pointed at the mount with `--root`. Where
-// pjdfstest/LTP ask "does this filesystem conform to POSIX" and stdfs asks
-// "do language runtimes work on it", the git suite asks "does the single most
-// filesystem-dependent application still work": repo init with the
-// core.filemode/ignorecase/symlinks/precomposeunicode probes, lockfile+rename
-// atomicity for the index and refs, loose-object fan-out and pack IO,
-// symlink/case/NFD-NFC semantics through checkout/merge/status, racy-mtime
-// index handling and hardlinked local clones.
-//
-// The suite is version-locked to the binary: the scripts exercise their own
-// version's options and usage text, so they are never vendored and never run
-// against a different git build — one checkout provides both (see
-// scripts/prepare-git.sh, embedded below like the LTP prepare script). Like
-// ltp/stdfs, nothing is embedded or redistributed.
-//
-// Invocation contract (test-lib.sh): the scripts source `./test-lib.sh` from
-// the cwd and derive TEST_DIRECTORY from it, so every script runs with
-// cwd = <git-tree>/t; `--root=<work dir under the mount>` moves every trash
-// directory onto the filesystem under test, and TEST_OUTPUT_DIRECTORY keeps
-// the harness' bookkeeping on the mount too, so a read-only build tree is
-// enough. The harness probes capabilities (symlinks, case, NFD→NFC, ACLs,
-// perl, curl …) and turns missing ones into `# skip` TAP lines rather than
-// failures — only wrong behavior on a present capability fails.
-//
-// fstest executes each selected tNNNN script itself with a per-script timeout
-// (process-group kill) and parses the TAP from stdout. Result mapping:
-// `not ok … # TODO known breakage` is upstream's expected breakage, `ok … #
-// TODO known breakage vanished` is a fixed breakage (upstream exits 1 for it;
-// fstest reports it without failing the run); a script that dies before
-// emitting its trailing `1..N` plan is `broken`; a whole-file `1..0 # SKIP` is
-// `skip`. The run is ok iff no script fails/breaks/times out. Failed scripts
-// keep their trash directory (upstream behavior), so the work dir is removed
-// at the end under a time bound — never block the report on a wedged mount.
+// Runs Git's `t/` test suite against `<mountpoint>` via `--root`, using the
+// compile-time embedded Git build tree (`GIT_TEST_FSYNC=1` by default).
 
-use crate::smallfile::iso8601;
+use crate::common::iso8601;
 use log::{info, warn};
 use serde_json::{Value, json};
 use std::fs;
@@ -45,111 +13,118 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-// scripts/prepare-git.sh is the single source of truth for getting a built
-// tree, embedded here so a fresh machine can bootstrap from the fstest binary
-// alone: `fstest git --prepare-script | sh`.
-pub const PREPARE_SCRIPT: &str = include_str!("../scripts/prepare-git.sh");
-
-// Tier A: the scripts that actually couple to filesystem semantics, curated
-// the same way the ltp adapter narrows JuiceFS's selection — everything here
-// exercises FS behavior (feature probing, symlinks, case, unicode, mtime
-// races, lockfiles, permissions, hardlinks …); the bulk of t/ (diff/rev-list/
-// porcelain internals, network transports, foreign SCMs) does not. Names
-// resolve against the tree at runtime (exact match first, then number prefix)
-// and a selection that matches nothing is reported instead of silently
-// skipped, so upstream renames show up as warnings rather than lost coverage.
-const TIER_A: &[&str] = &[
-    // capability probing + repo layout
+// Default curated suite (`fstest git <mnt>`): all Git t/ scripts that directly
+// exercise filesystem contracts, object/ref storage backends, and core Git
+// developer/agent workflows on the mount under test (with `GIT_TEST_FSYNC=1`
+// enabled by default):
+//   1. Repo init, capability probing & ownership (`safe.directory`)
+//   2. Lockfiles, loose refs, reflogs, `packed-refs`, and `reftable` backend
+//   3. Loose objects, packfiles, 1-page `mmap` sliding window, `.idx`/`.bitmap`,
+//      `commit-graph`, `multi-pack-index` (`MIDX`), and `gc`/`repack`/cruft packs
+//   4. `.git/index`, split-index, racy-mtime stat cache, untracked-cache & fsmonitor
+//   5. Multi-worker parallel checkout, sparse-checkout, multi-worktree, hardlink
+//      local clones & alternates
+//   6. Symlinks, case-insensitivity, Unicode NFD/NFC, permissions/ACL, CRLF &
+//      funny filenames
+//   7. Core developer/agent workflows (`add`, `rm`, `mv`, `stash`, `rebase`,
+//      `submodule`, executable `.git/hooks/*`)
+// Names resolve against the embedded `t/` tree at runtime (exact stem first,
+// then unique number prefix) so upstream suffix renames surface cleanly.
+const DEFAULT_SCRIPTS: &[&str] = &[
+    // 1. Capability probing, repo layout & ownership
     "t0001-init",
+    "t0033-safe-directory",
     "t0050-filesystem",
     "t0055-beyond-symlinks",
     "t0060-path-utils",
-    // symlink semantics
-    "t2005-checkout-index-symlinks",
-    "t2102-update-index-symlinks",
-    "t6405-merge-symlinks",
-    "t7515-status-symlinks",
-    "t6415-merge-dir-to-symlink",
-    // case-insensitive filesystems
-    "t0003-attributes",
-    "t2100-update-cache-badpath",
-    "t2000-conflict-when-checking-files-out",
-    "t2201-add-update-typechange",
-    // unicode normalization (NFD/NFC)
-    "t3910-mac-os-precompose",
-    // executable bit / filemode
-    "t4000-diff-format",
-    "t4129-apply-samemode",
-    // mtime granularity / racy index
+    // 2. Lockfiles, loose refs, reflogs, packed-refs & reftable backend
+    "t0031-lockfile-pid",
+    "t0601-reffiles-pack-refs",
+    "t0610-reftable-basics",
+    "t0613-reftable-write-options",
+    "t0614-reftable-fsck",
+    "t1400-update-ref",
+    "t1408-packed-refs",
+    "t1410-reflog",
+    // 3. Object store, packfiles, mmap sliding window, commit-graph, MIDX, bitmaps & gc/repack
+    "t1050-large",
+    "t5300-pack-object",
+    "t5301-sliding-window",
+    "t5302-pack-index",
+    "t5304-prune",
+    "t5310-pack-bitmaps",
+    "t5318-commit-graph",
+    "t5319-multi-pack-index",
+    "t6500-gc",
+    "t6501-freshen-objects",
+    "t7700-repack",
+    "t7704-repack-cruft",
+    // 4. Index, split-index, racy-mtime stat cache, untracked-cache & fsmonitor
+    "t1600-index",
     "t1700-split-index",
     "t1701-racy-split-index",
     "t2108-update-index-refresh-racy",
-    "t6501-freshen-objects",
-    // lockfiles / ref/index atomicity
-    "t0031-lockfile-pid",
-    "t1400-update-ref",
-    "t1410-reflog",
-    "t1600-index",
-    "t5304-prune",
-    // special filenames
-    "t3300-funny-names",
-    "t3902-quoted",
-    "t4016-diff-quote",
-    // dircache / fsmonitor
     "t7063-status-untracked-cache",
     "t7519-status-fsmonitor",
-    // hardlinks / alternates
-    "t5605-clone-local",
-    "t5613-info-alternate",
-    // sparse checkout
+    // 5. Parallel checkout, sparse-checkout, multi-worktree, local clone & alternates
     "t1011-read-tree-sparse-checkout",
     "t1090-sparse-checkout-scope",
-    // crlf / working-tree encoding
-    "t0020-crlf",
-    "t0028-working-tree-encoding",
-    // permission bits / shared repos
-    "t1301-shared-repo",
-    "t1304-default-acl",
-    // large files / deep paths
-    "t1050-large",
-    "t7001-mv",
-    // add/rm/rename
-    "t2200-add-update",
-    "t3600-rm",
-    "t4008-diff-break-rewrite",
-    // ownership (safe.directory probes the FS's uid metadata)
-    "t0033-safe-directory",
-];
-
-// Tier B: heavyweights on top of tier A (--tier b includes both). Minutes each
-// on local disk; on a network filesystem expect the per-script timeout to bite.
-const TIER_B: &[&str] = &[
-    "t0027-auto-crlf",                     // the full CRLF combination matrix (~2600 assertions)
-    "t0021-conversion",                    // clean/smudge filters, incl. the perl filter process
-    "t1092-sparse-checkout-compatibility", // every git command run sparse vs full
-    "t2400-worktree-add",
     "t2080-parallel-checkout-basics",
     "t2081-parallel-checkout-collisions",
-    "t3705-add-sparse-checkout",
-    "t7704-repack-cruft",
-    // case-insensitive deep-dives
-    "t6131-pathspec-icase",
-    "t7062-wtstatus-ignorecase",
-    "t6419-merge-ignorecase",
+    "t2400-worktree-add",
+    "t2403-worktree-move",
+    "t5605-clone-local",
+    "t5613-info-alternate",
+    // 6. Symlinks, case-sensitivity, Unicode NFD/NFC, permissions/ACL, CRLF & special filenames
+    "t0003-attributes",
+    "t0020-crlf",
+    "t0028-working-tree-encoding",
+    "t1301-shared-repo",
+    "t1304-default-acl",
+    "t2000-conflict-when-checking-files-out",
+    "t2005-checkout-index-symlinks",
+    "t2100-update-cache-badpath",
+    "t2102-update-index-symlinks",
+    "t2201-add-update-typechange",
+    "t3300-funny-names",
+    "t3902-quoted",
+    "t3910-mac-os-precompose",
+    "t4000-diff-format",
+    "t4016-diff-quote",
+    "t4129-apply-samemode",
+    "t6405-merge-symlinks",
+    "t6415-merge-dir-to-symlink",
+    "t7515-status-symlinks",
+    // 7. Core developer/agent workflows (add, rm, mv, stash, rebase, submodule, hooks)
+    "t1800-hook",
+    "t2200-add-update",
+    "t3400-rebase",
+    "t3600-rm",
+    "t3700-add",
+    "t3903-stash",
+    "t4008-diff-break-rewrite",
+    "t7001-mv",
+    "t7400-submodule-basic",
 ];
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(4, 8))
+        .unwrap_or(4)
+}
 
 #[derive(clap::Args)]
 pub struct Args {
     /// git build tree (contains git, t/test-lib.sh, t/helper/test-tool);
-    /// default: $FSTEST_GIT_DIR, else the newest build under ~/.cache/fstest/git
+    /// default: $FSTEST_GIT_DIR, else the embedded bundle extracted under ~/.cache/fstest
     #[arg(long)]
     pub git_dir: Option<PathBuf>,
 
-    /// a = curated fs-coupled scripts (default); b = a + heavyweights; all = every tNNNN script
-    #[arg(long, default_value = "a")]
-    pub tier: String,
+    /// run every tNNNN script in the embedded Git tree (~1046 scripts) instead of the curated FS+workflow suite
+    #[arg(long, conflicts_with = "tests")]
+    pub all: bool,
 
-    /// explicit scripts (comma list of tNNNN or tNNNN-name), overrides --tier
+    /// explicit scripts (comma list of tNNNN or tNNNN-name), overriding the default suite
     #[arg(long, value_delimiter = ',')]
     pub tests: Vec<String>,
 
@@ -162,12 +137,16 @@ pub struct Args {
     pub list: bool,
 
     /// concurrent scripts (each owns its own trash directory)
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = default_jobs())]
     pub jobs: usize,
 
     /// per-script timeout in seconds
     #[arg(long, default_value_t = 600)]
     pub timeout: u64,
+
+    /// disable GIT_TEST_FSYNC=1 (by default real fsync is enforced across objects, packfiles, refs, and lockfiles)
+    #[arg(long)]
+    pub no_fsync: bool,
 
     /// working directory name under the mount point (trash directories live here)
     #[arg(long, default_value = ".fstest-git")]
@@ -183,14 +162,25 @@ pub struct Args {
     #[arg(long)]
     pub keep: bool,
 
-    /// print the git prepare script (clone + build the pinned release) and exit;
-    /// run it on a fresh machine with: fstest git --prepare-script | sh
-    #[arg(long)]
-    pub prepare_script: bool,
-
     /// also write the JSON result to this file
     #[arg(long)]
     pub json: Option<PathBuf>,
+}
+
+impl Args {
+    pub fn fsync_enabled(&self) -> bool {
+        !self.no_fsync
+    }
+
+    fn selection_mode(&self) -> &'static str {
+        if !self.tests.is_empty() {
+            "custom"
+        } else if self.all {
+            "all"
+        } else {
+            "default"
+        }
+    }
 }
 
 // ---------- tree discovery ----------
@@ -203,25 +193,25 @@ fn validate_tree(dir: &Path) -> bool {
 
 fn default_git_dir_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Ok(d) = std::env::var("FSTEST_GIT_DIR") {
+    if let Ok(d) = std::env::var("FSTEST_GIT_DIR")
+        && !d.trim().is_empty()
+    {
         v.push(PathBuf::from(d));
     }
-    let cache = match std::env::var("XDG_CACHE_HOME") {
-        Ok(c) => PathBuf::from(c),
-        Err(_) => match std::env::var("HOME") {
-            Ok(h) => PathBuf::from(h).join(".cache"),
-            Err(_) => return v,
-        },
+    if let Some(bundle) = crate::bundle::ensure_extracted() {
+        let p = bundle.join("git");
+        if p.is_dir() {
+            v.push(p);
+        }
     }
-    .join("fstest")
-    .join("git");
-    if let Ok(rd) = fs::read_dir(&cache) {
-        // newest version first; lexical order is right within a major series
-        // (v2.55.0 > v2.54.0) and FSTEST_GIT_DIR is the escape hatch otherwise
-        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        dirs.sort();
-        dirs.reverse();
-        v.extend(dirs);
+    for base in crate::common::cache_dir_candidates() {
+        let cache = base.join("git");
+        if let Ok(rd) = fs::read_dir(&cache) {
+            let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            dirs.sort();
+            dirs.reverse();
+            v.extend(dirs);
+        }
     }
     v
 }
@@ -238,11 +228,10 @@ fn find_git_dir(args: &Args) -> Result<PathBuf, String> {
     }
     Err(match &args.git_dir {
         Some(d) => format!(
-            "{} is not a built git tree (needs git, t/test-lib.sh and t/helper/test-tool); build one with: fstest git --prepare-script | sh",
+            "{} is not a built git tree (needs git, t/test-lib.sh and t/helper/test-tool)",
             d.display()
         ),
-        None => "no built git tree found (looked in $FSTEST_GIT_DIR and ~/.cache/fstest/git/*); \
-                 build one with: fstest git --prepare-script | sh"
+        None => "no built git tree found (embedded bundle disabled and nothing in $FSTEST_GIT_DIR or ~/.cache/fstest/git/*; pass --git-dir or rebuild fstest with default features)"
             .into(),
     })
 }
@@ -285,21 +274,16 @@ fn resolve_entry(entry: &str, scripts: &[String]) -> Result<String, String> {
 
 fn selection(t_dir: &Path, args: &Args) -> Result<(Vec<String>, Vec<String>), String> {
     let scripts = discover_scripts(t_dir)?;
-    let entries: Vec<String> = if !args.tests.is_empty() {
-        args.tests.clone()
-    } else {
-        match args.tier.as_str() {
-            "a" => TIER_A.iter().map(|s| s.to_string()).collect(),
-            "b" => TIER_A.iter().chain(TIER_B.iter()).map(|s| s.to_string()).collect(),
-            "all" => scripts.clone(),
-            other => return Err(format!("unknown tier {other:?} (a|b|all)")),
-        }
-    };
     let mut unmatched = Vec::new();
     let mut selected = Vec::new();
-    if args.tier == "all" && args.tests.is_empty() {
+    if args.all && args.tests.is_empty() {
         selected = scripts;
     } else {
+        let entries: Vec<String> = if !args.tests.is_empty() {
+            args.tests.clone()
+        } else {
+            DEFAULT_SCRIPTS.iter().map(|s| s.to_string()).collect()
+        };
         let mut seen = std::collections::HashSet::new();
         for e in &entries {
             match resolve_entry(e, &scripts) {
@@ -615,10 +599,10 @@ pub fn list(args: &Args) -> Result<(), String> {
         warn!("git: selection not matched: {u}");
     }
     info!(
-        "git: {} scripts selected from {} (tier {}) in {}",
+        "git: {} scripts selected from {} ({}) in {}",
         selected.len(),
         tree.display(),
-        if args.tests.is_empty() { &args.tier } else { "custom" },
+        args.selection_mode(),
         tree.join("t").display()
     );
     Ok(())
@@ -635,7 +619,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     let t_dir = tree.join("t");
     let (selected, unmatched) = selection(&t_dir, args)?;
     if selected.is_empty() {
-        return Err("no test scripts selected (check --tier/--tests/--filter against this tree)".into());
+        return Err("no test scripts selected (check --all/--tests/--filter against this tree)".into());
     }
     for u in &unmatched {
         warn!("git: selection not matched: {u}");
@@ -678,11 +662,13 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     let work_root = mountpoint.join(&args.work_dir);
     fs::create_dir_all(&work_root).map_err(|e| format!("{}: {e}", work_root.display()))?;
     let results_dir = work_root.join("test-results");
+    let fsync_on = args.fsync_enabled();
 
     info!(
-        "git: {} scripts selected (tier {}) on {} using {} ({})",
+        "git: {} scripts selected ({}, fsync={}) on {} using {} ({})",
         selected.len(),
-        if args.tests.is_empty() { &args.tier } else { "custom" },
+        args.selection_mode(),
+        fsync_on,
         mountpoint.display(),
         tree.display(),
         if args.jobs == 1 {
@@ -712,6 +698,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             }
         }
         cmd.env("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME", "main")
+            .env("GIT_TEST_FSYNC", if fsync_on { "1" } else { "0" })
             .env("TEST_OUTPUT_DIRECTORY", &results_dir);
         let ex = exec_with_timeout(cmd, Duration::from_secs(args.timeout.max(1)));
         let tap = parse_tap(&ex.stdout);
@@ -853,9 +840,11 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             "git_dir": tree.display().to_string(),
             "git_version": version,
             "git_commit": commit,
-            "tier": if args.tests.is_empty() { json!(args.tier) } else { json!("custom") },
+            "selection": args.selection_mode(),
+            "all": args.all,
             "tests": if args.tests.is_empty() { Value::Null } else { json!(args.tests) },
             "filter": args.filter,
+            "fsync": fsync_on,
             "jobs": args.jobs,
             "timeout_sec": args.timeout,
         },
@@ -873,10 +862,78 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             "items": items,
         },
     });
-    if let Some(path) = &args.json {
-        if let Err(e) = fs::write(path, serde_json::to_vec_pretty(&report).unwrap()) {
-            warn!("failed to write {}: {e}", path.display());
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn default_scripts_are_unique_and_cover_all_git_fs_pillars() {
+        assert_eq!(DEFAULT_SCRIPTS.len(), 67);
+        let mut uniq = std::collections::HashSet::new();
+        for &s in DEFAULT_SCRIPTS {
+            assert!(uniq.insert(s), "duplicate script in DEFAULT_SCRIPTS: {s}");
+        }
+        // Key representatives across reftable, pack/mmap/MIDX/commit-graph/gc/repack,
+        // parallel-checkout, worktree, and porcelain workflows
+        for must in [
+            "t0610-reftable-basics",
+            "t1408-packed-refs",
+            "t1800-hook",
+            "t2080-parallel-checkout-basics",
+            "t2400-worktree-add",
+            "t3400-rebase",
+            "t3700-add",
+            "t3903-stash",
+            "t5300-pack-object",
+            "t5301-sliding-window",
+            "t5318-commit-graph",
+            "t5319-multi-pack-index",
+            "t6500-gc",
+            "t7400-submodule-basic",
+            "t7700-repack",
+        ] {
+            assert!(uniq.contains(must), "missing expected script {must}");
         }
     }
-    Ok(report)
+
+    #[test]
+    fn default_cli_enables_fsync_and_default_selection() {
+        let cli = TestCli::parse_from(["test"]);
+        assert!(cli.args.fsync_enabled());
+        assert!(!cli.args.all);
+        assert_eq!(cli.args.selection_mode(), "default");
+
+        let cli_no_fsync = TestCli::parse_from(["test", "--no-fsync", "--all"]);
+        assert!(!cli_no_fsync.args.fsync_enabled());
+        assert!(cli_no_fsync.args.all);
+        assert_eq!(cli_no_fsync.args.selection_mode(), "all");
+    }
+
+    #[test]
+    fn tap_parser_handles_todo_vanished_and_skips() {
+        let sample = "\
+ok 1 - basic init
+ok 2 # skip case folding (missing CASE_INSENSITIVE_FS)
+not ok 3 - known racy # TODO known breakage
+ok 4 - fixed upstream # TODO known breakage vanished
+1..4
+";
+        let tap = parse_tap(sample);
+        assert_eq!(tap.plan, Some(4));
+        assert_eq!(tap.pass, 1);
+        assert_eq!(tap.skip, 1);
+        assert_eq!(tap.todo, 1);
+        assert_eq!(tap.fixed, 1);
+        assert_eq!(tap.fail, 0);
+    }
 }

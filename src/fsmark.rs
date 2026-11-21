@@ -1,8 +1,7 @@
-// Behavior-level port of fs_mark 3.3 (https://github.com/josefbacik/fs_mark).
-// Per-system-call microsecond timing, sync-method matrix, subdirectory policies,
-// file naming, aggregation and text report formats mirror the C implementation.
+// Port of `fs_mark` 3.3 (https://github.com/josefbacik/fs_mark):
+// synchronous/asynchronous file-creation rate and per-syscall microsecond benchmark.
 
-use crate::smallfile::fsync_raw;
+use crate::common::{SplitMix64, fsync_raw, host_name, iso8601, sync_filesystem};
 use log::{info, warn};
 use serde_json::{Map, Value, json};
 use std::ffi::CString;
@@ -74,7 +73,7 @@ pub struct Args {
     #[arg(short = 'd', long)]
     pub dir: Vec<PathBuf>,
 
-    /// number of files to create per iteration
+    /// number of files to create per iteration per thread
     #[arg(short = 'n', long, default_value_t = 1000)]
     pub files: u32,
 
@@ -86,7 +85,7 @@ pub struct Args {
     #[arg(short = 'w', long, default_value_t = 16 * 1024)]
     pub write_size: usize,
 
-    /// number of iterations (implies keeping files)
+    /// number of iterations (implies keeping files across iterations)
     #[arg(short = 'L', long, default_value_t = 0)]
     pub iterations: u32,
 
@@ -114,7 +113,7 @@ pub struct Args {
     #[arg(short = 't', long, default_value_t = 1)]
     pub threads: usize,
 
-    /// keep files after each iteration
+    /// keep files after completion
     #[arg(short = 'k', long)]
     pub keep_files: bool,
 
@@ -122,16 +121,23 @@ pub struct Args {
     #[arg(short = 'F', long)]
     pub fill_fs: bool,
 
-    /// append the fs_mark-format text report to this log file (fs_mark itself
-    /// always wrote fs_log.txt in the CWD; fstest only writes it on request)
+    /// fill write buffer with deterministic pseudo-random bytes instead of zeros
+    #[arg(long)]
+    pub incompressible: bool,
+
+    /// append the fs_mark-format text report to this log file
     #[arg(short = 'l', long)]
     pub log_file: Option<PathBuf>,
 
     /// include per-system-call min/avg/max stats in the text report
-    #[arg(long)]
+    #[arg(short = 'v', long)]
     pub verbose_stats: bool,
 
-    /// also write the JSON result to this file
+    /// debug logging
+    #[arg(long)]
+    pub verbose: bool,
+
+    /// write the enriched JSON result to this file
     #[arg(long)]
     pub json: Option<PathBuf>,
 }
@@ -162,6 +168,7 @@ struct Params {
     rand_len: usize,
     keep_files: bool,
     fill_fs: bool,
+    incompressible: bool,
     log_file: Option<PathBuf>,
     verbose_stats: bool,
 }
@@ -206,10 +213,13 @@ fn resolve(args: &Args, mountpoint: &Path) -> Result<Params, String> {
     let num_per_subdir = match args.files_per_subdir {
         Some(n) => {
             if num_subdirs == 0 {
-                return Err("Must specify more than 1 subdirectory with -D for files-per-subdir to make sense".into());
+                return Err(
+                    "Must specify more than 1 subdirectory with -D for files-per-subdir to make sense"
+                        .into(),
+                );
             }
             dir_policy = DirPolicy::RoundRobin;
-            n
+            n.max(1)
         }
         None => 0,
     };
@@ -220,9 +230,9 @@ fn resolve(args: &Args, mountpoint: &Path) -> Result<Params, String> {
     let num_dirs = dirs.len();
     if num_dirs > threads {
         threads = num_dirs;
-    } else if threads % num_dirs != 0 {
+    } else if !threads.is_multiple_of(num_dirs) {
         return Err(format!(
-            "Threads ({threads}) must be an even multiple the number of directories ({num_dirs}) and less than {MAX_THREADS}"
+            "Threads ({threads}) must be an even multiple of directories ({num_dirs}) and <= {MAX_THREADS}"
         ));
     }
     let keep_files = args.keep_files || args.iterations > 0 || args.fill_fs;
@@ -243,6 +253,7 @@ fn resolve(args: &Args, mountpoint: &Path) -> Result<Params, String> {
         rand_len: args.rand_len,
         keep_files,
         fill_fs: args.fill_fs,
+        incompressible: args.incompressible,
         log_file: args.log_file.clone(),
         verbose_stats: args.verbose_stats,
     })
@@ -266,7 +277,6 @@ fn us(d: std::time::Duration) -> u64 {
     d.as_micros() as u64
 }
 
-// fs_mark reports min==0 as "unset" and carries that convention into aggregation
 #[derive(Default, Clone, Copy)]
 struct Stat {
     min: u64,
@@ -295,39 +305,31 @@ impl Stat {
     }
 }
 
+#[derive(Default)]
 struct Row {
     file_count: u64,
     files_per_sec: f64,
     app_overhead_usec: i64,
     creat: Stat,
     write: Stat,
-    write_avg_acc: u64, // fs_mark accumulates the per-file average of write() times, then divides by files
+    write_avg_acc: u64,
     fsync: Stat,
     sync_usec: u64,
     close: Stat,
     unlink: Stat,
 }
 
-impl Default for Row {
-    fn default() -> Self {
-        Row {
-            file_count: 0,
-            files_per_sec: 0.0,
-            app_overhead_usec: 0,
-            creat: Stat::default(),
-            write: Stat::default(),
-            write_avg_acc: 0,
-            fsync: Stat::default(),
-            sync_usec: 0,
-            close: Stat::default(),
-            unlink: Stat::default(),
-        }
-    }
-}
-
 enum RunErr {
     SpaceFull(PathBuf),
     Io(io::Error),
+}
+
+fn map_io_err(e: io::Error, dir: &Path, fill_fs: bool) -> RunErr {
+    if fill_fs && matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)) {
+        RunErr::SpaceFull(dir.to_path_buf())
+    } else {
+        RunErr::Io(e)
+    }
 }
 
 fn mkdir_eexist(dir: &Path) -> io::Result<()> {
@@ -339,34 +341,56 @@ fn mkdir_eexist(dir: &Path) -> io::Result<()> {
 }
 
 fn statfs_vals(dir: &Path) -> io::Result<(u64, u64, u64)> {
-    let c = CString::new(dir.as_os_str().as_bytes()).map_err(|_| io::Error::other("path contains NUL"))?;
+    let c = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("path contains NUL"))?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((st.f_blocks as u64, st.f_bavail as u64, st.f_bsize as u64))
+    #[cfg(target_os = "linux")]
+    let unit = if st.f_frsize > 0 {
+        st.f_frsize as u64
+    } else {
+        st.f_bsize as u64
+    };
+    #[cfg(not(target_os = "linux"))]
+    let unit = st.f_bsize as u64;
+    Ok((st.f_blocks as u64, st.f_bavail as u64, unit.max(512)))
 }
 
 fn free_bytes(dir: &Path) -> io::Result<u64> {
-    let (_, bavail, bsize) = statfs_vals(dir)?;
-    Ok(bavail * bsize)
+    let (blocks, bavail, unit) = statfs_vals(dir)?;
+    if blocks == 0 {
+        return Ok(u64::MAX);
+    }
+    Ok(bavail.saturating_mul(unit))
 }
 
 fn fs_use_pct(dir: &Path) -> io::Result<u32> {
     let (blocks, bavail, _) = statfs_vals(dir)?;
-    Ok((100 * (blocks - bavail) / blocks) as u32)
+    if blocks == 0 {
+        return Ok(0);
+    }
+    let used = blocks.saturating_sub(bavail);
+    Ok((100u64.saturating_mul(used) / blocks) as u32)
 }
 
-// port of setup_file_name(): lowercase-hex timestamp for the sequential part
-// (least significant digits kept, padded with '~' when short), then random
-// uppercase-letter/digit characters; plus the subdirectory policy selection
+struct ThreadState {
+    dir: PathBuf,
+    rng: SplitMix64,
+    current_subdir: usize,
+    last_mkdir_subdir: Option<usize>,
+    start_sec_time: u64,
+    files_in_subdir: usize,
+}
+
 fn setup_file_name(p: &Params, st: &mut ThreadState) -> io::Result<(PathBuf, String)> {
     let sec_time = unix_secs();
     if st.start_sec_time == 0 {
         st.start_sec_time = sec_time;
     }
-    let subdir = match p.dir_policy {
-        DirPolicy::NoSubdirs => String::new(),
+    let target_dir = match p.dir_policy {
+        DirPolicy::NoSubdirs => st.dir.clone(),
         DirPolicy::RoundRobin => {
             if st.files_in_subdir >= p.num_per_subdir {
                 st.current_subdir += 1;
@@ -374,18 +398,27 @@ fn setup_file_name(p: &Params, st: &mut ThreadState) -> io::Result<(PathBuf, Str
             }
             st.current_subdir %= p.num_subdirs;
             st.files_in_subdir += 1;
-            format!("{:02x}", st.current_subdir)
+            let d = st.dir.join(format!("{:02x}", st.current_subdir));
+            if st.last_mkdir_subdir != Some(st.current_subdir) {
+                mkdir_eexist(&d)?;
+                st.last_mkdir_subdir = Some(st.current_subdir);
+            }
+            d
         }
         DirPolicy::TimeHash => {
             if sec_time - st.start_sec_time > p.secs_per_dir {
                 st.current_subdir = (st.current_subdir + 1) % p.num_subdirs;
                 st.start_sec_time = sec_time;
             }
-            format!("{:02x}", st.current_subdir)
+            let d = st.dir.join(format!("{:02x}", st.current_subdir));
+            if st.last_mkdir_subdir != Some(st.current_subdir) {
+                mkdir_eexist(&d)?;
+                st.last_mkdir_subdir = Some(st.current_subdir);
+            }
+            d
         }
     };
-    let target_dir = PathBuf::from(format!("{}/{}", st.dir.display(), subdir));
-    mkdir_eexist(&target_dir)?;
+
     let seq_len = p.name_len - p.rand_len;
     let seq_name = format!("{sec_time:x}");
     let mut name = String::with_capacity(p.name_len);
@@ -400,7 +433,7 @@ fn setup_file_name(p: &Params, st: &mut ThreadState) -> io::Result<(PathBuf, Str
     }
     for _ in 0..p.rand_len {
         loop {
-            let val = st.next_rand();
+            let val = st.rng.next_u64();
             let c = b'0' + (val & 0x7f) as u8;
             if c.is_ascii_uppercase() || c.is_ascii_digit() {
                 name.push(c as char);
@@ -411,26 +444,13 @@ fn setup_file_name(p: &Params, st: &mut ThreadState) -> io::Result<(PathBuf, Str
     Ok((target_dir, name))
 }
 
-struct ThreadState {
-    dir: PathBuf,
-    rng: u64,
-    current_subdir: usize,
-    start_sec_time: u64,
-    files_in_subdir: usize,
-}
-
-impl ThreadState {
-    fn next_rand(&mut self) -> u64 {
-        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        z
-    }
-}
-
-fn write_file(f: &mut File, buf: &[u8], sz: u64, write_stat: &mut Stat, write_avg_acc: &mut u64) -> io::Result<()> {
+fn write_file(
+    f: &mut File,
+    buf: &[u8],
+    sz: u64,
+    write_stat: &mut Stat,
+    write_avg_acc: &mut u64,
+) -> io::Result<()> {
     let mut left = sz as usize;
     let mut calls = 0u64;
     let mut local = 0u64;
@@ -444,26 +464,30 @@ fn write_file(f: &mut File, buf: &[u8], sz: u64, write_stat: &mut Stat, write_av
         calls += 1;
         left -= n;
     }
-    *write_avg_acc += local / calls.max(1);
+    if calls > 0 {
+        *write_avg_acc += local / calls;
+    }
     Ok(())
 }
 
-fn run_thread(p: &Params, dir_index: usize, io_buffer: &[u8]) -> Result<Row, RunErr> {
-    let dir = p.dirs[dir_index % p.dirs.len()].clone();
-    // fs_mark's setup() (mkdir) runs before do_run()'s check_space (statfs), and
-    // the latter needs the directory to exist
-    mkdir_eexist(&dir).map_err(RunErr::Io)?;
-    let bytes_per_loop = p.file_size * p.num_files as u64;
-    if free_bytes(&dir).map_err(RunErr::Io)? < bytes_per_loop {
+fn run_thread(p: &Params, tid: usize, io_buffer: &[u8]) -> Result<Row, RunErr> {
+    let dir = p.dirs[tid % p.dirs.len()].clone();
+    mkdir_eexist(&dir).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
+    let threads_per_dir = (p.threads / p.dirs.len().max(1)).max(1) as u64;
+    let bytes_needed = p
+        .file_size
+        .saturating_mul(p.num_files as u64)
+        .saturating_mul(threads_per_dir);
+    if free_bytes(&dir).map_err(RunErr::Io)? < bytes_needed {
         return Err(RunErr::SpaceFull(dir));
     }
-    // fs_mark re-forks its children every iteration, so all state below is
-    // per-iteration and file counts are never cumulative inside a row
+
     let num_subdirs = p.num_subdirs.max(1);
     let mut st = ThreadState {
-        dir,
-        rng: unix_nanos() as u64 ^ (dir_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-        current_subdir: (unix_secs() % num_subdirs as u64) as usize,
+        dir: dir.clone(),
+        rng: SplitMix64::new(unix_nanos() as u64 ^ (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        current_subdir: ((unix_secs() as usize).wrapping_add(tid)) % num_subdirs,
+        last_mkdir_subdir: None,
         start_sec_time: 0,
         files_in_subdir: 0,
     };
@@ -471,9 +495,9 @@ fn run_thread(p: &Params, dir_index: usize, io_buffer: &[u8]) -> Result<Row, Run
     let mut names: Vec<PathBuf> = Vec::with_capacity(p.num_files as usize);
     let loop_start = Instant::now();
     for _ in 0..p.num_files {
-        let (target_dir, fname) = setup_file_name(p, &mut st).map_err(RunErr::Io)?;
+        let (target_dir, fname) =
+            setup_file_name(p, &mut st).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
         let path = target_dir.join(&fname);
-        names.push(path.clone());
         let t0 = Instant::now();
         let mut f = OpenOptions::new()
             .read(true)
@@ -482,12 +506,14 @@ fn run_thread(p: &Params, dir_index: usize, io_buffer: &[u8]) -> Result<Row, Run
             .truncate(true)
             .mode(0o666)
             .open(&path)
-            .map_err(RunErr::Io)?;
+            .map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
         row.creat.add(us(t0.elapsed()));
-        write_file(&mut f, io_buffer, p.file_size, &mut row.write, &mut row.write_avg_acc).map_err(RunErr::Io)?;
+        names.push(path);
+        write_file(&mut f, io_buffer, p.file_size, &mut row.write, &mut row.write_avg_acc)
+            .map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
         if p.sync_bits & FSYNC_BEFORE_CLOSE != 0 {
             let t0 = Instant::now();
-            fsync_raw(&f).map_err(RunErr::Io)?;
+            fsync_raw(&f).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
             row.fsync.add(us(t0.elapsed()));
         }
         let t0 = Instant::now();
@@ -496,13 +522,13 @@ fn run_thread(p: &Params, dir_index: usize, io_buffer: &[u8]) -> Result<Row, Run
     }
     if p.sync_bits & FSYNC_SYNC_SYSCALL != 0 {
         let t0 = Instant::now();
-        unsafe { libc::sync() };
+        sync_filesystem(&dir);
         row.sync_usec = us(t0.elapsed());
     }
     let post_fsync = |row: &mut Row, path: &Path| -> Result<(), RunErr> {
         let t0 = Instant::now();
-        let f = File::open(path).map_err(RunErr::Io)?;
-        fsync_raw(&f).map_err(RunErr::Io)?;
+        let f = File::open(path).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
+        fsync_raw(&f).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
         drop(f);
         row.fsync.add(us(t0.elapsed()));
         Ok(())
@@ -517,12 +543,10 @@ fn run_thread(p: &Params, dir_index: usize, io_buffer: &[u8]) -> Result<Row, Run
             post_fsync(&mut row, path)?;
         }
     }
-    if p.sync_bits & FSYNC_FIRST_FILE != 0 {
-        // fs_mark adds this single open/fsync/close to the fsync total without
-        // feeding its min/max trackers
+    if p.sync_bits & FSYNC_FIRST_FILE != 0 && !names.is_empty() {
         let t0 = Instant::now();
-        let f = File::open(&names[0]).map_err(RunErr::Io)?;
-        fsync_raw(&f).map_err(RunErr::Io)?;
+        let f = File::open(&names[0]).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
+        fsync_raw(&f).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
         drop(f);
         row.fsync.total += us(t0.elapsed());
     }
@@ -534,10 +558,11 @@ fn run_thread(p: &Params, dir_index: usize, io_buffer: &[u8]) -> Result<Row, Run
             row.unlink.add(us(t0.elapsed()));
         }
     }
-    let total_ops = row.creat.total + row.write.total + row.fsync.total + row.sync_usec + row.close.total;
+    let total_ops =
+        row.creat.total + row.write.total + row.fsync.total + row.sync_usec + row.close.total;
     row.app_overhead_usec = loop_usecs as i64 - total_ops as i64;
     row.file_count = p.num_files as u64;
-    row.files_per_sec = p.num_files as f64 / (loop_usecs as f64 / 1e6);
+    row.files_per_sec = p.num_files as f64 / (loop_usecs.max(1) as f64 / 1e6);
     Ok(row)
 }
 
@@ -547,16 +572,25 @@ struct Agg {
     files_per_sec: f64,
     app_overhead_usec: i64,
     creat: Stat,
+    creat_avg: u64,
     write: Stat,
     write_avg: u64,
     fsync: Stat,
-    sync_total: u64,
+    fsync_avg: u64,
+    sync_avg: u64,
     close: Stat,
+    close_avg: u64,
     unlink: Stat,
+    unlink_avg: u64,
 }
 
-fn aggregate(rows: &[Row], threads: usize) -> Agg {
+fn aggregate(rows: &[Row], per_thread_files: u64) -> Agg {
     let mut a = Agg::default();
+    if rows.is_empty() {
+        return a;
+    }
+    let mut write_avg_sum = 0u64;
+    let mut sync_sum = 0u64;
     for r in rows {
         a.file_count += r.file_count;
         a.files_per_sec += r.files_per_sec;
@@ -566,18 +600,21 @@ fn aggregate(rows: &[Row], threads: usize) -> Agg {
         a.fsync.merge(&r.fsync);
         a.close.merge(&r.close);
         a.unlink.merge(&r.unlink);
-        a.write_avg += r.write_avg_acc;
-        a.sync_total += r.sync_usec;
+        write_avg_sum += r.write_avg_acc / per_thread_files.max(1);
+        sync_sum += r.sync_usec;
     }
-    if threads > 1 {
-        // fs_mark recomputes the average of per-thread averages
-        a.write_avg /= threads as u64;
-    }
+    let nthreads = rows.len() as u64;
+    let total_files = a.file_count.max(1);
+    a.creat_avg = a.creat.total / total_files;
+    a.write_avg = write_avg_sum / nthreads;
+    a.fsync_avg = a.fsync.total / total_files;
+    a.sync_avg = sync_sum / nthreads;
+    a.close_avg = a.close.total / total_files;
+    a.unlink_avg = a.unlink.total / total_files;
     a
 }
 
 fn ctime_now() -> String {
-    // mirror ctime(3): local time, space-padded day-of-month
     let t = unix_secs() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&t, &mut tm) };
@@ -630,10 +667,6 @@ fn header_lines(p: &Params) -> Vec<String> {
         "#\tFiles info: size {} bytes, written with an IO size of {} bytes per write",
         p.file_size, p.io_size
     ));
-    v.push(
-        "#\tApp overhead is time in microseconds spent in the test not doing file writing related system calls."
-            .to_string(),
-    );
     v.push(String::new());
     if p.verbose_stats {
         v.push("#\tAll system call times are reported in microseconds.".to_string());
@@ -662,7 +695,6 @@ fn header_lines(p: &Params) -> Vec<String> {
 }
 
 fn iter_line(p: &Params, a: &Agg, files_written: u64, df_full: u32) -> String {
-    let n = p.num_files as u64;
     if p.verbose_stats {
         format!(
             "{:6} {:>12} {:>12} {:>12.1} {:>16} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
@@ -672,22 +704,22 @@ fn iter_line(p: &Params, a: &Agg, files_written: u64, df_full: u32) -> String {
             a.files_per_sec,
             a.app_overhead_usec,
             a.creat.min,
-            a.creat.total / n,
+            a.creat_avg,
             a.creat.max,
             a.write.min,
-            a.write_avg / n,
+            a.write_avg,
             a.write.max,
             a.fsync.min,
-            a.fsync.total / n,
+            a.fsync_avg,
             a.fsync.max,
-            0, // fs_mark never fills min/max sync
-            a.sync_total,
+            0,
+            a.sync_avg,
             0,
             a.close.min,
-            a.close.total / n,
+            a.close_avg,
             a.close.max,
             a.unlink.min,
-            a.unlink.total / n,
+            a.unlink_avg,
             a.unlink.max
         )
     } else {
@@ -699,7 +731,7 @@ fn iter_line(p: &Params, a: &Agg, files_written: u64, df_full: u32) -> String {
 }
 
 fn row_json(r: &Row, p: &Params) -> Value {
-    let n = p.num_files as u64;
+    let n = (p.num_files as u64).max(1);
     json!({
         "fileCount": r.file_count,
         "filesPerSec": r.files_per_sec,
@@ -714,10 +746,12 @@ fn row_json(r: &Row, p: &Params) -> Value {
 }
 
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
-    // fs_mark mkdirs its test directories itself (parent must exist), so there is
-    // no pre-existence check on the mount point here
     let p = resolve(args, mountpoint)?;
-    let io_buffer = vec![0u8; p.io_size];
+    let mut io_buffer = vec![0u8; p.io_size];
+    if p.incompressible {
+        SplitMix64::new(0x4653_4D41_524B_3333).fill_bytes(&mut io_buffer);
+    }
+
     let mut log_out: Option<File> =
         p.log_file
             .as_ref()
@@ -729,7 +763,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
                 }
             });
     info!(
-        "fsmark: dirs={} threads={} files={} size={}B io={}B sync={} subdirs={} policy={} keep_files={} iterations_requested={}",
+        "fsmark: dirs={} threads={} files={} size={}B io={}B sync={} subdirs={} policy={} keep_files={} iterations={}",
         p.dirs.len(),
         p.threads,
         p.num_files,
@@ -739,11 +773,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         p.num_subdirs,
         dir_policy_name(p.dir_policy),
         p.keep_files,
-        if p.loop_count > 0 {
-            p.loop_count.to_string()
-        } else {
-            "1".to_string()
-        }
+        p.loop_count.max(1),
     );
     for line in header_lines(&p) {
         info!("{line}");
@@ -751,14 +781,17 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             let _ = writeln!(f, "{line}");
         }
     }
+
     let suite_start = SystemTime::now();
     let mut files_written = 0u64;
     let mut rates: Vec<u64> = Vec::new();
     let mut rates_sum = 0u64;
     let mut iteration_rows: Vec<Value> = Vec::new();
     let mut status = "ok";
+    let mut first_failure: Option<String> = None;
     let mut fs_full = false;
     let mut loops_done = 0u32;
+
     loop {
         let results: Vec<Result<Row, RunErr>> = thread::scope(|s| {
             let mut joins = Vec::with_capacity(p.threads);
@@ -782,7 +815,11 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
                     fs_full = true;
                 }
                 Err(RunErr::Io(e)) => {
-                    warn!("iteration {} failed: {e}", loops_done + 1);
+                    let msg = format!("iteration {} failed: {e}", loops_done + 1);
+                    warn!("{msg}");
+                    if first_failure.is_none() {
+                        first_failure = Some(msg);
+                    }
                     status = "failed";
                 }
             }
@@ -790,7 +827,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         if rows.is_empty() {
             break;
         }
-        let a = aggregate(&rows, p.threads);
+        let a = aggregate(&rows, p.num_files as u64);
         files_written += a.file_count;
         let df_full = fs_use_pct(&p.dirs[0]).unwrap_or(0);
         let line = iter_line(&p, &a, files_written, df_full);
@@ -808,12 +845,12 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             "filesWritten": files_written,
             "filesPerSec": a.files_per_sec,
             "appOverheadUsec": a.app_overhead_usec,
-            "creatUsec": {"min": a.creat.min, "avg": a.creat.total / p.num_files as u64, "max": a.creat.max},
-            "writeUsec": {"min": a.write.min, "avg": a.write_avg / p.num_files as u64, "max": a.write.max},
-            "fsyncUsec": {"min": a.fsync.min, "avg": a.fsync.total / p.num_files as u64, "max": a.fsync.max},
-            "syncUsec": a.sync_total,
-            "closeUsec": {"min": a.close.min, "avg": a.close.total / p.num_files as u64, "max": a.close.max},
-            "unlinkUsec": {"min": a.unlink.min, "avg": a.unlink.total / p.num_files as u64, "max": a.unlink.max},
+            "creatUsec": {"min": a.creat.min, "avg": a.creat_avg, "max": a.creat.max},
+            "writeUsec": {"min": a.write.min, "avg": a.write_avg, "max": a.write.max},
+            "fsyncUsec": {"min": a.fsync.min, "avg": a.fsync_avg, "max": a.fsync.max},
+            "syncUsec": a.sync_avg,
+            "closeUsec": {"min": a.close.min, "avg": a.close_avg, "max": a.close.max},
+            "unlinkUsec": {"min": a.unlink.min, "avg": a.unlink_avg, "max": a.unlink.max},
             "thread": tj,
         }));
         rates.push(a.files_per_sec as u64);
@@ -823,9 +860,15 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             break;
         }
     }
-    // fs_mark truncates per-iteration rates to integers, sorts descending and
-    // indexes percentiles directly out of that array; a fully failed run has no
-    // rates at all and reports zeros
+
+    if !p.keep_files && p.num_subdirs > 0 {
+        for d in &p.dirs {
+            for s in 0..p.num_subdirs {
+                let _ = fs::remove_dir(d.join(format!("{s:02x}")));
+            }
+        }
+    }
+
     let (average, p50, p90, p99) = if rates.is_empty() {
         (0.0, 0, 0, 0)
     } else {
@@ -840,17 +883,12 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         )
     };
     info!("Average Files/sec: {average:12.1}");
-    info!("p50 Files/sec: {p50}");
-    info!("p90 Files/sec: {p90}");
-    info!("p99 Files/sec: {p99}");
-    let host = hostname::get()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "localhost".to_string());
-    let report = json!({
+
+    let mut report = json!({
         "suite": "fsmark",
         "fsMarkVersion": FS_MARK_VERSION,
-        "host": host,
-        "date": crate::smallfile::iso8601(suite_start),
+        "host": host_name(),
+        "date": iso8601(suite_start),
         "top": mountpoint.display().to_string(),
         "dirs": p.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
         "params": {
@@ -866,6 +904,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             "rand_len": p.rand_len,
             "keep_files": p.keep_files,
             "fill_fs": p.fill_fs,
+            "incompressible": p.incompressible,
             "log_file": p.log_file.as_ref().map(|l| l.display().to_string()),
         },
         "status": status,
@@ -879,5 +918,86 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             "p99FilesPerSec": p99,
         },
     });
+    if let Some(f) = first_failure {
+        report["failure"] = json!(f);
+    }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn aggregate_divides_per_syscall_averages_by_total_files_not_single_thread() {
+        let r1 = Row {
+            file_count: 10,
+            files_per_sec: 100.0,
+            app_overhead_usec: 50,
+            creat: Stat { min: 10, max: 30, total: 200 },
+            write: Stat { min: 5, max: 15, total: 100 },
+            write_avg_acc: 100,
+            fsync: Stat { min: 40, max: 80, total: 600 },
+            sync_usec: 1000,
+            close: Stat { min: 2, max: 6, total: 40 },
+            unlink: Stat { min: 3, max: 9, total: 60 },
+        };
+        let r2 = Row {
+            file_count: 10,
+            files_per_sec: 100.0,
+            app_overhead_usec: 50,
+            creat: Stat { min: 20, max: 40, total: 300 },
+            write: Stat { min: 5, max: 15, total: 100 },
+            write_avg_acc: 100,
+            fsync: Stat { min: 50, max: 90, total: 700 },
+            sync_usec: 1400,
+            close: Stat { min: 4, max: 8, total: 60 },
+            unlink: Stat { min: 5, max: 11, total: 80 },
+        };
+        let agg = aggregate(&[r1, r2], 10);
+        assert_eq!(agg.file_count, 20);
+        assert_eq!(agg.creat_avg, 25); // (200 + 300) / 20, NOT 50!
+        assert_eq!(agg.fsync_avg, 65); // (600 + 700) / 20, NOT 130!
+        assert_eq!(agg.sync_avg, 1200); // (1000 + 1400) / 2
+        assert_eq!(agg.close_avg, 5);
+        assert_eq!(agg.unlink_avg, 7);
+    }
+
+    #[test]
+    fn fsmark_multithread_subdirs_runs_and_cleans_up_when_not_keeping_files() {
+        let dir = std::env::temp_dir().join(format!("fstest-fsmark-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cli = TestCli::parse_from([
+            "fsmark",
+            "-n",
+            "20",
+            "-s",
+            "4096",
+            "-S",
+            "1",
+            "-t",
+            "2",
+            "-D",
+            "4",
+            "-N",
+            "5",
+            "--incompressible",
+            "-v",
+        ]);
+        let rep = run(&dir, &cli.args).expect("fsmark run");
+        assert_eq!(rep["status"], json!("ok"));
+        assert_eq!(rep["filesWritten"], json!(40));
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

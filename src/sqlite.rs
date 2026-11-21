@@ -30,7 +30,7 @@
 // group timeout, parses the summary into the standard JSON envelope and
 // cleans the work directory under a time bound.
 
-use crate::smallfile::iso8601;
+use crate::common::iso8601;
 use log::{info, warn};
 use rusqlite::Connection;
 use rusqlite::ffi;
@@ -780,10 +780,12 @@ fn run_script(conn: &Connection, i_client: i64, task_id: i64, script: &[u8], fil
                 sqlite_sleep(atoi(&args[0]) as i32);
             }
             // --exit N: exit this process; N>0 exits WITHOUT closing the
-            // database — a simulated crash leaving a hot journal
+            // database — a simulated crash leaving a hot journal / uncommitted WAL tail
             "exit" => {
                 let rc = atoi(&args[0]);
-                finish_script(conn, i_client, task_id, true);
+                if rc == 0 {
+                    finish_script(conn, i_client, task_id, true);
+                }
                 std::process::exit(rc as i32);
             }
             // --testcase NAME: begin a new test case
@@ -1301,6 +1303,9 @@ pub fn mptest_main(args: &[String]) -> i32 {
             if fs::symlink_metadata(&db_file).is_ok() {
                 fatal_error(None, format!("unable to unlink '{}' after {n_try} attempts\n", db_file));
             }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let _ = fs::remove_file(format!("{db_file}{suffix}"));
+            }
             open_create = true;
         }
     }
@@ -1528,24 +1533,32 @@ fn embedded_names() -> Vec<&'static str> {
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// scripts to run (embedded mptest scripts, comma list, extension optional)
+    /// probe families to run: mptest, crud, speedtest, kvtest, walthread, wal-lifecycle, mmap
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "config01,config02,crash01,multiwrite01"
+        default_value = "mptest,crud,speedtest,kvtest,walthread,wal-lifecycle,mmap"
+    )]
+    pub probes: Vec<String>,
+
+    /// scripts to run in the mptest probe (embedded scripts + *-wal multi-process WAL targets)
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "config01,config02,crash01,multiwrite01,multiwrite01-wal,crash01-wal"
     )]
     pub script: Vec<String>,
 
-    /// only run scripts whose name contains this substring (repeatable)
+    /// only run scripts/probes whose name contains this substring (repeatable)
     #[arg(long = "filter")]
     pub filter: Vec<String>,
 
-    /// list the embedded scripts and exit
+    /// list the embedded scripts and built-in probes and exit
     #[arg(long)]
     pub list: bool,
 
     /// scripts in parallel (each gets its own database and work directory)
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 6)]
     pub jobs: usize,
 
     /// per-script timeout in seconds (covers the whole multi-process run)
@@ -1564,9 +1577,13 @@ pub struct Args {
     #[arg(long)]
     pub vfs: Option<String>,
 
-    /// keep synchronous=FULL (mptest --sync; default is synchronous=OFF like upstream)
+    /// enable synchronous disk writes (enabled by default; accepted for compatibility)
     #[arg(long)]
     pub sync: bool,
+
+    /// disable fsync (PRAGMA synchronous=OFF) for faster lock-only stress
+    #[arg(long, conflicts_with = "sync")]
+    pub no_sync: bool,
 
     /// mptest --sqltrace
     #[arg(long)]
@@ -1593,12 +1610,24 @@ pub struct Args {
     pub json: Option<PathBuf>,
 }
 
+impl Args {
+    pub fn sync_enabled(&self) -> bool {
+        !self.no_sync
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MptestJob {
+    name: String,
+    script: String,
+    journalmode: Option<String>,
+}
+
 pub fn list(args: &Args) {
     for (name, content) in SCRIPTS {
         if !args.filter.is_empty() && !args.filter.iter().any(|f| name.contains(f)) {
             continue;
         }
-        // description = the leading /* ... */ comment block, joined
         let mut words: Vec<&str> = Vec::new();
         for l in content.lines() {
             let l = l.trim();
@@ -1620,42 +1649,2027 @@ pub fn list(args: &Args) {
             let cut = joined[..73].rfind(' ').unwrap_or(72);
             format!("{} ...", &joined[..cut])
         };
-        println!("{name:20} {desc}");
+        println!("{name:28} [mptest       ] {desc}");
+    }
+    let extra = [
+        ("multiwrite01-wal", "mptest", "5-process concurrent table/index/VACUUM stress over WAL + -shm locks"),
+        ("crash01-wal", "mptest", "5-process WAL mid-transaction _exit(1) crash & survivor WAL recovery"),
+        ("crud-delete", "crud", "Core SQL CRUD + FK cascade + external sort + rollback + ATTACH + blob + FTS5 (DELETE)"),
+        ("crud-wal", "crud", "Core SQL CRUD + FK cascade + external sort + rollback + ATTACH + blob + FTS5 (WAL)"),
+        ("speedtest-delete", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (DELETE journal)"),
+        ("speedtest-truncate", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (TRUNCATE journal)"),
+        ("speedtest-persist", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (PERSIST journal)"),
+        ("speedtest-wal-mmap", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + 4MiB mmap (WAL journal)"),
+        ("speedtest-wal-exclusive", "speedtest", "B-tree/index/trigger/savepoint/VACUUM (WAL + locking_mode=EXCLUSIVE)"),
+        ("kvtest-wal", "kvtest", "4KiB-page overflow-blob KV updates + PRAGMA integrity_check (WAL)"),
+        ("kvtest-delete", "kvtest", "4KiB-page overflow-blob KV updates + PRAGMA integrity_check (DELETE)"),
+        ("walthread-concurrent", "walthread", "Concurrent multi-thread WAL readers + writers + PASSIVE/FULL/RESTART/TRUNCATE checkpointer"),
+        ("wal-checkpoint-truncate-cycle", "wal-lifecycle", "Repeated WAL RESTART/TRUNCATE 0-byte truncation + immediate frame-1 reuse"),
+        ("wal-journal-mode-transitions", "wal-lifecycle", "Live DELETE <-> WAL <-> TRUNCATE <-> PERSIST mode switches & sidecar cleanup"),
+        ("mmap-probe-wal", "mmap", "MAP_SHARED kernel mmap probe of SQLite main DB and -shm WAL index"),
+        ("mmap-shared-rw-multiprocess", "mmap", "Cross-process O_RDWR MAP_SHARED coherence + fcntl WAL byte-range lock probe"),
+    ];
+    for (name, kind, desc) in extra {
+        if !args.filter.is_empty() && !args.filter.iter().any(|f| name.contains(f)) {
+            continue;
+        }
+        println!("{name:28} [{kind:13}] {desc}");
     }
 }
 
-fn resolve_selection(args: &Args) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
+fn resolve_selection(args: &Args) -> Result<Vec<MptestJob>, String> {
+    if !args.probes.iter().any(|p| p == "mptest" || p == "all") {
+        return Ok(Vec::new());
+    }
+    let has_base = |stem: &str| {
+        args.script.iter().any(|raw| {
+            let trimmed = raw.trim_end_matches(".test");
+            trimmed == stem
+        })
+    };
+    let mut out: Vec<MptestJob> = Vec::new();
     for s in &args.script {
+        let trimmed = s.trim_end_matches(".test");
+        if let Some(base_stem) = trimmed.strip_suffix("-wal")
+            && matches!(base_stem, "multiwrite01" | "crash01")
+        {
+            // When the caller explicitly forces `--journalmode <jm>` alongside the base script,
+            // avoid running the same script twice under `<jm>`.
+            if args.journalmode.is_some() && has_base(base_stem) {
+                continue;
+            }
+            let job = MptestJob {
+                name: format!("{base_stem}-wal"),
+                script: format!("{base_stem}.test"),
+                journalmode: Some(args.journalmode.clone().unwrap_or_else(|| "wal".to_string())),
+            };
+            if !out.iter().any(|j| j.name == job.name) {
+                out.push(job);
+            }
+            continue;
+        }
         let cand = if s.ends_with(".test") || s.ends_with(".subtest") {
             s.clone()
         } else {
             format!("{s}.test")
         };
         if SCRIPTS.iter().any(|(n, _)| *n == cand) {
-            if !out.contains(&cand) {
-                out.push(cand);
+            let stem = filename_tail(&cand)
+                .trim_end_matches(".test")
+                .trim_end_matches(".subtest")
+                .to_string();
+            if !out.iter().any(|j| j.name == stem) {
+                out.push(MptestJob {
+                    name: stem,
+                    script: cand,
+                    journalmode: args.journalmode.clone(),
+                });
             }
             continue;
         }
-        // an explicit path to an external mptest script
         if s.contains('/') && Path::new(s).is_file() {
-            if !out.contains(s) {
-                out.push(s.clone());
+            let stem = filename_tail(s)
+                .trim_end_matches(".test")
+                .trim_end_matches(".subtest")
+                .to_string();
+            if !out.iter().any(|j| j.script == *s) {
+                out.push(MptestJob {
+                    name: stem,
+                    script: s.clone(),
+                    journalmode: args.journalmode.clone(),
+                });
             }
             continue;
         }
         return Err(format!(
-            "{s}: not an embedded mptest script (config01, config02, crash01, multiwrite01) and not a file"
+            "{s}: not an embedded mptest target (config01, config02, crash01, multiwrite01, multiwrite01-wal, crash01-wal) and not a file"
         ));
     }
     if !args.filter.is_empty() {
-        out.retain(|s| args.filter.iter().any(|f| s.contains(f)));
-    }
-    if out.is_empty() {
-        return Err("no scripts selected (check --script/--filter)".into());
+        out.retain(|j| args.filter.iter().any(|f| j.name.contains(f) || j.script.contains(f)));
     }
     Ok(out)
+}
+
+// ---------- Mount-scoped SQLite temp directory guard ----------
+
+static SQLITE_TEMP_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+struct SqliteTempDirGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SqliteTempDirGuard {
+    fn activate(tmp_dir: &Path) -> Option<Self> {
+        let guard = SQLITE_TEMP_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let escaped = tmp_dir.display().to_string().replace('\'', "''");
+        if let Ok(conn) = Connection::open_in_memory() {
+            let _ = conn.execute_batch(&format!("PRAGMA temp_store_directory = '{escaped}';"));
+        }
+        Some(Self { _lock: guard })
+    }
+}
+
+impl Drop for SqliteTempDirGuard {
+    fn drop(&mut self) {
+        if let Ok(conn) = Connection::open_in_memory() {
+            let _ = conn.execute_batch("PRAGMA temp_store_directory = '';");
+        }
+    }
+}
+
+fn sql_quote_path(p: &Path) -> String {
+    p.display().to_string().replace('\'', "''")
+}
+
+// ---------- Incremental BLOB helpers via bundled sqlite3_blob_* ----------
+
+fn blob_rmw_write(conn: &Connection, table: &CStr, col: &CStr, rowid: i64, expected_len: usize, edits: &[(usize, &[u8])]) -> Result<(), String> {
+    unsafe {
+        let db = dbh(conn);
+        let mut p_blob: *mut ffi::sqlite3_blob = std::ptr::null_mut();
+        let rc = ffi::sqlite3_blob_open(db, c"main".as_ptr(), table.as_ptr(), col.as_ptr(), rowid, 1, &mut p_blob);
+        if rc != ffi::SQLITE_OK || p_blob.is_null() {
+            return Err(format!("sqlite3_blob_open(rw) failed (rc={rc}): {}", last_errmsg(db)));
+        }
+        let n_bytes = ffi::sqlite3_blob_bytes(p_blob) as usize;
+        if n_bytes != expected_len {
+            ffi::sqlite3_blob_close(p_blob);
+            return Err(format!("sqlite3_blob_bytes got {n_bytes}, want {expected_len}"));
+        }
+        for &(off, patch) in edits {
+            let wrc = ffi::sqlite3_blob_write(
+                p_blob,
+                patch.as_ptr() as *const c_void,
+                patch.len() as c_int,
+                off as c_int,
+            );
+            if wrc != ffi::SQLITE_OK {
+                let msg = last_errmsg(db);
+                ffi::sqlite3_blob_close(p_blob);
+                return Err(format!("sqlite3_blob_write(off={off}, len={}) failed (rc={wrc}): {msg}", patch.len()));
+            }
+        }
+        let crc = ffi::sqlite3_blob_close(p_blob);
+        if crc != ffi::SQLITE_OK {
+            return Err(format!("sqlite3_blob_close(rw) failed (rc={crc}): {}", last_errmsg(db)));
+        }
+    }
+    Ok(())
+}
+
+fn blob_incremental_read(conn: &Connection, table: &CStr, col: &CStr, rowid: i64, total_len: usize) -> Result<Vec<u8>, String> {
+    unsafe {
+        let db = dbh(conn);
+        let mut p_blob: *mut ffi::sqlite3_blob = std::ptr::null_mut();
+        let rc = ffi::sqlite3_blob_open(db, c"main".as_ptr(), table.as_ptr(), col.as_ptr(), rowid, 0, &mut p_blob);
+        if rc != ffi::SQLITE_OK || p_blob.is_null() {
+            return Err(format!("sqlite3_blob_open(ro) failed (rc={rc}): {}", last_errmsg(db)));
+        }
+        let mut out = vec![0u8; total_len];
+        let chunk = 19_997usize; // unaligned multi-page chunk size
+        let mut off = 0usize;
+        while off < total_len {
+            let take = (total_len - off).min(chunk);
+            let rrc = ffi::sqlite3_blob_read(
+                p_blob,
+                out[off..off + take].as_mut_ptr() as *mut c_void,
+                take as c_int,
+                off as c_int,
+            );
+            if rrc != ffi::SQLITE_OK {
+                let msg = last_errmsg(db);
+                ffi::sqlite3_blob_close(p_blob);
+                return Err(format!("sqlite3_blob_read(off={off}, len={take}) failed (rc={rrc}): {msg}"));
+            }
+            off += take;
+        }
+        let crc = ffi::sqlite3_blob_close(p_blob);
+        if crc != ffi::SQLITE_OK {
+            return Err(format!("sqlite3_blob_close(ro) failed (rc={crc}): {}", last_errmsg(db)));
+        }
+        Ok(out)
+    }
+}
+
+// ---------- Built-in SQLite engine probes (crud, speedtest, kvtest, walthread, wal-lifecycle, mmap) ----------
+
+fn compute_crud_canonical_digest(db_path: &Path, aux_path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let conn = Connection::open(db_path).map_err(|e| format!("open {}: {e}", db_path.display()))?;
+    let ic: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .map_err(|e| format!("integrity_check {}: {e}", db_path.display()))?;
+    if ic != "ok" {
+        return Err(format!("{}: integrity_check={ic:?}", db_path.display()));
+    }
+    let fk_errs: i64 = conn
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+        .map_err(|e| format!("foreign_key_check: {e}"))?;
+    if fk_errs != 0 {
+        return Err(format!("{}: foreign_key_check found {fk_errs} violations", db_path.display()));
+    }
+
+    let mut hasher = Sha256::new();
+    {
+        let mut st = conn
+            .prepare(
+                "SELECT id, email, tier, balance, json_extract(meta, '$.region'), schema_ver
+                 FROM users ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = st.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            let line = format!(
+                "u:{}:{}:{}:{}:{}:{}\n",
+                r.get::<_, i64>(0).map_err(|e| e.to_string())?,
+                r.get::<_, String>(1).map_err(|e| e.to_string())?,
+                r.get::<_, String>(2).map_err(|e| e.to_string())?,
+                r.get::<_, i64>(3).map_err(|e| e.to_string())?,
+                r.get::<_, String>(4).unwrap_or_default(),
+                r.get::<_, i64>(5).map_err(|e| e.to_string())?,
+            );
+            hasher.update(line.as_bytes());
+        }
+    }
+    {
+        let mut st = conn
+            .prepare("SELECT id, user_id, sku, qty, amount, note FROM orders ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let mut rows = st.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            let line = format!(
+                "o:{}:{}:{}:{}:{}:{}\n",
+                r.get::<_, i64>(0).map_err(|e| e.to_string())?,
+                r.get::<_, i64>(1).map_err(|e| e.to_string())?,
+                r.get::<_, String>(2).map_err(|e| e.to_string())?,
+                r.get::<_, i64>(3).map_err(|e| e.to_string())?,
+                r.get::<_, i64>(4).map_err(|e| e.to_string())?,
+                r.get::<_, String>(5).map_err(|e| e.to_string())?,
+            );
+            hasher.update(line.as_bytes());
+        }
+    }
+    {
+        let mut st = conn
+            .prepare("SELECT ns, k, v FROM kv_without_rowid ORDER BY ns, k")
+            .map_err(|e| e.to_string())?;
+        let mut rows = st.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            hasher.update(r.get::<_, String>(0).map_err(|e| e.to_string())?.as_bytes());
+            hasher.update(b":");
+            hasher.update(r.get::<_, String>(1).map_err(|e| e.to_string())?.as_bytes());
+            hasher.update(&r.get::<_, Vec<u8>>(2).map_err(|e| e.to_string())?);
+        }
+    }
+    {
+        let blob: Vec<u8> = conn
+            .query_row("SELECT payload FROM blobs WHERE id = 1", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        hasher.update(&blob);
+    }
+    {
+        let mut st = conn
+            .prepare("SELECT rowid, title, body FROM docs_fts ORDER BY rowid")
+            .map_err(|e| e.to_string())?;
+        let mut rows = st.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            let line = format!(
+                "fts:{}:{}:{}\n",
+                r.get::<_, i64>(0).map_err(|e| e.to_string())?,
+                r.get::<_, String>(1).map_err(|e| e.to_string())?,
+                r.get::<_, String>(2).map_err(|e| e.to_string())?,
+            );
+            hasher.update(line.as_bytes());
+        }
+    }
+
+    let aux_conn = Connection::open(aux_path).map_err(|e| format!("open aux {}: {e}", aux_path.display()))?;
+    let aux_ic: String = aux_conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if aux_ic != "ok" {
+        return Err(format!("aux integrity_check={aux_ic:?}"));
+    }
+    {
+        let mut st = aux_conn
+            .prepare("SELECT id, user_id, amount, tag FROM archived_orders ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let mut rows = st.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            let line = format!(
+                "aux:{}:{}:{}:{}\n",
+                r.get::<_, i64>(0).map_err(|e| e.to_string())?,
+                r.get::<_, i64>(1).map_err(|e| e.to_string())?,
+                r.get::<_, i64>(2).map_err(|e| e.to_string())?,
+                r.get::<_, String>(3).map_err(|e| e.to_string())?,
+            );
+            hasher.update(line.as_bytes());
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn run_crud_case(work_root: &Path, journal: &str, sync_full: bool) -> (Value, Option<String>) {
+    let slug = journal.to_ascii_lowercase();
+    let name = format!("crud-{slug}");
+    let t0 = Instant::now();
+    let dir = work_root.join(&name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        let msg = e.to_string();
+        return (
+            json!({"name": name, "kind": "crud", "status": "broken", "reason": msg, "tail": msg, "errors": 1, "tests": 6}),
+            None,
+        );
+    }
+    let db_path = dir.join("crud.db");
+    let aux_path = dir.join("crud_archive.db");
+    let backup_path = dir.join("crud_backup.db");
+    let sync_mode = if sync_full { "FULL" } else { "OFF" };
+
+    let step = || -> Result<String, String> {
+        // Pre-initialize aux DB with matching journal_mode so ATTACH exercises either
+        // rollback master-journal (*-mj*) or dual-WAL multi-file transactions cleanly.
+        {
+            let aux_init = Connection::open(&aux_path).map_err(|e| format!("open aux: {e}"))?;
+            let got_aux_jm: String = aux_init
+                .query_row(&format!("PRAGMA journal_mode={slug}"), [], |r| r.get(0))
+                .map_err(|e| format!("aux journal_mode={slug}: {e}"))?;
+            if !got_aux_jm.eq_ignore_ascii_case(&slug) {
+                return Err(format!("aux journal_mode got {got_aux_jm:?}, expected {slug:?}"));
+            }
+            aux_init
+                .execute_batch(
+                    "PRAGMA page_size=4096;
+                     CREATE TABLE archived_orders(
+                         id INTEGER PRIMARY KEY,
+                         user_id INTEGER NOT NULL,
+                         amount INTEGER NOT NULL,
+                         tag TEXT NOT NULL
+                     );",
+                )
+                .map_err(|e| format!("aux schema: {e}"))?;
+        }
+
+        let conn = Connection::open(&db_path).map_err(|e| format!("open main: {e}"))?;
+        conn.busy_timeout(Duration::from_secs(30))
+            .map_err(|e| format!("busy_timeout: {e}"))?;
+        let got_jm: String = conn
+            .query_row(&format!("PRAGMA journal_mode={slug}"), [], |r| r.get(0))
+            .map_err(|e| format!("journal_mode={slug}: {e}"))?;
+        if !got_jm.eq_ignore_ascii_case(&slug) {
+            return Err(format!("journal_mode got {got_jm:?}, expected {slug:?}"));
+        }
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous={sync_mode};
+             PRAGMA page_size=4096;
+             PRAGMA foreign_keys=ON;
+             PRAGMA temp_store=FILE;"
+        ))
+        .map_err(|e| format!("pragmas: {e}"))?;
+
+        // 1. Relational CRUD + UNIQUE/CHECK/FK ON UPDATE & ON DELETE CASCADE + UPSERT + JSONB index
+        conn.execute_batch(
+            "CREATE TABLE users(
+                 id INTEGER PRIMARY KEY,
+                 email TEXT NOT NULL UNIQUE,
+                 tier TEXT NOT NULL,
+                 balance INTEGER NOT NULL,
+                 meta BLOB NOT NULL
+             );
+             CREATE INDEX idx_users_tier_bal ON users(tier, balance DESC);
+             CREATE INDEX idx_users_region ON users(json_extract(meta, '$.region'));
+             CREATE TABLE orders(
+                 id INTEGER PRIMARY KEY,
+                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE,
+                 sku TEXT NOT NULL,
+                 qty INTEGER NOT NULL CHECK(qty > 0),
+                 amount INTEGER NOT NULL,
+                 note TEXT NOT NULL
+             );
+             CREATE INDEX idx_orders_user ON orders(user_id, amount);
+             CREATE TABLE kv_without_rowid(
+                 ns TEXT NOT NULL,
+                 k TEXT NOT NULL,
+                 v BLOB NOT NULL,
+                 PRIMARY KEY(ns, k)
+             ) WITHOUT ROWID;
+             CREATE TABLE blobs(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
+             CREATE VIRTUAL TABLE docs_fts USING fts5(title, body, tokenize='unicode61');",
+        )
+        .map_err(|e| format!("crud schema: {e}"))?;
+
+        let regions = ["ap-southeast-1", "us-east-1", "eu-central-1", "ap-northeast-1"];
+        let tiers = ["free", "pro", "enterprise"];
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        {
+            let mut u_stmt = conn
+                .prepare("INSERT INTO users(id, email, tier, balance, meta) VALUES(?1, ?2, ?3, ?4, jsonb(?5))")
+                .map_err(|e| e.to_string())?;
+            for id in 1..=300i64 {
+                let email = format!("user-{id:04}@fstest.local");
+                let tier = tiers[(id as usize) % tiers.len()];
+                let bal = id * 100;
+                let meta_json = format!(
+                    r#"{{"region":"{}","bucket":{}}}"#,
+                    regions[(id as usize) % regions.len()],
+                    id % 16
+                );
+                u_stmt
+                    .execute(rusqlite::params![id, email, tier, bal, meta_json])
+                    .map_err(|e| format!("insert user {id}: {e}"))?;
+            }
+            let mut o_stmt = conn
+                .prepare("INSERT INTO orders(id, user_id, sku, qty, amount, note) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")
+                .map_err(|e| e.to_string())?;
+            for oid in 1..=900i64 {
+                let uid = ((oid - 1) % 300) + 1;
+                let sku = format!("SKU-{:02}", oid % 24);
+                let qty = (oid % 5) + 1;
+                let amount = qty * (60 + ((oid * 37) % 280));
+                let note = format!("ord-{oid:04}-u{uid:03}");
+                o_stmt
+                    .execute(rusqlite::params![oid, uid, sku, qty, amount, note])
+                    .map_err(|e| format!("insert order {oid}: {e}"))?;
+            }
+        }
+        conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+
+        // UPSERT across existing + new UNIQUE emails
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        for idx in 1..=50i64 {
+            let uid = if idx <= 40 { idx * 3 } else { 300 + (idx - 40) };
+            let email = format!("user-{uid:04}@fstest.local");
+            let meta_json = format!(r#"{{"region":"ap-southeast-1","bucket":{}}}"#, uid % 16);
+            conn.execute(
+                "INSERT INTO users(id, email, tier, balance, meta)
+                 VALUES(?1, ?2, 'pro', 750, jsonb(?3))
+                 ON CONFLICT(email) DO UPDATE SET
+                     balance = users.balance + excluded.balance,
+                     tier = excluded.tier",
+                rusqlite::params![uid, email, meta_json],
+            )
+            .map_err(|e| format!("upsert {uid}: {e}"))?;
+        }
+        conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+
+        // Constraint enforcement (FK + CHECK must reject invalid writes without corrupting state)
+        if conn
+            .execute(
+                "INSERT INTO orders(id, user_id, sku, qty, amount, note) VALUES(999901, 888888, 'BAD', 1, 10, 'fk')",
+                [],
+            )
+            .is_ok()
+        {
+            return Err("FOREIGN KEY violation unexpectedly succeeded".into());
+        }
+        if conn
+            .execute(
+                "INSERT INTO orders(id, user_id, sku, qty, amount, note) VALUES(999902, 1, 'BAD', 0, 10, 'chk')",
+                [],
+            )
+            .is_ok()
+        {
+            return Err("CHECK(qty > 0) violation unexpectedly succeeded".into());
+        }
+
+        // ON UPDATE CASCADE + ON DELETE CASCADE + JSONB expression index lookup
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE users SET id = id + 10000 WHERE id <= 15;
+             DELETE FROM users WHERE id < 10000 AND id % 29 = 0;
+             COMMIT;",
+        )
+        .map_err(|e| format!("cascade tx: {e}"))?;
+        let cascaded_orders: i64 = conn
+            .query_row("SELECT count(*) FROM orders WHERE user_id > 10000", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if cascaded_orders != 45 {
+            return Err(format!("ON UPDATE CASCADE expected 45 orders, got {cascaded_orders}"));
+        }
+        let orphan_orders: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE u.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if orphan_orders != 0 {
+            return Err(format!("ON DELETE CASCADE left {orphan_orders} orphan orders"));
+        }
+        let ap_users: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM users WHERE json_extract(meta, '$.region') = 'ap-southeast-1'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if ap_users < 70 {
+            return Err(format!("JSONB expression index query returned unexpectedly low count {ap_users}"));
+        }
+
+        // 2. External temp-file merge-sort query (forces VDBE sorter to spill unlinked etilqs_* onto <mnt>)
+        conn.execute_batch("PRAGMA cache_size = 16; PRAGMA temp_store = FILE;")
+            .map_err(|e| e.to_string())?;
+        let max_oid: i64 = conn
+            .query_row("SELECT max(id) FROM orders", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let (top_key, sorted_cnt): (String, i64) = {
+            let mut st = conn
+                .prepare(
+                    "SELECT printf('%06d', o.id) || '-' || hex(zeroblob(1500)) || '-' || o.note AS sort_rec, o.amount
+                     FROM orders o
+                     JOIN users u ON u.id = o.user_id
+                     ORDER BY sort_rec DESC",
+                )
+                .map_err(|e| format!("prepare external sort: {e}"))?;
+            let mut rows = st.query([]).map_err(|e| format!("exec external sort: {e}"))?;
+            let mut first_prefix = String::new();
+            let mut n = 0i64;
+            while let Some(r) = rows.next().map_err(|e| format!("step external sort: {e}"))? {
+                if n == 0 {
+                    let s: String = r.get(0).map_err(|e| e.to_string())?;
+                    first_prefix = s.chars().take(6).collect();
+                }
+                n += 1;
+            }
+            (first_prefix, n)
+        };
+        conn.execute_batch("PRAGMA cache_size = -2000;")
+            .map_err(|e| e.to_string())?;
+        let expected_prefix = format!("{max_oid:06}");
+        if top_key != expected_prefix || sorted_cnt < 800 {
+            return Err(format!(
+                "external merge-sort mismatch: top_key={top_key:?} (want {expected_prefix:?}), rows={sorted_cnt}"
+            ));
+        }
+
+        // 3. Cache-spilling explicit BEGIN...ROLLBACK & nested SAVEPOINT...ROLLBACK TO
+        let pre_snap: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM users),
+                        (SELECT sum(balance) FROM users),
+                        (SELECT count(*) FROM orders),
+                        (SELECT sum(amount) FROM orders)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "PRAGMA cache_size = 10;
+             BEGIN IMMEDIATE;
+             UPDATE users SET balance = -999999, meta = jsonb_object('region', 'rollback', 'pad', hex(zeroblob(1800)));
+             DELETE FROM orders WHERE id % 2 = 0;
+             INSERT INTO kv_without_rowid(ns, k, v) VALUES('rb', 'spill1', zeroblob(65536));
+             INSERT INTO kv_without_rowid(ns, k, v) VALUES('rb', 'spill2', zeroblob(65536));
+             ROLLBACK;",
+        )
+        .map_err(|e| format!("cache-spill rollback: {e}"))?;
+        let post_snap: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM users),
+                        (SELECT sum(balance) FROM users),
+                        (SELECT count(*) FROM orders),
+                        (SELECT sum(amount) FROM orders)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if pre_snap != post_snap {
+            return Err(format!("ROLLBACK state mismatch: before={pre_snap:?}, after={post_snap:?}"));
+        }
+
+        let target_uid: i64 = conn
+            .query_row("SELECT min(id) FROM users", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let (orig_bal, orig_u_orders): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT balance FROM users WHERE id = ?1),
+                        (SELECT count(*) FROM orders WHERE user_id = ?1)",
+                [target_uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             UPDATE users SET balance = balance + 333 WHERE id = {target_uid};
+             SAVEPOINT sp_outer;
+             DELETE FROM orders WHERE user_id = {target_uid};
+             SAVEPOINT sp_inner;
+             INSERT INTO kv_without_rowid(ns, k, v) VALUES('sp', 'spill_a', zeroblob(65536));
+             INSERT INTO kv_without_rowid(ns, k, v) VALUES('sp', 'spill_b', zeroblob(65536));
+             ROLLBACK TO sp_outer;
+             RELEASE sp_outer;
+             INSERT INTO kv_without_rowid(ns, k, v) VALUES('committed', 'k1', X'CAFEBABE01020304');
+             COMMIT;
+             PRAGMA cache_size = -2000;"
+        ))
+        .map_err(|e| format!("nested savepoint tx: {e}"))?;
+        let (new_bal, new_u_orders, kv_cnt): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT balance FROM users WHERE id = ?1),
+                        (SELECT count(*) FROM orders WHERE user_id = ?1),
+                        (SELECT count(*) FROM kv_without_rowid)",
+                [target_uid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if new_bal != orig_bal + 333 || new_u_orders != orig_u_orders || kv_cnt != 1 {
+            return Err(format!(
+                "SAVEPOINT rollback mismatch: bal={new_bal} (want {}), orders={new_u_orders} (want {orig_u_orders}), kv_cnt={kv_cnt} (want 1)",
+                orig_bal + 333
+            ));
+        }
+
+        // 4. ATTACH DATABASE multi-file atomic CRUD commit & rollback (master-journal *-mj* on rollback modes)
+        let aux_q = sql_quote_path(&aux_path);
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{aux_q}' AS aux;
+             PRAGMA aux.synchronous={sync_mode};"
+        ))
+        .map_err(|e| format!("attach aux: {e}"))?;
+        let expected_arch: (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), coalesce(sum(amount), 0) FROM main.orders WHERE amount >= 950",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if expected_arch.0 == 0 {
+            return Err("expected non-zero orders with amount >= 950 for ATTACH test".into());
+        }
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO aux.archived_orders(id, user_id, amount, tag)
+                 SELECT id, user_id, amount, 'batch-1' FROM main.orders WHERE amount >= 950;
+             DELETE FROM main.orders WHERE amount >= 950;
+             COMMIT;",
+        )
+        .map_err(|e| format!("cross-db commit: {e}"))?;
+
+        // Cross-DB atomic rollback after spilling dirty pages across BOTH databases
+        let main_orders_after_arch: i64 = conn
+            .query_row("SELECT count(*) FROM main.orders", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "PRAGMA main.cache_size = 10;
+             PRAGMA aux.cache_size = 10;
+             BEGIN IMMEDIATE;
+             DELETE FROM main.orders;
+             DELETE FROM aux.archived_orders;
+             INSERT INTO main.kv_without_rowid(ns, k, v) VALUES('mj', 'spill', zeroblob(49152));
+             INSERT INTO aux.archived_orders(id, user_id, amount, tag) VALUES(999999, 1, 1, hex(zeroblob(24576)));
+             ROLLBACK;
+             PRAGMA main.cache_size = -2000;
+             PRAGMA aux.cache_size = -2000;
+             DETACH DATABASE aux;",
+        )
+        .map_err(|e| format!("cross-db rollback: {e}"))?;
+        let main_orders_restored: i64 = conn
+            .query_row("SELECT count(*) FROM main.orders", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if main_orders_restored != main_orders_after_arch {
+            return Err(format!(
+                "cross-db ROLLBACK failed on main.orders: got {main_orders_restored}, want {main_orders_after_arch}"
+            ));
+        }
+        // Ensure no stale master-journal (*-mj*) file leaked in the directory
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for ent in rd.flatten() {
+                let fname = ent.file_name().to_string_lossy().into_owned();
+                if fname.contains("-mj") {
+                    return Err(format!("leftover master journal file not unlinked: {fname}"));
+                }
+            }
+        }
+
+        // 5. Incremental BLOB random RMW across page boundaries (sqlite3_blob_open/read/write)
+        let blob_len = 65_536usize;
+        let mut expected_blob = vec![0u8; blob_len];
+        for (i, b) in expected_blob.iter_mut().enumerate() {
+            *b = ((i * 31 + 17) & 0xff) as u8;
+        }
+        conn.execute("INSERT INTO blobs(id, payload) VALUES(1, ?1)", [&expected_blob])
+            .map_err(|e| format!("insert initial blob: {e}"))?;
+        let offsets = [0usize, 4088, 4096, 8184, 16372, 24570, 32760, 40952, 49144, 57336, 65420];
+        let mut patches: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (p_idx, &off) in offsets.iter().enumerate() {
+            let plen = 96usize;
+            let mut p = vec![0u8; plen];
+            for (k, b) in p.iter_mut().enumerate() {
+                *b = ((0xa5usize + p_idx * 43 + k * 7) & 0xff) as u8;
+            }
+            expected_blob[off..off + plen].copy_from_slice(&p);
+            patches.push((off, p));
+        }
+        let patch_refs: Vec<(usize, &[u8])> = patches.iter().map(|(o, v)| (*o, v.as_slice())).collect();
+        blob_rmw_write(&conn, c"blobs", c"payload", 1, blob_len, &patch_refs)?;
+        let got_inc = blob_incremental_read(&conn, c"blobs", c"payload", 1, blob_len)?;
+        if got_inc != expected_blob {
+            return Err("incremental sqlite3_blob_read mismatch after partial page-crossing writes".into());
+        }
+
+        // 6. FTS5 full-text CRUD + segment merge + ALTER TABLE + VACUUM INTO backup parity
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        for doc_id in 1..=120i64 {
+            let title = format!("Doc {doc_id:03}");
+            let body = if doc_id % 3 == 0 {
+                format!("distributed storage transaction durability wal checkpoint item {doc_id}")
+            } else {
+                format!("posix metadata directory renameunlink consistency item {doc_id}")
+            };
+            conn.execute(
+                "INSERT INTO docs_fts(rowid, title, body) VALUES(?1, ?2, ?3)",
+                rusqlite::params![doc_id, title, body],
+            )
+            .map_err(|e| format!("fts5 insert {doc_id}: {e}"))?;
+        }
+        conn.execute_batch(
+            "UPDATE docs_fts SET body = 'distributed storage transaction updated segment' WHERE rowid <= 15;
+             DELETE FROM docs_fts WHERE rowid > 105;
+             INSERT INTO docs_fts(docs_fts, rank) VALUES('merge', 16);
+             INSERT INTO docs_fts(docs_fts) VALUES('optimize');
+             INSERT INTO docs_fts(docs_fts) VALUES('integrity-check');
+             COMMIT;",
+        )
+        .map_err(|e| format!("fts5 update/delete/merge: {e}"))?;
+        let fts_hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM docs_fts WHERE docs_fts MATCH 'storage AND transaction'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("fts5 match: {e}"))?;
+        if fts_hits != 45 {
+            return Err(format!("fts5 MATCH count mismatch: got {fts_hits}, want 45"));
+        }
+
+        conn.execute_batch(
+            "ALTER TABLE users ADD COLUMN schema_ver INTEGER NOT NULL DEFAULT 2;
+             UPDATE users SET schema_ver = 3 WHERE tier = 'enterprise';",
+        )
+        .map_err(|e| format!("alter table: {e}"))?;
+
+        let backup_q = sql_quote_path(&backup_path);
+        conn.execute_batch(&format!("VACUUM INTO '{backup_q}';"))
+            .map_err(|e| format!("VACUUM INTO: {e}"))?;
+        drop(conn);
+
+        let main_digest = compute_crud_canonical_digest(&db_path, &aux_path)?;
+        let backup_digest = compute_crud_canonical_digest(&backup_path, &aux_path)?;
+        if main_digest != backup_digest {
+            return Err(format!(
+                "VACUUM INTO digest mismatch: main={main_digest}, backup={backup_digest}"
+            ));
+        }
+        Ok(main_digest)
+    };
+
+    match step() {
+        Ok(digest) => {
+            info!(
+                "sqlite: {name} -> ok (digest={}, {}ms)",
+                &digest[..16],
+                t0.elapsed().as_millis()
+            );
+            (
+                json!({
+                    "name": name,
+                    "kind": "crud",
+                    "journal": slug,
+                    "status": "ok",
+                    "errors": 0,
+                    "tests": 6,
+                    "verifyDigest": digest,
+                    "durationMs": t0.elapsed().as_millis() as u64,
+                }),
+                Some(digest),
+            )
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            (
+                json!({
+                    "name": name,
+                    "kind": "crud",
+                    "journal": slug,
+                    "status": "fail",
+                    "errors": 1,
+                    "tests": 6,
+                    "reason": reason,
+                    "tail": reason,
+                    "durationMs": t0.elapsed().as_millis() as u64,
+                }),
+                None,
+            )
+        }
+    }
+}
+
+fn run_speedtest_case(
+    work_root: &Path,
+    journal: &str,
+    mmap_size: u64,
+    exclusive_lock: bool,
+    sync_full: bool,
+) -> (Value, Option<String>) {
+    use sha2::{Digest, Sha256};
+    let slug = journal.to_ascii_lowercase();
+    let name = if exclusive_lock {
+        format!("speedtest-{slug}-exclusive")
+    } else if mmap_size > 0 {
+        format!("speedtest-{slug}-mmap")
+    } else {
+        format!("speedtest-{slug}")
+    };
+    let t0 = Instant::now();
+    let dir = work_root.join(&name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        let msg = e.to_string();
+        return (
+            json!({"name": name, "kind": "speedtest", "status": "broken", "reason": msg, "tail": msg, "errors": 1, "tests": 1}),
+            None,
+        );
+    }
+    let db_path = dir.join("speedtest.db");
+    let step = || -> Result<String, String> {
+        let conn = Connection::open(&db_path).map_err(|e| format!("open: {e}"))?;
+        conn.busy_timeout(Duration::from_secs(30))
+            .map_err(|e| format!("busy_timeout: {e}"))?;
+        if exclusive_lock {
+            let lm: String = conn
+                .query_row("PRAGMA locking_mode=EXCLUSIVE", [], |r| r.get(0))
+                .map_err(|e| format!("locking_mode=EXCLUSIVE: {e}"))?;
+            if !lm.eq_ignore_ascii_case("exclusive") {
+                return Err(format!("locking_mode got {lm:?}, expected 'exclusive'"));
+            }
+        }
+        let got_jm: String = conn
+            .query_row(&format!("PRAGMA journal_mode={slug}"), [], |r| r.get(0))
+            .map_err(|e| format!("journal_mode={slug}: {e}"))?;
+        if !got_jm.eq_ignore_ascii_case(&slug) {
+            return Err(format!("journal_mode got {got_jm:?}, expected {slug:?}"));
+        }
+        let sync_mode = if sync_full { "FULL" } else { "OFF" };
+        conn.execute_batch(&format!("PRAGMA synchronous={sync_mode}; PRAGMA page_size=4096;"))
+            .map_err(|e| format!("pragmas: {e}"))?;
+        if mmap_size > 0 {
+            let _ = conn.query_row(&format!("PRAGMA mmap_size={mmap_size}"), [], |_r| Ok(()));
+        }
+
+        // Schema: tables, secondary indexes, WITHOUT ROWID table, and audit trigger
+        conn.execute_batch(
+            "CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+             CREATE INDEX i1b ON t1(b);
+             CREATE INDEX i1c ON t1(c);
+             CREATE TABLE t2(k TEXT PRIMARY KEY, v BLOB) WITHOUT ROWID;
+             CREATE TABLE audit_log(seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, key_id INTEGER);
+             CREATE TRIGGER tr_t1_upd AFTER UPDATE ON t1 BEGIN
+                 INSERT INTO audit_log(op, key_id) VALUES('upd', NEW.a);
+             END;",
+        )
+        .map_err(|e| format!("schema: {e}"))?;
+
+        // Batch 1: 500 deterministic rows inside transaction
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| format!("begin1: {e}"))?;
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO t1(a, b, c) VALUES(?1, ?2, ?3)")
+                .map_err(|e| e.to_string())?;
+            for i in 1..=500i64 {
+                let b = (i * 2654435761) & 0xffff;
+                let c = format!("row-{i:04}-{b:05}-payload");
+                stmt.execute(rusqlite::params![i, b, c])
+                    .map_err(|e| format!("insert {i}: {e}"))?;
+            }
+        }
+        conn.execute_batch("COMMIT;").map_err(|e| format!("commit1: {e}"))?;
+
+        // Batch 2: savepoint rollback + partial commit + range updates firing triggers + deletes
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE t1 SET b = b + 17, c = c || '-u' WHERE a % 5 = 0;
+             SAVEPOINT sp1;
+             DELETE FROM t1 WHERE a <= 50;
+             INSERT INTO t2(k, v) VALUES('transient', zeroblob(8192));
+             ROLLBACK TO sp1;
+             RELEASE sp1;
+             DELETE FROM t1 WHERE a % 11 = 0;
+             REPLACE INTO t1(a, b, c) VALUES(501, 42, 'replaced-tail');
+             COMMIT;",
+        )
+        .map_err(|e| format!("tx2: {e}"))?;
+
+        // Batch 3: WITHOUT ROWID multi-page blobs + VACUUM + reopen check
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| e.to_string())?;
+        for k in 0..32u32 {
+            let mut blob = vec![0u8; 6000];
+            for (idx, byte) in blob.iter_mut().enumerate() {
+                *byte = ((k as usize * 31 + idx * 7) & 0xff) as u8;
+            }
+            conn.execute(
+                "INSERT INTO t2(k, v) VALUES(?1, ?2)",
+                rusqlite::params![format!("blob-{k:03}"), blob],
+            )
+            .map_err(|e| format!("insert t2 {k}: {e}"))?;
+        }
+        conn.execute_batch("COMMIT; VACUUM;")
+            .map_err(|e| format!("vacuum: {e}"))?;
+        if exclusive_lock && slug == "wal" {
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_r| Ok(()));
+        }
+        drop(conn);
+
+        // Reopen fresh connection to validate persisted image + compute canonical SHA-256
+        let conn2 = Connection::open(&db_path).map_err(|e| format!("reopen: {e}"))?;
+        let ic: String = conn2
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| format!("integrity_check: {e}"))?;
+        if ic != "ok" {
+            return Err(format!("integrity_check returned {ic:?}"));
+        }
+        let mut hasher = Sha256::new();
+        {
+            let mut st = conn2
+                .prepare("SELECT a, b, c FROM t1 ORDER BY a")
+                .map_err(|e| e.to_string())?;
+            let mut rows = st.query([]).map_err(|e| e.to_string())?;
+            while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+                let a: i64 = r.get(0).map_err(|e| e.to_string())?;
+                let b: i64 = r.get(1).map_err(|e| e.to_string())?;
+                let c: String = r.get(2).map_err(|e| e.to_string())?;
+                hasher.update(format!("{a}:{b}:{c}\n").as_bytes());
+            }
+        }
+        {
+            let mut st = conn2
+                .prepare("SELECT k, v FROM t2 ORDER BY k")
+                .map_err(|e| e.to_string())?;
+            let mut rows = st.query([]).map_err(|e| e.to_string())?;
+            while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+                let k: String = r.get(0).map_err(|e| e.to_string())?;
+                let v: Vec<u8> = r.get(1).map_err(|e| e.to_string())?;
+                hasher.update(k.as_bytes());
+                hasher.update(&v);
+            }
+        }
+        let trig_cnt: i64 = conn2
+            .query_row("SELECT count(*) FROM audit_log", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        hasher.update(trig_cnt.to_le_bytes());
+        Ok(hex::encode(hasher.finalize()))
+    };
+
+    match step() {
+        Ok(digest) => {
+            info!(
+                "sqlite: {name} -> ok (digest={}, {}ms)",
+                &digest[..16],
+                t0.elapsed().as_millis()
+            );
+            (
+                json!({
+                    "name": name,
+                    "kind": "speedtest",
+                    "journal": slug,
+                    "status": "ok",
+                    "errors": 0,
+                    "tests": 5,
+                    "verifyDigest": digest,
+                    "durationMs": t0.elapsed().as_millis() as u64,
+                }),
+                Some(digest),
+            )
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            (
+                json!({
+                    "name": name,
+                    "kind": "speedtest",
+                    "journal": slug,
+                    "status": "fail",
+                    "errors": 1,
+                    "tests": 5,
+                    "reason": reason,
+                    "tail": reason,
+                    "durationMs": t0.elapsed().as_millis() as u64,
+                }),
+                None,
+            )
+        }
+    }
+}
+
+fn run_kvtest_case(work_root: &Path, journal: &str, sync_full: bool) -> Value {
+    let slug = journal.to_ascii_lowercase();
+    let name = format!("kvtest-{slug}");
+    let t0 = Instant::now();
+    let dir = work_root.join(&name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return json!({"name": name, "kind": "kvtest", "status": "broken", "reason": e.to_string(), "errors": 1, "tests": 1});
+    }
+    let db_path = dir.join("kvtest.db");
+    let step = || -> Result<(), String> {
+        let mut model: std::collections::BTreeMap<i64, Vec<u8>> = std::collections::BTreeMap::new();
+        // Phase 1: init 64 4KiB..12KiB blobs (overflow pages)
+        {
+            let conn = Connection::open(&db_path).map_err(|e| format!("open init: {e}"))?;
+            conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+            conn.execute_batch("PRAGMA page_size=4096; CREATE TABLE kv(k INTEGER PRIMARY KEY, v BLOB NOT NULL);")
+                .map_err(|e| format!("create kv: {e}"))?;
+            conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+            for k in 0..64i64 {
+                let sz = 4096 + ((k as usize * 397) % 8192);
+                let mut blob = vec![0u8; sz];
+                for (idx, b) in blob.iter_mut().enumerate() {
+                    *b = ((k as usize * 17 + idx * 13) & 0xff) as u8;
+                }
+                conn.execute("INSERT INTO kv(k, v) VALUES(?1, ?2)", rusqlite::params![k, &blob])
+                    .map_err(|e| format!("init k={k}: {e}"))?;
+                model.insert(k, blob);
+            }
+            conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+        }
+
+        // Phase 2: reopen with requested journal mode + mmap_size, perform random updates, verify
+        let conn = Connection::open(&db_path).map_err(|e| format!("reopen run: {e}"))?;
+        conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+        let got_jm: String = conn
+            .query_row(&format!("PRAGMA journal_mode={slug}"), [], |r| r.get(0))
+            .map_err(|e| format!("journal_mode={slug}: {e}"))?;
+        if !got_jm.eq_ignore_ascii_case(&slug) {
+            return Err(format!("journal_mode={got_jm:?}, expected {slug:?}"));
+        }
+        let sync_mode = if sync_full { "FULL" } else { "OFF" };
+        conn.execute_batch(&format!("PRAGMA synchronous={sync_mode};"))
+            .map_err(|e| e.to_string())?;
+        let _ = conn.query_row("PRAGMA mmap_size=4194304", [], |_r| Ok(()));
+
+        let mut state = 0x517cc1b727220a95u64;
+        for round in 0..96u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let k = (state % 64) as i64;
+            let sz = 1024 + ((state as usize) % 10240);
+            let mut blob = vec![0u8; sz];
+            for (idx, b) in blob.iter_mut().enumerate() {
+                *b = ((round as usize + idx * 29 + k as usize) & 0xff) as u8;
+            }
+            conn.execute("UPDATE kv SET v = ?2 WHERE k = ?1", rusqlite::params![k, &blob])
+                .map_err(|e| format!("update round {round} k={k}: {e}"))?;
+            model.insert(k, blob);
+        }
+
+        let ic: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| format!("integrity_check: {e}"))?;
+        if ic != "ok" {
+            return Err(format!("integrity_check failed: {ic}"));
+        }
+
+        for (k, want) in &model {
+            let got: Vec<u8> = conn
+                .query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0))
+                .map_err(|e| format!("select k={k}: {e}"))?;
+            if &got != want {
+                return Err(format!(
+                    "blob mismatch at k={k} (got {} bytes, want {} bytes)",
+                    got.len(),
+                    want.len()
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    match step() {
+        Ok(()) => {
+            info!("sqlite: {name} -> ok ({}ms)", t0.elapsed().as_millis());
+            json!({
+                "name": name,
+                "kind": "kvtest",
+                "journal": slug,
+                "status": "ok",
+                "errors": 0,
+                "tests": 3,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            json!({
+                "name": name,
+                "kind": "kvtest",
+                "journal": slug,
+                "status": "fail",
+                "errors": 1,
+                "tests": 3,
+                "reason": reason,
+                "tail": reason,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+    }
+}
+
+fn run_walthread_case(work_root: &Path, sync_full: bool) -> Value {
+    let name = "walthread-concurrent";
+    let t0 = Instant::now();
+    let dir = work_root.join(name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        let msg = e.to_string();
+        return json!({"name": name, "kind": "walthread", "status": "broken", "reason": msg, "tail": msg, "errors": 1, "tests": 1});
+    }
+    let db_path = dir.join("walthread.db");
+    let sync_mode = if sync_full { "NORMAL" } else { "OFF" };
+    let step = || -> Result<u64, String> {
+        {
+            let conn = Connection::open(&db_path).map_err(|e| format!("open: {e}"))?;
+            conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+            let jm: String = conn
+                .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+                .map_err(|e| format!("WAL pragma: {e}"))?;
+            if !jm.eq_ignore_ascii_case("wal") {
+                return Err(format!("journal_mode={jm:?}, expected 'wal'"));
+            }
+            conn.execute_batch(&format!(
+                "PRAGMA synchronous={sync_mode};
+                 CREATE TABLE accounts(id INTEGER PRIMARY KEY, bal INTEGER NOT NULL, ver INTEGER NOT NULL);
+                 BEGIN IMMEDIATE;",
+            ))
+            .map_err(|e| e.to_string())?;
+            // Zero-sum invariant across 32 accounts: total balance == 32_000 at every committed snapshot!
+            for id in 0..32i64 {
+                conn.execute(
+                    "INSERT INTO accounts(id, bal, ver) VALUES(?1, 1000, 0)",
+                    [id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+        }
+
+        let err_slot: Mutex<Option<String>> = Mutex::new(None);
+        let ops_done = AtomicU64::new(0);
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            // 2 concurrent writer threads transferring balance atomically (preserving sum == 32_000)
+            for wid in 0..2u64 {
+                let db_path = &db_path;
+                let err_slot = &err_slot;
+                let ops_done = &ops_done;
+                s.spawn(move || {
+                    let res = (|| -> Result<(), String> {
+                        let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+                        conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+                        let _ = conn.execute_batch(&format!("PRAGMA synchronous={sync_mode};"));
+                        for step_idx in 0..80u64 {
+                            let a = ((wid * 13 + step_idx * 7) % 32) as i64;
+                            let mut b = ((wid * 19 + step_idx * 11 + 1) % 32) as i64;
+                            if a == b {
+                                b = (a + 1) % 32;
+                            }
+                            let delta = ((step_idx % 25) + 1) as i64;
+                            conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+                            conn.execute(
+                                "UPDATE accounts SET bal = bal - ?1, ver = ver + 1 WHERE id = ?2",
+                                rusqlite::params![delta, a],
+                            )
+                            .map_err(|e| e.to_string())?;
+                            conn.execute(
+                                "UPDATE accounts SET bal = bal + ?1, ver = ver + 1 WHERE id = ?2",
+                                rusqlite::params![delta, b],
+                            )
+                            .map_err(|e| e.to_string())?;
+                            conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+                            ops_done.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = res {
+                        let mut g = err_slot.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(format!("writer {wid}: {e}"));
+                        }
+                    }
+                });
+            }
+
+            // 4 concurrent snapshot reader threads asserting sum(bal) == 32_000 at all times
+            for rid in 0..4u64 {
+                let db_path = &db_path;
+                let err_slot = &err_slot;
+                let ops_done = &ops_done;
+                let done = &done;
+                s.spawn(move || {
+                    let res = (|| -> Result<(), String> {
+                        let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+                        conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+                        let mut reads = 0u64;
+                        while !done.load(Ordering::Relaxed) || reads < 20 {
+                            let sum: i64 = conn
+                                .query_row("SELECT coalesce(sum(bal), 0) FROM accounts", [], |r| r.get(0))
+                                .map_err(|e| e.to_string())?;
+                            if sum != 32_000 {
+                                return Err(format!("snapshot isolation violation: sum(bal)={sum} != 32000"));
+                            }
+                            reads += 1;
+                            ops_done.fetch_add(1, Ordering::Relaxed);
+                            if done.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = res {
+                        let mut g = err_slot.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(format!("reader {rid}: {e}"));
+                        }
+                    }
+                });
+            }
+
+            // Checkpointer thread cycling PASSIVE / FULL / RESTART / TRUNCATE while readers/writers run
+            {
+                let db_path = &db_path;
+                let err_slot = &err_slot;
+                let done = &done;
+                let ops_done = &ops_done;
+                s.spawn(move || {
+                    let ckpt_modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
+                    if let Ok(conn) = Connection::open(db_path) {
+                        let _ = conn.busy_timeout(Duration::from_millis(250));
+                        for idx in 0..12usize {
+                            if ops_done.load(Ordering::Relaxed) >= 160 {
+                                break;
+                            }
+                            let mode = ckpt_modes[idx % ckpt_modes.len()];
+                            let _ = conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |_r| Ok(()));
+                            std::thread::sleep(Duration::from_millis(12));
+                        }
+                    } else {
+                        let mut g = err_slot.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some("checkpointer failed to open db".into());
+                        }
+                    }
+                    // Wait until both writers finish (160 txns) or an error occurs, then release readers
+                    let wait_t0 = Instant::now();
+                    while wait_t0.elapsed() < Duration::from_secs(60) {
+                        if err_slot.lock().unwrap().is_some() {
+                            break;
+                        }
+                        // Writers together execute 160 txns; check accounts sum(ver) == 320
+                        if let Ok(c) = Connection::open(db_path) {
+                            let _ = c.busy_timeout(Duration::from_secs(5));
+                            if let Ok(vsum) = c.query_row("SELECT sum(ver) FROM accounts", [], |r| r.get::<_, i64>(0))
+                                && vsum >= 320
+                            {
+                                break;
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    done.store(true, Ordering::Relaxed);
+                });
+            }
+        });
+
+        if let Some(e) = err_slot.into_inner().unwrap() {
+            return Err(e);
+        }
+
+        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+        conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_r| Ok(()));
+        let ic: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if ic != "ok" {
+            return Err(format!("post-walthread integrity_check: {ic}"));
+        }
+        let (sum_bal, sum_ver): (i64, i64) = conn
+            .query_row("SELECT sum(bal), sum(ver) FROM accounts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        if sum_bal != 32_000 || sum_ver != 320 {
+            return Err(format!(
+                "final invariant mismatch: sum(bal)={sum_bal} (want 32000), sum(ver)={sum_ver} (want 320)"
+            ));
+        }
+        Ok(ops_done.load(Ordering::Relaxed))
+    };
+
+    match step() {
+        Ok(ops) => {
+            info!(
+                "sqlite: {name} -> ok ({ops} concurrent ops, {}ms)",
+                t0.elapsed().as_millis()
+            );
+            json!({
+                "name": name,
+                "kind": "walthread",
+                "status": "ok",
+                "errors": 0,
+                "tests": ops,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            json!({
+                "name": name,
+                "kind": "walthread",
+                "status": "fail",
+                "errors": 1,
+                "tests": 1,
+                "reason": reason,
+                "tail": reason,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+    }
+}
+
+// ---------- WAL lifecycle edge probes (TRUNCATE 0-byte reset & mode transitions) ----------
+
+fn run_wal_checkpoint_truncate_case(work_root: &Path, sync_full: bool) -> Value {
+    let name = "wal-checkpoint-truncate-cycle";
+    let t0 = Instant::now();
+    let dir = work_root.join(name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        let msg = e.to_string();
+        return json!({"name": name, "kind": "wal-lifecycle", "status": "broken", "reason": msg, "tail": msg, "errors": 1, "tests": 12});
+    }
+    let db_path = dir.join("wal_trunc.db");
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let sync_mode = if sync_full { "FULL" } else { "OFF" };
+
+    let step = || -> Result<u64, String> {
+        let conn = Connection::open(&db_path).map_err(|e| format!("open: {e}"))?;
+        conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+        let jm: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .map_err(|e| format!("WAL pragma: {e}"))?;
+        if !jm.eq_ignore_ascii_case("wal") {
+            return Err(format!("journal_mode={jm:?}, expected 'wal'"));
+        }
+        // Disable auto-checkpoint so we control RESTART/TRUNCATE boundaries deterministically
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous={sync_mode};
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA page_size=4096;
+             CREATE TABLE slots(id INTEGER PRIMARY KEY, round INTEGER NOT NULL, payload BLOB NOT NULL);"
+        ))
+        .map_err(|e| format!("init schema: {e}"))?;
+
+        let mut expected_round = vec![0i64; 24];
+        for round in 1..=12i64 {
+            conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+            for s in 0..8usize {
+                let slot_id = ((round as usize * 5 + s) % 24) as i64;
+                let mut payload = vec![0u8; 5000];
+                for (i, b) in payload.iter_mut().enumerate() {
+                    *b = ((round as usize * 37 + slot_id as usize * 13 + i) & 0xff) as u8;
+                }
+                conn.execute(
+                    "INSERT INTO slots(id, round, payload) VALUES(?1, ?2, ?3)
+                     ON CONFLICT(id) DO UPDATE SET round = excluded.round, payload = excluded.payload",
+                    rusqlite::params![slot_id, round, payload],
+                )
+                .map_err(|e| format!("round {round} upsert {slot_id}: {e}"))?;
+                expected_round[slot_id as usize] = round;
+            }
+            conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+
+            let wal_len_before = fs::metadata(&wal_path)
+                .map(|m| m.len())
+                .map_err(|e| format!("round {round} stat -wal before checkpoint: {e}"))?;
+            if wal_len_before == 0 {
+                return Err(format!("round {round}: expected non-empty -wal before checkpoint, got 0 bytes"));
+            }
+
+            if round % 2 == 1 {
+                // RESTART resets WAL write cursor to frame 1 (offset 0) without truncating file size
+                let (busy, log_frames, ckpt_frames): (i64, i64, i64) = conn
+                    .query_row("PRAGMA wal_checkpoint(RESTART)", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .map_err(|e| format!("round {round} RESTART: {e}"))?;
+                if busy != 0 || log_frames != ckpt_frames {
+                    return Err(format!(
+                        "round {round} RESTART incomplete: busy={busy}, log={log_frames}, ckpt={ckpt_frames}"
+                    ));
+                }
+            } else {
+                // TRUNCATE calls ftruncate(wal_fd, 0); next round immediately rewrites offset 0
+                let (busy, _, _): (i64, i64, i64) = conn
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .map_err(|e| format!("round {round} TRUNCATE: {e}"))?;
+                if busy != 0 {
+                    return Err(format!("round {round} TRUNCATE returned busy={busy}"));
+                }
+                let wal_len_after = fs::metadata(&wal_path)
+                    .map(|m| m.len())
+                    .map_err(|e| format!("round {round} stat -wal after TRUNCATE: {e}"))?;
+                if wal_len_after != 0 {
+                    return Err(format!(
+                        "round {round}: -wal not truncated to 0 bytes after wal_checkpoint(TRUNCATE): size={wal_len_after}"
+                    ));
+                }
+            }
+        }
+        drop(conn);
+
+        // Reopen fresh connection to verify no stale page-cache / WAL salt mismatch occurred
+        let conn2 = Connection::open(&db_path).map_err(|e| format!("reopen: {e}"))?;
+        let ic: String = conn2
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if ic != "ok" {
+            return Err(format!("integrity_check after TRUNCATE cycles: {ic}"));
+        }
+        for (slot_id, &want_r) in expected_round.iter().enumerate() {
+            if want_r == 0 {
+                continue;
+            }
+            let (got_r, got_blob): (i64, Vec<u8>) = conn2
+                .query_row(
+                    "SELECT round, payload FROM slots WHERE id = ?1",
+                    [slot_id as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| format!("verify slot {slot_id}: {e}"))?;
+            if got_r != want_r || got_blob.len() != 5000 {
+                return Err(format!("slot {slot_id} round mismatch: got {got_r}, want {want_r}"));
+            }
+            for (i, &b) in got_blob.iter().enumerate() {
+                let want_b = ((want_r as usize * 37 + slot_id * 13 + i) & 0xff) as u8;
+                if b != want_b {
+                    return Err(format!("slot {slot_id} byte {i} corrupted: got {b:#x}, want {want_b:#x}"));
+                }
+            }
+        }
+        Ok(12)
+    };
+
+    match step() {
+        Ok(tests) => {
+            info!("sqlite: {name} -> ok ({}ms)", t0.elapsed().as_millis());
+            json!({
+                "name": name,
+                "kind": "wal-lifecycle",
+                "status": "ok",
+                "errors": 0,
+                "tests": tests,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            json!({
+                "name": name,
+                "kind": "wal-lifecycle",
+                "status": "fail",
+                "errors": 1,
+                "tests": 12,
+                "reason": reason,
+                "tail": reason,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+    }
+}
+
+fn run_wal_mode_transitions_case(work_root: &Path, sync_full: bool) -> Value {
+    let name = "wal-journal-mode-transitions";
+    let t0 = Instant::now();
+    let dir = work_root.join(name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        let msg = e.to_string();
+        return json!({"name": name, "kind": "wal-lifecycle", "status": "broken", "reason": msg, "tail": msg, "errors": 1, "tests": 8});
+    }
+    let db_path = dir.join("mode_trans.db");
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    let sync_mode = if sync_full { "FULL" } else { "OFF" };
+    let transitions = [
+        "delete", "wal", "delete", "wal", "truncate", "wal", "persist", "delete",
+    ];
+
+    let step = || -> Result<u64, String> {
+        {
+            let conn = Connection::open(&db_path).map_err(|e| format!("open init: {e}"))?;
+            conn.execute_batch(&format!(
+                "PRAGMA synchronous={sync_mode};
+                 PRAGMA page_size=4096;
+                 CREATE TABLE seq_log(step INTEGER PRIMARY KEY, mode TEXT NOT NULL, data BLOB NOT NULL);"
+            ))
+            .map_err(|e| format!("init: {e}"))?;
+        }
+
+        for (idx, &mode) in transitions.iter().enumerate() {
+            let step_no = (idx + 1) as i64;
+            let conn = Connection::open(&db_path).map_err(|e| format!("open step {step_no}: {e}"))?;
+            conn.busy_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
+            let got_jm: String = conn
+                .query_row(&format!("PRAGMA journal_mode={mode}"), [], |r| r.get(0))
+                .map_err(|e| format!("step {step_no} journal_mode={mode}: {e}"))?;
+            if !got_jm.eq_ignore_ascii_case(mode) {
+                return Err(format!("step {step_no}: got journal_mode {got_jm:?}, expected {mode:?}"));
+            }
+            conn.execute_batch(&format!("PRAGMA synchronous={sync_mode};"))
+                .map_err(|e| e.to_string())?;
+
+            // When leaving WAL mode, SQLite checkpoints and unlinks -wal and -shm immediately
+            if mode != "wal" && (wal_path.exists() || shm_path.exists()) {
+                return Err(format!(
+                    "step {step_no} ({mode}): stale WAL sidecars still present after leaving WAL (wal={}, shm={})",
+                    wal_path.exists(),
+                    shm_path.exists()
+                ));
+            }
+
+            let mut blob = vec![0u8; 6144];
+            for (i, b) in blob.iter_mut().enumerate() {
+                *b = ((step_no as usize * 53 + i * 11) & 0xff) as u8;
+            }
+            conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO seq_log(step, mode, data) VALUES(?1, ?2, ?3)",
+                rusqlite::params![step_no, mode, blob],
+            )
+            .map_err(|e| format!("step {step_no} insert: {e}"))?;
+            if step_no > 1 {
+                conn.execute(
+                    "UPDATE seq_log SET mode = mode || '+ok' WHERE step = ?1",
+                    [step_no - 1],
+                )
+                .map_err(|e| format!("step {step_no} update prior: {e}"))?;
+            }
+            conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+
+            if mode == "wal" && (!wal_path.exists() || !shm_path.exists()) {
+                return Err(format!(
+                    "step {step_no} (wal): expected active -wal and -shm while open (wal={}, shm={})",
+                    wal_path.exists(),
+                    shm_path.exists()
+                ));
+            }
+            drop(conn);
+        }
+
+        let verify_conn = Connection::open(&db_path).map_err(|e| format!("verify open: {e}"))?;
+        let ic: String = verify_conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if ic != "ok" {
+            return Err(format!("post-transitions integrity_check: {ic}"));
+        }
+        let cnt: i64 = verify_conn
+            .query_row("SELECT count(*) FROM seq_log", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if cnt != transitions.len() as i64 {
+            return Err(format!("seq_log row count got {cnt}, want {}", transitions.len()));
+        }
+        Ok(transitions.len() as u64)
+    };
+
+    match step() {
+        Ok(tests) => {
+            info!("sqlite: {name} -> ok ({}ms)", t0.elapsed().as_millis());
+            json!({
+                "name": name,
+                "kind": "wal-lifecycle",
+                "status": "ok",
+                "errors": 0,
+                "tests": tests,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            json!({
+                "name": name,
+                "kind": "wal-lifecycle",
+                "status": "fail",
+                "errors": 1,
+                "tests": transitions.len(),
+                "reason": reason,
+                "tail": reason,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+    }
+}
+
+// ---------- Cross-process O_RDWR MAP_SHARED + fcntl WAL-index lock probe ----------
+
+const SHM_PROBE_SIZE: usize = 32_768; // SQLite WALINDEX_PGSZ (32 KiB)
+const SHM_PARENT_MAGIC: &[u8; 32] = b"FSTEST-SQLITE-SHM-PARENT-V1-0001";
+const SHM_CHILD_MAGIC: &[u8; 32] = b"FSTEST-SQLITE-SHM-CHILD--V1-0002";
+
+fn fcntl_setlk(fd: c_int, lock_type: impl Into<i32>, start: i64, len: i64) -> Result<(), std::io::Error> {
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = lock_type.into() as _;
+    fl.l_whence = libc::SEEK_SET as _;
+    fl.l_start = start;
+    fl.l_len = len;
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &fl) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn shm_child_main(args: &[String]) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(path_str) = args.first() else {
+        eprintln!("__sqlite-shm-child: missing <shm_path>");
+        return 2;
+    };
+    let path = Path::new(path_str);
+    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+        eprintln!("__sqlite-shm-child: invalid path");
+        return 2;
+    };
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        eprintln!("__sqlite-shm-child: open O_RDWR failed: {}", std::io::Error::last_os_error());
+        return 1;
+    }
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            SHM_PROBE_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED || addr.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        eprintln!("__sqlite-shm-child: mmap(PROT_READ|PROT_WRITE, MAP_SHARED) failed: {err}");
+        return 1;
+    }
+
+    let step = (|| -> Result<(), String> {
+        let slice = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, SHM_PROBE_SIZE) };
+        if &slice[0..32] != SHM_PARENT_MAGIC {
+            return Err(format!(
+                "child MAP_SHARED did not observe parent header magic (got {:?})",
+                String::from_utf8_lossy(&slice[0..32])
+            ));
+        }
+        // Parent holds F_WRLCK on byte 120 (SQLite WAL_WRITE_LOCK): child F_WRLCK must contend!
+        match fcntl_setlk(fd, libc::F_WRLCK, 120, 1) {
+            Ok(()) => {
+                return Err(
+                    "child fcntl(F_SETLK, F_WRLCK, off=120) unexpectedly succeeded while parent held exclusive lock"
+                        .into(),
+                );
+            }
+            Err(e) => {
+                let raw = e.raw_os_error().unwrap_or(0);
+                if raw != libc::EAGAIN && raw != libc::EACCES {
+                    return Err(format!(
+                        "child fcntl(F_WRLCK, off=120) failed with unexpected errno {raw} ({e}); expected EAGAIN/EACCES"
+                    ));
+                }
+            }
+        }
+        // Parent holds shared F_RDLCK on byte 124 (WAL_READ_LOCK(1)): child shared F_RDLCK must succeed!
+        fcntl_setlk(fd, libc::F_RDLCK, 124, 1)
+            .map_err(|e| format!("child shared fcntl(F_RDLCK, off=124) failed: {e}"))?;
+        // Unheld byte 125 (WAL_READ_LOCK(2)): child exclusive F_WRLCK must succeed!
+        fcntl_setlk(fd, libc::F_WRLCK, 125, 1)
+            .map_err(|e| format!("child exclusive fcntl(F_WRLCK, off=125) failed: {e}"))?;
+
+        // Write child response into both page 0 (64..96) and page 1 (4096..4192) via MAP_SHARED
+        slice[64..96].copy_from_slice(SHM_CHILD_MAGIC);
+        for i in 0..96usize {
+            slice[4096 + i] = ((0x5au8 as usize + i * 19) & 0xff) as u8;
+        }
+        let mrc = unsafe { libc::msync(addr, SHM_PROBE_SIZE, libc::MS_SYNC) };
+        if mrc < 0 {
+            return Err(format!("child msync(MS_SYNC) failed: {}", std::io::Error::last_os_error()));
+        }
+        let _ = fcntl_setlk(fd, libc::F_UNLCK, 124, 2);
+        Ok(())
+    })();
+
+    unsafe {
+        libc::munmap(addr, SHM_PROBE_SIZE);
+        libc::close(fd);
+    }
+    match step {
+        Ok(()) => {
+            println!("SHM_CHILD_OK");
+            0
+        }
+        Err(msg) => {
+            eprintln!("__sqlite-shm-child: {msg}");
+            1
+        }
+    }
+}
+
+fn run_mmap_shared_rw_multiprocess_case(work_root: &Path, exe: &Path) -> Value {
+    use std::os::unix::ffi::OsStrExt;
+    let name = "mmap-shared-rw-multiprocess";
+    let t0 = Instant::now();
+    let dir = work_root.join(name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        let msg = e.to_string();
+        return json!({"name": name, "kind": "mmap", "status": "broken", "reason": msg, "tail": msg, "errors": 1, "tests": 4});
+    }
+    let shm_path = dir.join("walindex.db-shm");
+
+    let step = || -> Result<(), String> {
+        let cpath = CString::new(shm_path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+                0o644 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(format!("open {}: {}", shm_path.display(), std::io::Error::last_os_error()));
+        }
+        if unsafe { libc::ftruncate(fd, SHM_PROBE_SIZE as libc::off_t) } < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(format!("ftruncate {}: {err}", shm_path.display()));
+        }
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SHM_PROBE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED || addr.is_null() {
+            let err = std::io::Error::last_os_error();
+            let raw = err.raw_os_error().unwrap_or(0);
+            unsafe { libc::close(fd) };
+            if raw == libc::ENODEV {
+                return Err(format!(
+                    "{}: O_RDWR MAP_SHARED failed with ENODEV (FUSE mount likely uses FOPEN_DIRECT_IO without FUSE_DIRECT_IO_ALLOW_MMAP)",
+                    shm_path.display()
+                ));
+            }
+            return Err(format!("mmap(PROT_READ|PROT_WRITE, MAP_SHARED) {}: {err}", shm_path.display()));
+        }
+
+        let inner_res = (|| -> Result<(), String> {
+            let slice = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, SHM_PROBE_SIZE) };
+            slice[0..32].copy_from_slice(SHM_PARENT_MAGIC);
+            std::sync::atomic::fence(Ordering::SeqCst);
+
+            // Acquire SQLite's exact WAL-index byte-range locks (offsets 120 and 124)
+            fcntl_setlk(fd, libc::F_WRLCK, 120, 1)
+                .map_err(|e| format!("parent fcntl(F_WRLCK, off=120) failed: {e}"))?;
+            fcntl_setlk(fd, libc::F_RDLCK, 124, 1)
+                .map_err(|e| format!("parent fcntl(F_RDLCK, off=124) failed: {e}"))?;
+
+            let mut cmd = Command::new(exe);
+            cmd.arg("__sqlite-shm-child").arg(&shm_path);
+            let ex = exec_with_timeout(cmd, Duration::from_secs(30));
+            if let Some(se) = ex.spawn_err {
+                return Err(format!("spawn __sqlite-shm-child: {se}"));
+            }
+            if ex.timed_out {
+                return Err("__sqlite-shm-child timed out after 30s".into());
+            }
+            if ex.code != Some(0) || !ex.stdout.contains("SHM_CHILD_OK") {
+                return Err(format!(
+                    "__sqlite-shm-child failed (code={:?}): {}{}",
+                    ex.code,
+                    ex.stderr.trim(),
+                    if ex.stdout.trim().is_empty() { "" } else { " " }
+                ));
+            }
+
+            // 1. Verify parent's live MAP_SHARED mapping directly sees child's writes
+            std::sync::atomic::fence(Ordering::SeqCst);
+            let live_hdr = unsafe { std::slice::from_raw_parts(addr as *const u8, SHM_PROBE_SIZE) };
+            if &live_hdr[64..96] != SHM_CHILD_MAGIC {
+                return Err(format!(
+                    "parent MAP_SHARED did not observe child write at 64..96 (got {:?})",
+                    String::from_utf8_lossy(&live_hdr[64..96])
+                ));
+            }
+            for i in 0..96usize {
+                let want = ((0x5au8 as usize + i * 19) & 0xff) as u8;
+                if live_hdr[4096 + i] != want {
+                    return Err(format!(
+                        "parent MAP_SHARED mismatch at byte {}: got {:#x}, want {want:#x}",
+                        4096 + i,
+                        live_hdr[4096 + i]
+                    ));
+                }
+            }
+
+            // 2. Verify pread() on a fresh descriptor sees coherent MAP_SHARED pages
+            let rfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+            if rfd < 0 {
+                return Err(format!("reopen O_RDONLY {}: {}", shm_path.display(), std::io::Error::last_os_error()));
+            }
+            let mut pbuf0 = [0u8; 96];
+            let mut pbuf1 = [0u8; 96];
+            let n0 = unsafe { libc::pread(rfd, pbuf0.as_mut_ptr() as *mut c_void, pbuf0.len(), 0) };
+            let n1 = unsafe { libc::pread(rfd, pbuf1.as_mut_ptr() as *mut c_void, pbuf1.len(), 4096) };
+            unsafe { libc::close(rfd) };
+            if n0 != 96 || n1 != 96 {
+                return Err(format!("pread returned short counts n0={n0}, n1={n1}"));
+            }
+            if &pbuf0[0..32] != SHM_PARENT_MAGIC || &pbuf0[64..96] != SHM_CHILD_MAGIC {
+                return Err("pread() page 0 incoherent with MAP_SHARED writes".into());
+            }
+            for (i, &b) in pbuf1.iter().enumerate() {
+                let want = ((0x5au8 as usize + i * 19) & 0xff) as u8;
+                if b != want {
+                    return Err(format!("pread() page 1 byte {i} incoherent with MAP_SHARED write"));
+                }
+            }
+            Ok(())
+        })();
+
+        let _ = fcntl_setlk(fd, libc::F_UNLCK, 120, 8);
+        unsafe {
+            libc::munmap(addr, SHM_PROBE_SIZE);
+            libc::close(fd);
+        }
+        inner_res
+    };
+
+    match step() {
+        Ok(()) => {
+            info!("sqlite: {name} -> ok ({}ms)", t0.elapsed().as_millis());
+            json!({
+                "name": name,
+                "kind": "mmap",
+                "status": "ok",
+                "errors": 0,
+                "tests": 4,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            json!({
+                "name": name,
+                "kind": "mmap",
+                "status": "fail",
+                "errors": 1,
+                "tests": 4,
+                "reason": reason,
+                "tail": reason,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+    }
+}
+
+fn mmap_shared_check(path: &Path, require_sqlite_magic: bool) -> Result<u64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let meta = fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let size = meta.len() as usize;
+    if size == 0 {
+        return Err(format!("{}: file is empty", path.display()));
+    }
+    let cpath = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return Err(format!(
+            "open {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let addr = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+    unsafe { libc::close(fd) };
+    if addr == libc::MAP_FAILED || addr.is_null() {
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+        if raw == libc::ENODEV {
+            return Err(format!(
+                "{}: MAP_SHARED failed with ENODEV (FUSE mount likely uses FOPEN_DIRECT_IO without FUSE_DIRECT_IO_ALLOW_MMAP)",
+                path.display()
+            ));
+        }
+        return Err(format!("mmap(MAP_SHARED) {}: {err}", path.display()));
+    }
+    let res = if require_sqlite_magic {
+        if size < 16 {
+            Err(format!("{}: size {size} < 16", path.display()))
+        } else {
+            let hdr = unsafe { std::slice::from_raw_parts(addr as *const u8, 15) };
+            if hdr == b"SQLite format 3" {
+                Ok(size as u64)
+            } else {
+                Err(format!(
+                    "{}: MAP_SHARED header mismatch {:?}",
+                    path.display(),
+                    String::from_utf8_lossy(hdr)
+                ))
+            }
+        }
+    } else {
+        Ok(size as u64)
+    };
+    unsafe {
+        libc::munmap(addr, size);
+    }
+    res
+}
+
+fn run_mmap_probe_case(work_root: &Path) -> Value {
+    let name = "mmap-probe-wal";
+    let t0 = Instant::now();
+    let dir = work_root.join(name);
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        let msg = e.to_string();
+        return json!({"name": name, "kind": "mmap", "status": "broken", "reason": msg, "tail": msg, "errors": 1, "tests": 1});
+    }
+    let db_path = dir.join("mmap-probe.db");
+    let step = || -> Result<Vec<Value>, String> {
+        let conn = Connection::open(&db_path).map_err(|e| format!("open: {e}"))?;
+        let jm: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .map_err(|e| format!("WAL pragma: {e}"))?;
+        if !jm.eq_ignore_ascii_case("wal") {
+            return Err(format!("journal_mode={jm:?}, expected 'wal'"));
+        }
+        let _ = conn.query_row("PRAGMA mmap_size=4194304", [], |_r| Ok(()));
+        conn.execute_batch("CREATE TABLE t(x BLOB); INSERT INTO t VALUES(zeroblob(65536));")
+            .map_err(|e| format!("populate: {e}"))?;
+        // Force WAL checkpoint so main db file has full header + pages, while keeping conn open so -shm stays live
+        let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_r| Ok(()));
+        let mut probed = Vec::new();
+        let main_sz = mmap_shared_check(&db_path, true)?;
+        probed.push(json!({"path": db_path.display().to_string(), "size": main_sz, "ok": true}));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        if shm_path.is_file() && fs::metadata(&shm_path).map(|m| m.len() > 0).unwrap_or(false) {
+            let shm_sz = mmap_shared_check(&shm_path, false)?;
+            probed.push(json!({"path": shm_path.display().to_string(), "size": shm_sz, "ok": true}));
+        }
+        drop(conn);
+        Ok(probed)
+    };
+
+    match step() {
+        Ok(probed) => {
+            info!("sqlite: {name} -> ok ({}ms)", t0.elapsed().as_millis());
+            json!({
+                "name": name,
+                "kind": "mmap",
+                "status": "ok",
+                "errors": 0,
+                "tests": probed.len(),
+                "mmapProbes": probed,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+        Err(reason) => {
+            warn!("sqlite: {name} -> fail ({reason})");
+            json!({
+                "name": name,
+                "kind": "mmap",
+                "status": "fail",
+                "errors": 1,
+                "tests": 1,
+                "reason": reason,
+                "tail": reason,
+                "durationMs": t0.elapsed().as_millis() as u64,
+            })
+        }
+    }
 }
 
 struct Exec {
@@ -1798,6 +3812,21 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
     let selected = resolve_selection(args)?;
+    for p in &args.probes {
+        if !matches!(
+            p.as_str(),
+            "mptest" | "crud" | "speedtest" | "kvtest" | "walthread" | "wal-lifecycle" | "mmap" | "all"
+        ) {
+            return Err(format!(
+                "unknown sqlite probe {p:?} (expected mptest, crud, speedtest, kvtest, walthread, wal-lifecycle, mmap, or all)"
+            ));
+        }
+    }
+    let want_probe = |name: &str| args.probes.iter().any(|p| p == name || p == "all");
+    let matches_filter =
+        |case_name: &str| args.filter.is_empty() || args.filter.iter().any(|f| case_name.contains(f));
+    let sync_on = args.sync_enabled();
+
     let exe = std::env::current_exe().map_err(|e| format!("cannot resolve fstest binary: {e}"))?;
     let sqlite_version = Connection::open_in_memory().ok().and_then(|c| {
         c.query_row("select sqlite_version()", [], |r| r.get::<_, String>(0))
@@ -1806,143 +3835,252 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
 
     let work_root = mountpoint.join(&args.work_dir);
     fs::create_dir_all(&work_root).map_err(|e| format!("{}: {e}", work_root.display()))?;
+    let tmp_dir = work_root.join("tmp");
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("{}: {e}", tmp_dir.display()))?;
 
     info!(
-        "sqlite: {} scripts ({}) on {} with {} jobs",
+        "sqlite: probes=[{}] mptest_scripts={} sync={} on {} with {} jobs",
+        args.probes.join(","),
         selected.len(),
-        selected.join(","),
+        sync_on,
         mountpoint.display(),
         args.jobs
     );
     let started = SystemTime::now();
-    let items = run_parallel(selected.len(), args.jobs, |i| {
-        let it0 = Instant::now();
-        let script = &selected[i];
-        let stem = filename_tail(script)
-            .trim_end_matches(".test")
-            .trim_end_matches(".subtest")
-            .to_string();
-        let sub = work_root.join(&stem);
-        // a stale database from a previous run would start the run inside a
-        // half-crashed state; fresh per run (the master unlinks the db too)
-        let _ = fs::remove_dir_all(&sub);
-        if let Err(e) = fs::create_dir_all(&sub) {
-            return json!({ "name": stem, "status": "broken", "error": format!("create {}: {e}", sub.display()) });
-        }
-        let db = sub.join(format!("{stem}.db"));
-        let mut cmd = Command::new(&exe);
-        cmd.arg("__sqlite-mptest").arg(&db).arg(script);
-        if let Some(jm) = &args.journalmode {
-            cmd.args(["--journalmode", jm]);
-        }
-        if let Some(v) = &args.vfs {
-            cmd.args(["--vfs", v]);
-        }
-        if let Some(r) = args.repeat {
-            let r = r.to_string();
-            cmd.args(["--repeat", &r]);
-        }
-        if let Some(t) = args.trace {
-            let t = t.to_string();
-            cmd.args(["--trace", &t]);
-        }
-        if args.sync {
-            cmd.arg("--sync");
-        }
-        if args.sqltrace {
-            cmd.arg("--sqltrace");
-        }
-        if args.quiet {
-            cmd.arg("--quiet");
-        }
-        cmd.current_dir(&sub);
-        let ex = exec_with_timeout(cmd, Duration::from_secs(args.timeout.max(1)));
+    let selected_names: Vec<String> = selected.iter().map(|j| j.name.clone()).collect();
 
-        let combined = format!("{}\n{}", ex.stdout, ex.stderr);
-        let mut errors: u64 = 0;
-        let mut tests: u64 = 0;
-        let mut summary_seen = false;
-        let mut failures: Vec<(String, String)> = Vec::new();
-        for line in combined.lines() {
-            if let Some(rest) = line.strip_prefix("Summary: ") {
-                let mut it = rest.split_whitespace();
-                errors = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                let _ = it.next(); // "errors"
-                let _ = it.next(); // "out"
-                let _ = it.next(); // "of"
-                tests = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                summary_seen = true;
-                continue;
-            }
-            if let Some(pos) = line.find(":ERROR: ") {
-                if failures.len() < 20 {
-                    failures.push((
-                        line[..pos].split('.').last().unwrap_or("").to_string(),
-                        line[pos + 8..].to_string(),
-                    ));
-                }
-            } else if let Some(pos) = line.find(":FATAL: ") {
-                if failures.len() < 20 {
-                    failures.push((
-                        line[..pos].split('.').last().unwrap_or("").to_string(),
-                        format!("[fatal] {}", &line[pos + 8..]),
-                    ));
-                }
-            }
-        }
-        let status = if ex.spawn_err.is_some() {
-            "broken"
-        } else if ex.timed_out {
-            "timedout"
-        } else if !summary_seen {
-            // no Summary line: the master died before finishing (e.g. fatal)
-            "broken"
-        } else if errors > 0 {
-            "fail"
+    let items = {
+        let _temp_guard = SqliteTempDirGuard::activate(&tmp_dir);
+
+        let mut items = if selected.is_empty() {
+            Vec::new()
         } else {
-            "ok"
+            run_parallel(selected.len(), args.jobs, |i| {
+                let it0 = Instant::now();
+                let job = &selected[i];
+                let stem = &job.name;
+                let script = &job.script;
+                let sub = work_root.join(stem);
+                let _ = fs::remove_dir_all(&sub);
+                if let Err(e) = fs::create_dir_all(&sub) {
+                    let msg = format!("create {}: {e}", sub.display());
+                    return json!({ "name": stem, "kind": "mptest", "status": "broken", "error": msg, "tail": msg });
+                }
+                let db = sub.join(format!("{stem}.db"));
+                let mut cmd = Command::new(&exe);
+                cmd.arg("__sqlite-mptest").arg(&db).arg(script);
+                cmd.env("SQLITE_TMPDIR", &tmp_dir).env("TMPDIR", &tmp_dir);
+                if let Some(jm) = &job.journalmode {
+                    cmd.args(["--journalmode", jm]);
+                }
+                if let Some(v) = &args.vfs {
+                    cmd.args(["--vfs", v]);
+                }
+                if let Some(r) = args.repeat {
+                    let r = r.to_string();
+                    cmd.args(["--repeat", &r]);
+                }
+                if let Some(t) = args.trace {
+                    let t = t.to_string();
+                    cmd.args(["--trace", &t]);
+                }
+                if sync_on {
+                    cmd.arg("--sync");
+                }
+                if args.sqltrace {
+                    cmd.arg("--sqltrace");
+                }
+                if args.quiet {
+                    cmd.arg("--quiet");
+                }
+                cmd.current_dir(&sub);
+                let ex = exec_with_timeout(cmd, Duration::from_secs(args.timeout.max(1)));
+
+                let combined = format!("{}\n{}", ex.stdout, ex.stderr);
+                let mut errors: u64 = 0;
+                let mut tests: u64 = 0;
+                let mut summary_seen = false;
+                let mut failures: Vec<(String, String)> = Vec::new();
+                for line in combined.lines() {
+                    if let Some(rest) = line.strip_prefix("Summary: ") {
+                        let mut it = rest.split_whitespace();
+                        errors = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let _ = it.next();
+                        let _ = it.next();
+                        let _ = it.next();
+                        tests = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        summary_seen = true;
+                        continue;
+                    }
+                    if let Some(pos) = line.find(":ERROR: ") {
+                        if failures.len() < 20 {
+                            failures.push((
+                                line[..pos].split('.').last().unwrap_or("").to_string(),
+                                line[pos + 8..].to_string(),
+                            ));
+                        }
+                    } else if let Some(pos) = line.find(":FATAL: ")
+                        && failures.len() < 20
+                    {
+                        failures.push((
+                            line[..pos].split('.').last().unwrap_or("").to_string(),
+                            format!("[fatal] {}", &line[pos + 8..]),
+                        ));
+                    }
+                }
+                let status = if ex.spawn_err.is_some() {
+                    "broken"
+                } else if ex.timed_out {
+                    "timedout"
+                } else if !summary_seen {
+                    "broken"
+                } else if errors > 0 {
+                    "fail"
+                } else {
+                    "ok"
+                };
+                if status != "ok" {
+                    warn!("sqlite: {stem} ({script}) -> {status} ({errors} errors out of {tests} tests)");
+                }
+                info!(
+                    "sqlite: {} -> {} ({} errors out of {} tests, {}m{:02}s)",
+                    stem,
+                    status,
+                    errors,
+                    tests,
+                    it0.elapsed().as_secs() / 60,
+                    it0.elapsed().as_secs() % 60
+                );
+                let mut item = json!({
+                    "name": stem,
+                    "kind": "mptest",
+                    "script": script,
+                    "journal": job.journalmode.as_deref().unwrap_or("default"),
+                    "status": status,
+                    "errors": errors,
+                    "tests": tests,
+                    "durationMs": it0.elapsed().as_millis() as u64,
+                    "exitCode": ex.code,
+                });
+                let obj = item.as_object_mut().unwrap();
+                if !failures.is_empty() {
+                    obj.insert(
+                        "failures".into(),
+                        json!(
+                            failures
+                                .iter()
+                                .map(|(n, m)| json!({"client": n, "message": m}))
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
+                if status != "ok" {
+                    obj.insert("tail".into(), json!(tail(&combined, 2000)));
+                }
+                if let Some(e) = ex.spawn_err {
+                    obj.insert("error".into(), json!(e));
+                }
+                item
+            })
         };
-        if status != "ok" {
-            warn!("sqlite: {script} -> {status} ({errors} errors out of {tests} tests)");
+
+        if want_probe("crud") {
+            let mut crud_ref: Option<(String, String)> = None;
+            for (jm, cname) in [("delete", "crud-delete"), ("wal", "crud-wal")] {
+                if !matches_filter(cname) {
+                    continue;
+                }
+                let (mut item, digest_opt) = run_crud_case(&work_root, jm, sync_on);
+                if let Some(d) = digest_opt {
+                    if let Some((ref first_name, ref first_d)) = crud_ref {
+                        if &d != first_d {
+                            let msg = format!(
+                                "cross-journal CRUD SHA-256 digest mismatch vs {first_name}: got {d}, want {first_d}"
+                            );
+                            item["status"] = json!("fail");
+                            item["errors"] = json!(1);
+                            item["reason"] = json!(msg);
+                            item["tail"] = json!(msg);
+                        }
+                    } else {
+                        crud_ref = Some((cname.to_string(), d));
+                    }
+                }
+                items.push(item);
+            }
         }
-        info!(
-            "sqlite: {} -> {} ({} errors out of {} tests, {}m{:02}s)",
-            script,
-            status,
-            errors,
-            tests,
-            it0.elapsed().as_secs() / 60,
-            it0.elapsed().as_secs() % 60
-        );
-        let mut item = json!({
-            "name": stem,
-            "script": script,
-            "status": status,
-            "errors": errors,
-            "tests": tests,
-            "durationMs": it0.elapsed().as_millis() as u64,
-            "exitCode": ex.code,
-        });
-        let obj = item.as_object_mut().unwrap();
-        if !failures.is_empty() {
-            obj.insert(
-                "failures".into(),
-                json!(
-                    failures
-                        .iter()
-                        .map(|(n, m)| json!({"client": n, "message": m}))
-                        .collect::<Vec<_>>()
-                ),
-            );
+
+        if want_probe("speedtest") {
+            let mut ref_digest: Option<(String, String)> = None;
+            for (jm, mmap_sz, excl, cname) in [
+                ("delete", 0u64, false, "speedtest-delete"),
+                ("truncate", 0u64, false, "speedtest-truncate"),
+                ("persist", 0u64, false, "speedtest-persist"),
+                ("wal", 4_194_304u64, false, "speedtest-wal-mmap"),
+                ("wal", 0u64, true, "speedtest-wal-exclusive"),
+            ] {
+                if !matches_filter(cname) {
+                    continue;
+                }
+                let (mut item, digest_opt) = run_speedtest_case(&work_root, jm, mmap_sz, excl, sync_on);
+                if let Some(d) = digest_opt {
+                    if let Some((ref first_name, ref first_d)) = ref_digest {
+                        if &d != first_d {
+                            let msg = format!(
+                                "cross-journal SHA-256 digest mismatch vs {first_name}: got {d}, want {first_d}"
+                            );
+                            item["status"] = json!("fail");
+                            item["errors"] = json!(1);
+                            item["reason"] = json!(msg);
+                            item["tail"] = json!(msg);
+                        }
+                    } else {
+                        ref_digest = Some((cname.to_string(), d));
+                    }
+                }
+                items.push(item);
+            }
         }
-        if status != "ok" {
-            obj.insert("tail".into(), json!(tail(&combined, 2000)));
+
+        if want_probe("kvtest") {
+            for (jm, cname) in [("wal", "kvtest-wal"), ("delete", "kvtest-delete")] {
+                if matches_filter(cname) {
+                    items.push(run_kvtest_case(&work_root, jm, sync_on));
+                }
+            }
         }
-        if let Some(e) = ex.spawn_err {
-            obj.insert("error".into(), json!(e));
+
+        if want_probe("walthread") && matches_filter("walthread-concurrent") {
+            items.push(run_walthread_case(&work_root, sync_on));
         }
-        item
-    });
+
+        if want_probe("wal-lifecycle") {
+            if matches_filter("wal-checkpoint-truncate-cycle") {
+                items.push(run_wal_checkpoint_truncate_case(&work_root, sync_on));
+            }
+            if matches_filter("wal-journal-mode-transitions") {
+                items.push(run_wal_mode_transitions_case(&work_root, sync_on));
+            }
+        }
+
+        if want_probe("mmap") {
+            if matches_filter("mmap-probe-wal") {
+                items.push(run_mmap_probe_case(&work_root));
+            }
+            if matches_filter("mmap-shared-rw-multiprocess") {
+                items.push(run_mmap_shared_rw_multiprocess_case(&work_root, &exe));
+            }
+        }
+
+        items
+    };
+
+    if items.is_empty() {
+        if !args.keep {
+            remove_dir_all_bounded(&work_root, Duration::from_secs(60));
+        }
+        return Err("no sqlite probes/scripts matched selection (check --probes/--script/--filter)".into());
+    }
 
     let (mut ok_n, mut fail_n, mut broken_n, mut timedout_n) = (0u64, 0u64, 0u64, 0u64);
     let (mut t_errors, mut t_tests) = (0u64, 0u64);
@@ -1959,10 +4097,10 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     }
     let run_ok = fail_n == 0 && broken_n == 0 && timedout_n == 0;
     info!(
-        "sqlite: done in {}m{:02}s — {} scripts: {} ok {} failed {} broken {} timed out; {} errors out of {} tests",
+        "sqlite: done in {}m{:02}s — {} items: {} ok {} failed {} broken {} timed out; {} errors out of {} tests",
         started.elapsed().map(|d| d.as_secs()).unwrap_or(0) / 60,
         started.elapsed().map(|d| d.as_secs()).unwrap_or(0) % 60,
-        selected.len(),
+        items.len(),
         ok_n,
         fail_n,
         broken_n,
@@ -1985,28 +4123,100 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         "top": mountpoint.display().to_string(),
         "params": {
             "sqlite_version": sqlite_version,
-            "scripts": selected,
+            "probes": args.probes,
+            "scripts": selected_names,
             "jobs": args.jobs,
             "timeout_sec": args.timeout,
             "repeat": args.repeat,
             "journalmode": args.journalmode,
             "vfs": args.vfs,
-            "sync": args.sync,
+            "sync": sync_on,
         },
         "status": if run_ok { "ok" } else { "failed" },
         "results": {
             "summary": {
-                "scripts": selected.len(),
+                "scripts": items.len(),
                 "ok": ok_n, "failed": fail_n, "broken": broken_n, "timedout": timedout_n,
                 "errors": t_errors, "tests": t_tests,
             },
             "items": items,
         },
     });
-    if let Some(path) = &args.json {
-        if let Err(e) = fs::write(path, serde_json::to_vec_pretty(&report).unwrap()) {
-            warn!("failed to write {}: {e}", path.display());
-        }
-    }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn default_args_enable_sync_and_all_seven_probe_families() {
+        let cli = TestCli::parse_from(["test"]);
+        assert!(cli.args.sync_enabled());
+        assert_eq!(
+            cli.args.probes,
+            vec![
+                "mptest",
+                "crud",
+                "speedtest",
+                "kvtest",
+                "walthread",
+                "wal-lifecycle",
+                "mmap",
+            ]
+        );
+        let jobs = resolve_selection(&cli.args).expect("resolve default mptest selection");
+        let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "config01",
+                "config02",
+                "crash01",
+                "multiwrite01",
+                "multiwrite01-wal",
+                "crash01-wal",
+            ]
+        );
+        assert_eq!(jobs[4].journalmode.as_deref(), Some("wal"));
+        assert_eq!(jobs[5].journalmode.as_deref(), Some("wal"));
+    }
+
+    #[test]
+    fn explicit_journalmode_deduplicates_wal_aliases() {
+        let cli = TestCli::parse_from(["test", "--journalmode", "truncate", "--no-sync"]);
+        assert!(!cli.args.sync_enabled());
+        let jobs = resolve_selection(&cli.args).expect("resolve explicit journalmode");
+        let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+        assert_eq!(names, vec!["config01", "config02", "crash01", "multiwrite01"]);
+        assert!(jobs.iter().all(|j| j.journalmode.as_deref() == Some("truncate")));
+    }
+
+    #[test]
+    fn crud_and_wal_lifecycle_probes_pass_and_match_across_journals() {
+        let tmp = std::env::temp_dir().join(format!("fstest-sqlite-ut-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let (item_del, d_del) = run_crud_case(&tmp, "delete", false);
+        let (item_wal, d_wal) = run_crud_case(&tmp, "wal", false);
+        assert_eq!(item_del["status"], "ok", "crud-delete failed: {item_del}");
+        assert_eq!(item_wal["status"], "ok", "crud-wal failed: {item_wal}");
+        assert_eq!(d_del, d_wal, "crud-delete and crud-wal canonical digests must match");
+
+        let ckpt = run_wal_checkpoint_truncate_case(&tmp, false);
+        assert_eq!(ckpt["status"], "ok", "wal-checkpoint-truncate-cycle failed: {ckpt}");
+
+        let trans = run_wal_mode_transitions_case(&tmp, false);
+        assert_eq!(trans["status"], "ok", "wal-journal-mode-transitions failed: {trans}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

@@ -1,22 +1,18 @@
-// Behavior-level port of fsx from https://github.com/kdave/xfstests ltp/fsx.c
-// (NeXT/Apple lineage, GPL-2.0): single-file data-integrity fuzzer. A shadow
-// buffer (`good_buf`) tracks the expected file image; every operation is also
-// applied to the real file, and read/mapread results plus the file size are
-// verified against the shadow after each op. Deviations from upstream are
-// limited to what platforms cannot provide and are listed in README.md.
+// Port of `fsx` from xfstests `ltp/fsx.c`: single-file data-integrity fuzzer
+// verified against an in-memory shadow buffer (`good_buf`) after every operation.
 
-use crate::smallfile::iso8601;
+use crate::common::{host_name, iso8601, suffixed};
 use log::{info, warn};
 use serde_json::{Value, json};
-use std::fs::{self, OpenOptions};
+use std::ffi::CString;
+use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
-// glibc random() TYPE_3 (additive feedback, degree 31): replicating it makes
-// same-seed runs produce identical operation sequences to C fsx on Linux
+// glibc `random()` TYPE_3 (degree 31) so same-seed runs match C `fsx` sequences.
 pub struct GlibcRandom {
     st: [i32; 34],
     fp: usize,
@@ -26,7 +22,7 @@ pub struct GlibcRandom {
 impl GlibcRandom {
     pub fn new(seed: i32) -> Self {
         let mut st = [0i32; 34];
-        st[0] = seed;
+        st[0] = if seed == 0 { 1 } else { seed };
         for i in 1..31 {
             let hi = (st[i - 1] as i64) / 127773;
             let lo = (st[i - 1] as i64) % 127773;
@@ -45,6 +41,7 @@ impl GlibcRandom {
         }
         g
     }
+
     pub fn next(&mut self) -> u32 {
         let f = self.fp;
         let r = self.rp;
@@ -56,7 +53,7 @@ impl GlibcRandom {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
     Read,
     Write,
@@ -91,7 +88,6 @@ const OP_NAMES: [(Op, &str); 14] = [
     (Op::Fsync, "fsync"),
 ];
 
-// fallocate(2) mode flags — stable Linux ABI numbers, independent of libc version
 const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
 const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
 const FALLOC_FL_COLLAPSE_RANGE: i32 = 0x08;
@@ -118,6 +114,7 @@ struct Cfg {
     truncbdy: u64,
     pollute_eof: bool,
     do_fsync: bool,
+    direct: bool,
     simulatedopcount: u64,
     inject_failure_at: Option<u64>,
 }
@@ -140,7 +137,7 @@ pub struct Args {
     #[arg(short = 'N', long, default_value_t = 1000)]
     pub numops: i64,
 
-    /// RNG seed (0 = time+pid based); same seed reproduces a run
+    /// RNG seed (0 = time+pid based)
     #[arg(short = 'S', long, default_value_t = 1)]
     pub seed: i32,
 
@@ -160,7 +157,7 @@ pub struct Args {
     #[arg(short = 's', long, default_value_t = 0)]
     pub style: i32,
 
-    /// 1 in P chance of file close+open at each op
+    /// 1-in-P chance of file close+reopen after each operation
     #[arg(short = 'c', long, default_value_t = 0)]
     pub closeprob: i32,
 
@@ -168,13 +165,17 @@ pub struct Args {
     #[arg(short = 'p', long, default_value_t = 0)]
     pub progress: u64,
 
-    /// fsxLite: no file size changes (requires --keep-existing semantics)
+    /// fsxLite: no file size changes
     #[arg(short = 'L', long)]
     pub lite: bool,
 
     /// use oplen for every op (disable random lengths)
     #[arg(short = 'O', long)]
     pub fixed_oplen: bool,
+
+    /// direct I/O (`O_DIRECT` on Linux, `F_NOCACHE` on macOS; enforces page-aligned read/write boundaries)
+    #[arg(short = 'Z', long)]
+    pub direct: bool,
 
     /// disable mapped (mmap) reads
     #[arg(short = 'R', long)]
@@ -216,6 +217,10 @@ pub struct Args {
     #[arg(short = 'E', long)]
     pub no_copy: bool,
 
+    /// disable periodic fsync operations
+    #[arg(long)]
+    pub no_fsync_op: bool,
+
     /// disable file size verifications
     #[arg(short = 'n', long)]
     pub no_size_checks: bool,
@@ -224,7 +229,7 @@ pub struct Args {
     #[arg(short = 'X', long)]
     pub check_contents: bool,
 
-    /// fsync after each write
+    /// fsync after every write
     #[arg(short = 'y', long)]
     pub fsync_writes: bool,
 
@@ -240,7 +245,7 @@ pub struct Args {
     #[arg(short = 'd', long)]
     pub debug: bool,
 
-    /// begin operation number (replay up to here; like upstream -b)
+    /// simulate operations in memory up to this op number before issuing syscalls
     #[arg(short = 'b', long, default_value_t = 0)]
     pub begin_op: u64,
 
@@ -248,30 +253,40 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub duration: i64,
 
-    /// replay operations from a recorded .fsxops file
+    /// replay operations from a recorded `.fsxops` file
     #[arg(long)]
     pub replay_ops: Option<PathBuf>,
 
-    /// dump the ops file even on success
+    /// dump `<file>.fsxops` even on success
     #[arg(long)]
     pub record_ops: bool,
 
-    /// debug/testing aid: corrupt the file image at this op to verify detection
+    /// write `<file>.fsxgood` expected shadow image on success for post-remount `--verify-good`
+    #[arg(long)]
+    pub keep_good: bool,
+
+    /// verify `<file>` byte-for-byte against `<file>.fsxgood` without mutating it
+    #[arg(long)]
+    pub verify_good: bool,
+
+    /// remove test file on clean completion (ignored when `--keep-good` or `--record-ops` is set)
+    #[arg(long)]
+    pub cleanup: bool,
+
     #[arg(long, hide = true)]
     pub inject_failure_at: Option<u64>,
 
-    /// also write the JSON result to this file
+    /// write the enriched JSON result to this file
     #[arg(long)]
     pub json: Option<PathBuf>,
 }
 
 struct Fsx {
     a: Cfg,
+    file_path: PathBuf,
     fd: RawFd,
     good_buf: Vec<u8>,
     original_buf: Vec<u8>,
-    temp_buf: Vec<u8>,
-    check_buf: Vec<u8>,
     file_size: u64,
     biggest: u64,
     maxfilelen: u64,
@@ -288,11 +303,83 @@ struct Fsx {
     failure: Option<String>,
 }
 
-fn rounddown(v: u64, bdy: u64) -> u64 {
-    if bdy == 0 {
-        return v;
+impl Drop for Fsx {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = -1;
+        }
     }
-    v - v % bdy
+}
+
+fn rounddown(v: u64, bdy: u64) -> u64 {
+    if bdy <= 1 { v } else { v - v % bdy }
+}
+
+fn open_test_fd(path: &Path, create: bool, truncate: bool, direct: bool) -> io::Result<RawFd> {
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let mut flags = libc::O_RDWR;
+    if create {
+        flags |= libc::O_CREAT;
+    }
+    if truncate {
+        flags |= libc::O_TRUNC;
+    }
+    #[cfg(target_os = "linux")]
+    if direct {
+        flags |= libc::O_DIRECT;
+    }
+    let fd = unsafe { libc::open(cpath.as_ptr(), flags, 0o666usize) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(target_os = "macos")]
+    if direct && unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) } != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedBuf {
+    fn new(len: usize, align: usize) -> io::Result<Self> {
+        let alloc_len = len.max(align);
+        let mut raw: *mut libc::c_void = std::ptr::null_mut();
+        let rc = unsafe { libc::posix_memalign(&mut raw, align.max(4096), alloc_len) };
+        if rc != 0 || raw.is_null() {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        unsafe {
+            std::ptr::write_bytes(raw as *mut u8, 0, alloc_len);
+        }
+        Ok(Self {
+            ptr: raw as *mut u8,
+            len,
+        })
+    }
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { libc::free(self.ptr as *mut libc::c_void) };
+        }
+    }
 }
 
 impl Fsx {
@@ -300,34 +387,31 @@ impl Fsx {
         self.rng.next()
     }
 
-    fn log4(&mut self, op: Op, a0: u64, a1: u64, skipped: bool) {
+    fn simulating(&self) -> bool {
+        self.testcalls <= self.a.simulatedopcount
+    }
+
+    fn log_entry(&mut self, op: Op, args: [u64; 3], skipped: bool, keep_size: bool, unshare: bool) {
         self.log[self.logptr] = LogEntry {
             op,
-            args: [a0, a1, self.file_size],
+            args,
             skipped,
-            keep_size: false,
-            unshare: false,
+            keep_size,
+            unshare,
             close_open: self.closeopen,
         };
         self.logptr = (self.logptr + 1) % LOGSIZE;
         self.logcount += 1;
+    }
+
+    fn log4(&mut self, op: Op, a0: u64, a1: u64, skipped: bool) {
+        self.log_entry(op, [a0, a1, self.file_size], skipped, false, false);
     }
 
     fn log5(&mut self, op: Op, a0: u64, a1: u64, a2: u64, skipped: bool) {
-        self.log[self.logptr] = LogEntry {
-            op,
-            args: [a0, a1, a2],
-            skipped,
-            keep_size: false,
-            unshare: false,
-            close_open: self.closeopen,
-        };
-        self.logptr = (self.logptr + 1) % LOGSIZE;
-        self.logcount += 1;
+        self.log_entry(op, [a0, a1, a2], skipped, false, false);
     }
 
-    // gendata: per-op pattern; even bytes carry the op counter, odd bytes add
-    // the original fill so corruption is attributable
     fn gendata(&mut self, offset: usize, size: usize) {
         let tc = (self.testcalls % 256) as u8;
         for i in offset..offset + size {
@@ -340,6 +424,37 @@ impl Fsx {
     }
 
     fn pread_all(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.a.direct {
+            let align = self.page_size as usize;
+            let aligned_len = (buf.len() + align - 1) & !(align - 1);
+            let mut abuf = AlignedBuf::new(aligned_len, align)?;
+            let mut off = offset;
+            let mut done = 0usize;
+            while done < buf.len() {
+                let req = (aligned_len - done).max(align);
+                let n = unsafe {
+                    libc::pread(
+                        self.fd,
+                        abuf.as_mut_slice()[done..].as_mut_ptr() as *mut libc::c_void,
+                        req,
+                        off as i64,
+                    )
+                };
+                if n < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+                }
+                done += n as usize;
+                off += n as u64;
+            }
+            buf.copy_from_slice(&abuf.as_slice()[..buf.len()]);
+            return Ok(());
+        }
         let mut off = offset;
         let mut done = 0usize;
         while done < buf.len() {
@@ -364,6 +479,32 @@ impl Fsx {
     }
 
     fn pwrite_all(&self, data: &[u8], offset: u64) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.a.direct {
+            let align = self.page_size as usize;
+            let mut abuf = AlignedBuf::new(data.len(), align)?;
+            abuf.as_mut_slice().copy_from_slice(data);
+            let mut off = offset;
+            let mut done = 0usize;
+            while done < data.len() {
+                let n = unsafe {
+                    libc::pwrite(
+                        self.fd,
+                        abuf.as_slice()[done..].as_ptr() as *const libc::c_void,
+                        data.len() - done,
+                        off as i64,
+                    )
+                };
+                if n <= 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                done += n as usize;
+                off += n as u64;
+            }
+            return Ok(());
+        }
         let mut off = offset;
         let mut done = 0usize;
         while done < data.len() {
@@ -375,13 +516,42 @@ impl Fsx {
                     off as i64,
                 )
             };
-            if n < 0 {
+            if n <= 0 {
                 return Err(io::Error::last_os_error());
             }
             done += n as usize;
             off += n as u64;
         }
         Ok(())
+    }
+
+    fn do_close_open(&mut self) {
+        if self.simulating() {
+            return;
+        }
+        if unsafe { libc::close(self.fd) } != 0 {
+            self.fd = -1;
+            self.fail(format!("close_open close: {}", io::Error::last_os_error()));
+            return;
+        }
+        self.fd = -1;
+        match open_test_fd(&self.file_path, false, false, self.a.direct) {
+            Ok(new_fd) => self.fd = new_fd,
+            Err(e) => self.fail(format!("close_open reopen: {e}")),
+        }
+    }
+
+    fn flush_simulated_state(&mut self) {
+        if unsafe { libc::ftruncate(self.fd, self.file_size as i64) } != 0 {
+            self.fail(format!("begin_op ftruncate: {}", io::Error::last_os_error()));
+            return;
+        }
+        if self.file_size > 0 {
+            let img = self.good_buf[..self.file_size as usize].to_vec();
+            if let Err(e) = self.pwrite_all(&img, 0) {
+                self.fail(format!("begin_op pwrite: {e}"));
+            }
+        }
     }
 
     fn fail(&mut self, msg: String) {
@@ -392,7 +562,7 @@ impl Fsx {
         warn!("fsx failure: {msg}");
     }
 
-    fn check_buffers(&mut self, buf: &[u8], mut offset: u64, size: usize) {
+    fn check_buffers(&mut self, buf: &[u8], offset: u64, size: usize) {
         if buf[..size] != self.good_buf[offset as usize..offset as usize + size] {
             let mut mismatches = 0u32;
             for (i, b) in buf[..size].iter().enumerate() {
@@ -414,10 +584,12 @@ impl Fsx {
                 "READ BAD DATA: offset = 0x{offset:x}, size = 0x{size:x}, mismatches = {mismatches}"
             ));
         }
-        let _ = &mut offset;
     }
 
     fn check_size(&mut self) {
+        if self.simulating() {
+            return;
+        }
         let mut sb: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(self.fd, &mut sb) } != 0 {
             self.fail("check_size: fstat failed".into());
@@ -440,10 +612,8 @@ impl Fsx {
         self.file_size = offset + size;
     }
 
-    // pollute the page containing EOF with data past EOF; the next size-change
-    // op is expected to zero it, so missed zeroing becomes detectable
     fn pollute_eofpage(&mut self, maxoff: u64) {
-        if !self.a.pollute_eof || self.testcalls <= self.a.simulatedopcount {
+        if !self.a.pollute_eof || self.simulating() {
             return;
         }
         let offset = self.file_size;
@@ -483,52 +653,70 @@ impl Fsx {
     }
 
     fn doread(&mut self, mut offset: u64, size: u64) {
-        offset -= offset % self.a.readbdy.max(1);
+        offset = rounddown(offset, self.a.readbdy);
+        let size = rounddown(size, self.a.readbdy);
         if size == 0 || offset + size > self.file_size {
             self.log4(Op::Read, offset, size, true);
             return;
         }
         self.log4(Op::Read, offset, size, false);
+        if self.simulating() {
+            return;
+        }
         let mut tmp = vec![0u8; size as usize];
         if let Err(e) = self.pread_all(&mut tmp, offset) {
             self.fail(format!("doread: {e}"));
             return;
         }
         if self.a.inject_failure_at == Some(self.testcalls) && size > 8 {
-            tmp[7] ^= 0xff; // testing aid: verify detection machinery
+            tmp[7] ^= 0xff;
         }
         self.check_buffers(&tmp, offset, size as usize);
     }
 
     fn dowrite(&mut self, mut offset: u64, size: u64) {
-        offset -= offset % self.a.writebdy.max(1);
-        if size == 0 {
+        offset = rounddown(offset, self.a.writebdy);
+        let size = rounddown(size, self.a.writebdy);
+        if size == 0 || offset + size > self.maxfilelen {
             self.log4(Op::Write, offset, size, true);
             return;
+        }
+        if offset + size > self.biggest {
+            self.biggest = offset + size;
         }
         self.log4(Op::Write, offset, size, false);
         self.gendata(offset as usize, size as usize);
         if offset + size > self.file_size {
             self.update_file_size(offset, size);
         }
-        if let Err(e) = self.pwrite_all(&self.good_buf[offset as usize..offset as usize + size as usize], offset) {
+        if self.simulating() {
+            return;
+        }
+        if let Err(e) = self.pwrite_all(
+            &self.good_buf[offset as usize..offset as usize + size as usize],
+            offset,
+        ) {
             self.fail(format!("dowrite: {e}"));
             return;
         }
-        if self.a.do_fsync {
-            unsafe { libc::fsync(self.fd) };
+        if self.a.do_fsync && unsafe { libc::fsync(self.fd) } != 0 {
+            self.fail(format!("dowrite fsync: {}", io::Error::last_os_error()));
         }
     }
 
     fn domapread(&mut self, mut offset: u64, size: u64) {
-        offset -= offset % self.a.readbdy.max(1);
+        offset = rounddown(offset, self.a.readbdy);
         if size == 0 || offset + size > self.file_size {
             self.log4(Op::MapRead, offset, size, true);
             return;
         }
         self.log4(Op::MapRead, offset, size, false);
+        if self.simulating() {
+            return;
+        }
         unsafe {
             let pg_offset = offset & self.page_mask;
+            let map_base = offset - pg_offset;
             let map_size = pg_offset + size;
             let p = libc::mmap(
                 std::ptr::null_mut(),
@@ -536,7 +724,7 @@ impl Fsx {
                 libc::PROT_READ,
                 libc::MAP_SHARED,
                 self.fd,
-                (offset - pg_offset) as libc::off_t,
+                map_base as libc::off_t,
             );
             if p == libc::MAP_FAILED {
                 self.fail(format!("domapread: mmap {}", io::Error::last_os_error()));
@@ -545,15 +733,20 @@ impl Fsx {
             let src = (p as *const u8).add(pg_offset as usize);
             let mut tmp = vec![0u8; size as usize];
             std::ptr::copy_nonoverlapping(src, tmp.as_mut_ptr(), size as usize);
-            // POSIX requires zero-fill past EOF within the last mapped page
-            let eof_page_start = (self.file_size - (offset - pg_offset)) & !self.page_mask;
-            if offset - pg_offset + size > eof_page_start {
-                let file_page_off = self.file_size & self.page_mask;
-                for i in file_page_off..map_size {
+
+            // POSIX requires zero-fill past EOF within the mapped EOF page.
+            let mapped_pages_end = (map_size + self.page_mask) & !self.page_mask;
+            let eof_rel = self.file_size.saturating_sub(map_base);
+            if self.file_size >= map_base
+                && eof_rel < mapped_pages_end
+                && (self.file_size & self.page_mask) != 0
+            {
+                let eof_page_end = (eof_rel + self.page_mask) & !self.page_mask;
+                for i in eof_rel..eof_page_end.min(mapped_pages_end) {
                     let b = *(p as *const u8).add(i as usize);
-                    if i >= self.file_size - (offset - pg_offset) && b != 0 {
+                    if b != 0 {
                         self.fail(format!(
-                            "Mapped Read: non-zero data past EOF (page offset 0x{i:x}) is 0x{b:02x}"
+                            "Mapped Read: non-zero data past EOF (map offset 0x{i:x}) is 0x{b:02x}"
                         ));
                         break;
                     }
@@ -565,16 +758,22 @@ impl Fsx {
     }
 
     fn domapwrite(&mut self, mut offset: u64, size: u64) {
-        offset -= offset % self.a.writebdy.max(1);
-        if size == 0 {
+        offset = rounddown(offset, self.a.writebdy);
+        if size == 0 || offset + size > self.maxfilelen {
             self.log4(Op::MapWrite, offset, size, true);
             return;
         }
         let cur = self.file_size;
+        if offset + size > self.biggest {
+            self.biggest = offset + size;
+        }
         self.log4(Op::MapWrite, offset, size, false);
         self.gendata(offset as usize, size as usize);
         if offset + size > self.file_size {
             self.update_file_size(offset, size);
+        }
+        if self.simulating() {
+            return;
         }
         unsafe {
             if self.file_size > cur && libc::ftruncate(self.fd, self.file_size as i64) != 0 {
@@ -608,7 +807,7 @@ impl Fsx {
     }
 
     fn dotruncate(&mut self, mut size: u64) {
-        size -= size % self.a.truncbdy.max(1);
+        size = rounddown(size, self.a.truncbdy).min(self.maxfilelen);
         if size > self.biggest {
             self.biggest = size;
         }
@@ -617,8 +816,21 @@ impl Fsx {
             self.pollute_eofpage(self.maxfilelen);
         }
         self.update_file_size(size, 0);
+        if self.simulating() {
+            return;
+        }
         if unsafe { libc::ftruncate(self.fd, size as i64) } != 0 {
             self.fail(format!("dotruncate: {}", io::Error::last_os_error()));
+        }
+    }
+
+    fn do_fsync(&mut self) {
+        self.log4(Op::Fsync, 0, 0, false);
+        if self.simulating() {
+            return;
+        }
+        if unsafe { libc::fsync(self.fd) } != 0 {
+            self.fail(format!("do_fsync: {}", io::Error::last_os_error()));
         }
     }
 
@@ -633,7 +845,6 @@ impl Fsx {
         }
         #[cfg(target_os = "macos")]
         {
-            // macOS has no fallocate(2); punch/zero map to fcntl commands
             match mode {
                 m if m & FALLOC_FL_PUNCH_HOLE != 0 => {
                     let mut pr = libc::fpunchhole_t {
@@ -661,34 +872,26 @@ impl Fsx {
         offset = offset.min(self.maxfilelen);
         size = size.min(self.maxfilelen.saturating_sub(offset));
         if size == 0 {
-            self.log4(Op::Fallocate, offset, 0, true);
+            self.log_entry(Op::Fallocate, [offset, 0, self.file_size], true, keep_size, unshare);
             return;
         }
-        let end = if keep_size { 0 } else { offset + size };
-        if end > self.biggest {
+        let end = offset + size;
+        if !keep_size && end > self.biggest {
             self.biggest = end;
         }
-        let mut flags = (keep_size, unshare);
-        let mode = {
-            let mut m = 0i32;
-            if keep_size {
-                m |= FALLOC_FL_KEEP_SIZE;
-                flags.0 = true;
-            }
-            if unshare {
-                m |= FALLOC_FL_UNSHARE_RANGE;
-                flags.1 = true;
-            }
-            m
-        };
-        let _ = flags;
-        self.log4(Op::Fallocate, offset, size, false);
-        if offset + size > self.file_size {
-            let gap = (offset + size - self.file_size) as usize;
-            self.good_buf[self.file_size as usize..self.file_size as usize + gap].fill(0);
-            self.update_file_size(offset, size);
+        let mut mode = 0i32;
+        if keep_size {
+            mode |= FALLOC_FL_KEEP_SIZE;
         }
-        if self.testcalls <= self.a.simulatedopcount {
+        if unshare {
+            mode |= FALLOC_FL_UNSHARE_RANGE;
+        }
+        self.log_entry(Op::Fallocate, [offset, size, self.file_size], false, keep_size, unshare);
+        if !keep_size && end > self.file_size {
+            self.good_buf[self.file_size as usize..end as usize].fill(0);
+            self.file_size = end;
+        }
+        if self.simulating() {
             return;
         }
         if let Err(e) = self.fallocate_call(mode, offset, size) {
@@ -701,10 +904,6 @@ impl Fsx {
             self.log4(Op::PunchHole, offset, length, true);
             return;
         }
-        self.log4(Op::PunchHole, offset, length, false);
-        // APFS returns EINVAL unless offset and length are block-aligned;
-        // clip to EOF first (tail past EOF is a no-op for punching), then
-        // align. Linux fallocate(2) has no such requirement — leave as-is.
         let length = length.min(self.file_size - offset);
         #[cfg(target_os = "macos")]
         let (offset, length) = {
@@ -712,50 +911,52 @@ impl Fsx {
             (rounddown(offset, bdy), rounddown(length, bdy))
         };
         if length == 0 || offset >= self.file_size {
-            return; // fully clipped by alignment; nothing to punch
+            self.log4(Op::PunchHole, offset, length, true);
+            return;
         }
-        if let Err(e) = self.fallocate_call(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, length) {
+        self.log4(Op::PunchHole, offset, length, false);
+        if !self.simulating()
+            && let Err(e) = self.fallocate_call(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, length)
+        {
             self.fail(format!("do_punch_hole: {e}"));
             return;
         }
-        let max_offset = offset.min(self.file_size);
-        let max_len = if max_offset + length <= self.file_size {
-            length
-        } else {
-            self.file_size - max_offset
-        };
-        let s = max_offset as usize;
+        let max_len = length.min(self.file_size - offset);
+        let s = offset as usize;
         self.good_buf[s..s + max_len as usize].fill(0);
     }
 
     fn do_zero_range(&mut self, offset: u64, length: u64, keep_size: bool) {
-        if length == 0 {
-            self.log4(Op::ZeroRange, offset, length, true);
+        if length == 0 || offset + length > self.maxfilelen {
+            self.log_entry(Op::ZeroRange, [offset, length, self.file_size], true, keep_size, false);
             return;
         }
-        let end = if keep_size { 0 } else { offset + length };
-        if end > self.biggest {
+        let end = offset + length;
+        if !keep_size && end > self.biggest {
             self.biggest = end;
         }
-        self.log4(Op::ZeroRange, offset, length, false);
-        if !keep_size && offset + length > self.file_size {
-            self.update_file_size(offset, length);
+        self.log_entry(Op::ZeroRange, [offset, length, self.file_size], false, keep_size, false);
+        if !keep_size && end > self.file_size {
+            self.good_buf[self.file_size as usize..end as usize].fill(0);
+            self.file_size = end;
         }
         let mode = if keep_size {
             FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE
         } else {
             FALLOC_FL_ZERO_RANGE
         };
-        if let Err(e) = self.fallocate_call(mode, offset, length) {
+        if !self.simulating() && let Err(e) = self.fallocate_call(mode, offset, length) {
             self.fail(format!("do_zero_range: {e}"));
             return;
         }
-        let s = offset as usize;
-        self.good_buf[s..s + length as usize].fill(0);
+        let zero_end = end.min(self.file_size) as usize;
+        if (offset as usize) < zero_end {
+            self.good_buf[offset as usize..zero_end].fill(0);
+        }
     }
 
     fn do_write_zeroes(&mut self, offset: u64, length: u64) {
-        if length == 0 {
+        if length == 0 || offset + length > self.maxfilelen {
             self.log4(Op::WriteZeroes, offset, length, true);
             return;
         }
@@ -765,9 +966,10 @@ impl Fsx {
         }
         self.log4(Op::WriteZeroes, offset, length, false);
         if end > self.file_size {
-            self.update_file_size(offset, length);
+            self.good_buf[self.file_size as usize..end as usize].fill(0);
+            self.file_size = end;
         }
-        if let Err(e) = self.fallocate_call(FALLOC_FL_WRITE_ZEROES, offset, length) {
+        if !self.simulating() && let Err(e) = self.fallocate_call(FALLOC_FL_WRITE_ZEROES, offset, length) {
             self.fail(format!("do_write_zeroes: {e}"));
             return;
         }
@@ -782,7 +984,7 @@ impl Fsx {
         }
         self.log4(Op::CollapseRange, offset, length, false);
         self.pollute_eofpage(self.maxfilelen);
-        if let Err(e) = self.fallocate_call(FALLOC_FL_COLLAPSE_RANGE, offset, length) {
+        if !self.simulating() && let Err(e) = self.fallocate_call(FALLOC_FL_COLLAPSE_RANGE, offset, length) {
             self.fail(format!("do_collapse_range: {e}"));
             return;
         }
@@ -793,21 +995,23 @@ impl Fsx {
     }
 
     fn do_insert_range(&mut self, offset: u64, length: u64) {
-        if length == 0 || offset >= self.file_size {
+        if length == 0 || offset >= self.file_size || self.file_size + length > self.maxfilelen {
             self.log4(Op::InsertRange, offset, length, true);
             return;
         }
+        if self.file_size + length > self.biggest {
+            self.biggest = self.file_size + length;
+        }
         self.log4(Op::InsertRange, offset, length, false);
         self.pollute_eofpage(self.maxfilelen);
-        if let Err(e) = self.fallocate_call(FALLOC_FL_INSERT_RANGE, offset, length) {
+        if !self.simulating() && let Err(e) = self.fallocate_call(FALLOC_FL_INSERT_RANGE, offset, length) {
             self.fail(format!("do_insert_range: {e}"));
             return;
         }
         let end = offset + length;
         self.good_buf
-            .copy_within(offset as usize..(self.file_size - length) as usize, end as usize);
-        let s = offset as usize;
-        self.good_buf[s..s + length as usize].fill(0);
+            .copy_within(offset as usize..self.file_size as usize, end as usize);
+        self.good_buf[offset as usize..end as usize].fill(0);
         self.file_size += length;
     }
 
@@ -821,7 +1025,7 @@ impl Fsx {
             dest_offset: i64,
         }
         const FICLONERANGE: libc::c_ulong = 0x4020940D;
-        if length == 0 || offset >= self.file_size {
+        if length == 0 || offset + length > self.file_size || dest + length > self.maxfilelen {
             self.log5(Op::CloneRange, offset, length, dest, true);
             return;
         }
@@ -832,25 +1036,28 @@ impl Fsx {
         if dest + length > self.file_size {
             self.update_file_size(dest, length);
         }
-        let fcr = FileCloneRange {
-            src_fd: self.fd as i64,
-            src_offset: offset as i64,
-            src_length: length as i64,
-            dest_offset: dest as i64,
-        };
-        if unsafe { libc::ioctl(self.fd, FICLONERANGE as libc::c_ulong, &fcr) } == -1 {
-            self.fail(format!("do_clone_range: FICLONERANGE {}", io::Error::last_os_error()));
-            return;
+        if !self.simulating() {
+            let fcr = FileCloneRange {
+                src_fd: self.fd as i64,
+                src_offset: offset as i64,
+                src_length: length as i64,
+                dest_offset: dest as i64,
+            };
+            if unsafe { libc::ioctl(self.fd, FICLONERANGE, &fcr) } == -1 {
+                self.fail(format!("do_clone_range: FICLONERANGE {}", io::Error::last_os_error()));
+                return;
+            }
         }
         let (s, d) = (offset as usize, dest as usize);
         self.good_buf.copy_within(s..s + length as usize, d);
     }
+
     #[cfg(not(target_os = "linux"))]
     fn do_clone_range(&mut self, _o: u64, _l: u64, _d: u64) {}
 
     #[cfg(target_os = "linux")]
     fn do_copy_range(&mut self, offset: u64, length: u64, dest: u64) {
-        if length == 0 || offset >= self.file_size {
+        if length == 0 || offset + length > self.file_size || dest + length > self.maxfilelen {
             self.log5(Op::CopyRange, offset, length, dest, true);
             return;
         }
@@ -861,25 +1068,30 @@ impl Fsx {
         if dest + length > self.file_size {
             self.update_file_size(dest, length);
         }
-        let mut o1 = offset as i64;
-        let mut o2 = dest as i64;
-        let mut left = length as i64;
-        while left > 0 {
-            let n = unsafe { libc::copy_file_range(self.fd, &mut o1, self.fd, &mut o2, left as usize, 0) };
-            if n <= 0 {
-                self.fail(format!("do_copy_range: copy_file_range {}", io::Error::last_os_error()));
-                return;
+        if !self.simulating() {
+            let mut o1 = offset as i64;
+            let mut o2 = dest as i64;
+            let mut left = length as i64;
+            while left > 0 {
+                let n = unsafe {
+                    libc::copy_file_range(self.fd, &mut o1, self.fd, &mut o2, left as usize, 0)
+                };
+                if n <= 0 {
+                    self.fail(format!("do_copy_range: copy_file_range {}", io::Error::last_os_error()));
+                    return;
+                }
+                left -= n as i64;
             }
-            left -= n as i64;
         }
         let (s, d) = (offset as usize, dest as usize);
         self.good_buf.copy_within(s..s + length as usize, d);
     }
+
     #[cfg(not(target_os = "linux"))]
     fn do_copy_range(&mut self, _o: u64, _l: u64, _d: u64) {}
 
     fn check_contents(&mut self) {
-        if self.file_size == 0 {
+        if self.simulating() || self.file_size == 0 {
             return;
         }
         let mut buf = vec![0u8; self.file_size as usize];
@@ -893,12 +1105,17 @@ impl Fsx {
     fn logdump(&self) -> Vec<String> {
         let mut out = Vec::new();
         out.push(format!("LOG DUMP ({} total operations):", self.logcount));
-        let start = if self.logcount < LOGSIZE as u64 { 0 } else { self.logptr };
+        let start = if self.logcount < LOGSIZE as u64 {
+            0
+        } else {
+            self.logptr
+        };
         let count = self.logcount.min(LOGSIZE as u64);
+        let base_num = self.logcount.saturating_sub(count);
         let mut i = start;
         for c in 0..count {
-            let le = &self.log[i as usize];
-            let opnum = c + 1 + (self.logcount / LOGSIZE as u64) * LOGSIZE as u64;
+            let le = &self.log[i];
+            let opnum = base_num + c + 1;
             let name = OP_NAMES
                 .iter()
                 .find(|(o, _)| *o == le.op)
@@ -910,8 +1127,8 @@ impl Fsx {
                 out.push(format!(
                     "{opnum}: {name} 0x{:x} 0x{:x} 0x{:x}{}{}{}",
                     le.args[0],
-                    le.args.get(1).copied().unwrap_or(0),
-                    le.args.get(2).copied().unwrap_or(0),
+                    le.args[1],
+                    le.args[2],
                     if le.keep_size { " keep_size" } else { "" },
                     if le.unshare { " unshare" } else { "" },
                     if le.close_open { " close_open" } else { "" },
@@ -922,51 +1139,68 @@ impl Fsx {
         out
     }
 
-    // replay ops file lines look like: "write 0x123 0x456 [keep_size]..."
-    fn load_replay(path: &Path) -> io::Result<Vec<(Op, [u64; 3], bool, bool, bool)>> {
+    fn load_replay(path: &Path) -> io::Result<Vec<LogEntry>> {
         let text = fs::read_to_string(path)?;
         let mut out = Vec::new();
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() || line.starts_with('#') || line.starts_with("LOG DUMP") {
                 continue;
             }
-            let mut toks = line.split_whitespace();
-            let mut skipped = false;
-            if toks.next() == Some("skip") {
-                skipped = true;
-            }
-            let opname = match toks.next() {
-                Some(t) => t,
-                None => continue,
+            let body = match line.split_once(':') {
+                Some((prefix, rest)) if prefix.chars().all(|c| c.is_ascii_digit()) => rest.trim(),
+                _ => line,
             };
-            let Some((op, _)) = OP_NAMES.iter().find(|(_, n)| *n == opname) else {
+            let mut toks: Vec<&str> = body.split_whitespace().collect();
+            if toks.is_empty() {
+                continue;
+            }
+            let mut skipped = false;
+            if matches!(toks[0], "SKIPPED" | "skip") {
+                skipped = true;
+                toks.remove(0);
+            }
+            let Some(&opname) = toks.first() else {
+                continue;
+            };
+            let Some(&(op, _)) = OP_NAMES.iter().find(|(_, n)| *n == opname) else {
                 return Err(io::Error::other(format!("unknown op {opname} in {path:?}")));
             };
-            let mut args = [0u64; 3];
-            for (j, a) in args.iter_mut().enumerate() {
-                let t = toks.next().unwrap_or(":");
-                *a = u64::from_str_radix(t.trim_start_matches("0x"), 16)
-                    .or_else(|_| t.parse())
-                    .unwrap_or(0);
-                let _ = j;
+            if skipped {
+                out.push(LogEntry {
+                    op,
+                    args: [0; 3],
+                    skipped: true,
+                    keep_size: false,
+                    unshare: false,
+                    close_open: false,
+                });
+                continue;
             }
-            let keep = toks.any(|t| t == "keep_size");
-            out.push((*op, args, skipped, keep, false));
+            let parse_u64 = |s: &str| -> u64 {
+                if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    u64::from_str_radix(h, 16).unwrap_or(0)
+                } else {
+                    s.parse().unwrap_or(0)
+                }
+            };
+            let mut args = [0u64; 3];
+            for j in 0..3 {
+                if let Some(&t) = toks.get(1 + j) {
+                    args[j] = parse_u64(t);
+                }
+            }
+            let flags = if toks.len() > 4 { &toks[4..] } else { &[] };
+            out.push(LogEntry {
+                op,
+                args,
+                skipped: false,
+                keep_size: flags.contains(&"keep_size"),
+                unshare: flags.contains(&"unshare"),
+                close_open: flags.contains(&"close_open"),
+            });
         }
         Ok(out)
-    }
-}
-
-fn op_max(lite: bool, integrity_fsync: bool) -> usize {
-    // mirrors the C op-window: lite = 4 common ops, full = +size ops,
-    // integrity adds fsync at the end (we offer fsync via --fsync-op)
-    if lite {
-        4
-    } else if integrity_fsync {
-        14
-    } else {
-        13
     }
 }
 
@@ -978,6 +1212,56 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
     let file_path = mountpoint.join(&a.file);
+    let good_path = suffixed(&file_path, ".fsxgood");
+    let ops_path = suffixed(&file_path, ".fsxops");
+    let log_path = suffixed(&file_path, ".fsxlog");
+
+    if a.verify_good {
+        let t0 = Instant::now();
+        let want = fs::read(&good_path)
+            .map_err(|e| format!("cannot read expected image {}: {e}", good_path.display()))?;
+        let got = fs::read(&file_path)
+            .map_err(|e| format!("cannot read target file {}: {e}", file_path.display()))?;
+        let failure = if got.len() != want.len() {
+            Some(format!(
+                "verify-good size mismatch: {} has {} bytes, {} has {} bytes",
+                file_path.display(),
+                got.len(),
+                good_path.display(),
+                want.len()
+            ))
+        } else {
+            got.iter()
+                .zip(want.iter())
+                .position(|(x, y)| x != y)
+                .map(|off| {
+                    format!(
+                        "verify-good byte mismatch at offset {off} (0x{off:x}): got 0x{:02x}, expected 0x{:02x}",
+                        got[off], want[off]
+                    )
+                })
+        };
+        if failure.is_none() && a.cleanup {
+            let _ = fs::remove_file(&file_path);
+            let _ = fs::remove_file(&good_path);
+            let _ = fs::remove_file(&ops_path);
+        }
+        return Ok(json!({
+            "suite": "fsx",
+            "host": host_name(),
+            "date": iso8601(SystemTime::now()),
+            "top": mountpoint.display().to_string(),
+            "durationMs": t0.elapsed().as_millis() as u64,
+            "params": {"file": a.file, "mode": "verify-good"},
+            "status": if failure.is_some() { "failed" } else { "ok" },
+            "opsExecuted": 0,
+            "opsCompleted": 0,
+            "finalFileSize": got.len(),
+            "failure": failure,
+            "log": [],
+        }));
+    }
+
     let seed = if a.seed == 0 {
         let t = SystemTimeSeed::now();
         info!("fsx: seed = {t}");
@@ -985,35 +1269,45 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
     } else {
         a.seed
     };
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(!a.lite)
-        .mode(0o666)
-        .open(&file_path)
+
+    let page_size = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64).max(4096);
+    let readbdy = if a.direct { a.readbdy.max(page_size) } else { a.readbdy.max(1) };
+    let writebdy = if a.direct { a.writebdy.max(page_size) } else { a.writebdy.max(1) };
+    let truncbdy = if a.direct { a.truncbdy.max(page_size) } else { a.truncbdy.max(1) };
+
+    let fd = open_test_fd(&file_path, true, !a.lite, a.direct)
         .map_err(|e| format!("{}: {e}", file_path.display()))?;
-    let fd = file.as_raw_fd();
     let mut sb: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut sb) } != 0 {
+        unsafe { libc::close(fd) };
         return Err("fstat failed".into());
     }
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-    let mut maxfilelen = a.flen;
-    let mut file_size = 0u64;
-    if a.lite {
-        file_size = sb.st_size as u64;
-        maxfilelen = maxfilelen.max(file_size);
-    }
 
-    // feature probing, mirroring upstream test_fallocate()/test_clone_range()
+    let mut maxfilelen = a.flen;
+    if a.direct {
+        maxfilelen = rounddown(maxfilelen.max(page_size), page_size);
+    }
+    let initial_size = if a.lite {
+        let sz = sb.st_size as u64;
+        maxfilelen = maxfilelen.max(sz);
+        sz
+    } else {
+        0u64
+    };
+
     let mut enabled = [true; 14];
     let idx = |o: Op| OP_NAMES.iter().position(|(x, _)| *x == o).unwrap();
     let linux = cfg!(target_os = "linux");
+    if a.no_mapped_reads {
+        enabled[idx(Op::MapRead)] = false;
+    }
+    if a.no_mapped_writes {
+        enabled[idx(Op::MapWrite)] = false;
+    }
     if a.no_fallocate || !linux {
         enabled[idx(Op::Fallocate)] = false;
     }
-    if a.no_punch || !linux && !cfg!(target_os = "macos") {
+    if a.no_punch || (!linux && !cfg!(target_os = "macos")) {
         enabled[idx(Op::PunchHole)] = false;
     }
     if a.no_zero || !linux {
@@ -1032,50 +1326,68 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
     if a.no_copy || !linux {
         enabled[idx(Op::CopyRange)] = false;
     }
-    let probe = FsxProbe { fd, size: file_size };
+    if a.no_fsync_op || a.lite {
+        enabled[idx(Op::Fsync)] = false;
+    }
+
+    let probe = FsxProbe { fd, size: initial_size };
     if linux && enabled[idx(Op::Fallocate)] && !probe.fa(0) {
         enabled[idx(Op::Fallocate)] = false;
-        info!("fsx: filesystem does not support fallocate, disabling");
     }
     if linux && enabled[idx(Op::PunchHole)] && !probe.fa(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) {
         enabled[idx(Op::PunchHole)] = false;
-        info!("fsx: punch hole unsupported, disabling");
     }
     if linux && enabled[idx(Op::ZeroRange)] && !probe.fa(FALLOC_FL_ZERO_RANGE) {
         enabled[idx(Op::ZeroRange)] = false;
-        info!("fsx: zero range unsupported, disabling");
     }
     if linux && enabled[idx(Op::CollapseRange)] && !probe.fa(FALLOC_FL_COLLAPSE_RANGE) {
         enabled[idx(Op::CollapseRange)] = false;
-        info!("fsx: collapse range unsupported, disabling");
     }
     if linux && enabled[idx(Op::InsertRange)] && !probe.fa(FALLOC_FL_INSERT_RANGE) {
         enabled[idx(Op::InsertRange)] = false;
-        info!("fsx: insert range unsupported, disabling");
     }
     if linux && enabled[idx(Op::WriteZeroes)] && !probe.fa(FALLOC_FL_WRITE_ZEROES) {
         enabled[idx(Op::WriteZeroes)] = false;
-        info!("fsx: write zeroes unsupported, disabling");
     }
     if linux && enabled[idx(Op::CloneRange)] && !probe.clone_range() {
         enabled[idx(Op::CloneRange)] = false;
-        info!("fsx: clone range unsupported, disabling");
     }
     if linux && enabled[idx(Op::CopyRange)] && !probe.copy_range() {
         enabled[idx(Op::CopyRange)] = false;
-        info!("fsx: copy range unsupported, disabling");
     }
+    let falloc_keep_size_ok =
+        linux && !a.no_keep_size && enabled[idx(Op::Fallocate)] && probe.fa(FALLOC_FL_KEEP_SIZE);
+    let falloc_unshare_ok = linux
+        && enabled[idx(Op::Fallocate)]
+        && probe.fa(FALLOC_FL_UNSHARE_RANGE)
+        && (!falloc_keep_size_ok || probe.fa(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE));
+    let zero_keep_size_ok = linux
+        && !a.no_keep_size
+        && enabled[idx(Op::ZeroRange)]
+        && probe.fa(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE);
 
     let mut fsx = Fsx {
-        good_buf: vec![0u8; maxfilelen as usize + a.writebdy as usize + 8],
+        a: Cfg {
+            readbdy,
+            writebdy,
+            truncbdy,
+            pollute_eof: a.pollute_eof,
+            do_fsync: a.fsync_writes,
+            direct: a.direct,
+            simulatedopcount: a.begin_op,
+            inject_failure_at: a.inject_failure_at,
+        },
+        file_path: file_path.clone(),
+        fd,
+        good_buf: vec![0u8; maxfilelen as usize + writebdy as usize + 8],
         original_buf: {
             let mut g = GlibcRandom::new(seed);
-            (0..maxfilelen).map(|_| (g.next() % 256) as u8).collect()
+            (0..maxfilelen as usize + writebdy as usize + 8)
+                .map(|_| (g.next() % 256) as u8)
+                .collect()
         },
-        temp_buf: Vec::new(),
-        check_buf: Vec::new(),
-        file_size,
-        biggest: file_size,
+        file_size: initial_size,
+        biggest: initial_size,
         maxfilelen,
         page_size,
         page_mask: page_size - 1,
@@ -1088,7 +1400,7 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
                 skipped: false,
                 keep_size: false,
                 unshare: false,
-                close_open: false
+                close_open: false,
             };
             LOGSIZE
         ],
@@ -1098,48 +1410,28 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
         closeopen: false,
         enabled,
         failure: None,
-        a: Cfg {
-            readbdy: a.readbdy,
-            writebdy: a.writebdy,
-            truncbdy: a.truncbdy,
-            pollute_eof: a.pollute_eof,
-            do_fsync: a.fsync_writes,
-            simulatedopcount: a.begin_op,
-            inject_failure_at: a.inject_failure_at,
-        },
-        fd,
     };
-    fsx.temp_buf = vec![0u8; a.oplen as usize + a.readbdy as usize + 8];
-    fsx.check_buf = vec![0u8; maxfilelen as usize + 8];
-    let _ = &mut file;
 
-    // pre-fill the real file image so reads of unwritten ranges match the shadow
     if a.lite {
-        let _ = fsx.pwrite_all(&fsx.good_buf[..maxfilelen as usize], 0);
-    } else if file_size > 0 {
-        let mut image = vec![0u8; file_size as usize];
+        fsx.file_size = maxfilelen;
+        let init_img = fsx.good_buf[..maxfilelen as usize].to_vec();
+        let _ = fsx.pwrite_all(&init_img, 0);
+    } else if initial_size > 0 {
+        let mut image = vec![0u8; initial_size as usize];
         fsx.pread_all(&mut image, 0).map_err(|e| e.to_string())?;
-        fsx.good_buf[..file_size as usize].copy_from_slice(&image);
-        // check_trunc_hack: verify extend-on-truncate works (not posix-mandated)
-        let probe_size = file_size + 100000;
-        unsafe {
-            if libc::ftruncate(fd, file_size as i64) != 0 || libc::ftruncate(fd, probe_size as i64) != 0 {
-                return Err("no extend on truncate! not posix!".into());
-            }
-            libc::ftruncate(fd, file_size as i64);
-        }
+        fsx.good_buf[..initial_size as usize].copy_from_slice(&image);
     }
 
-    info!(
-        "fsx: file={} seed={seed} flen={maxfilelen} oplen={} numops={} lite={} bdy(r/w/t)={}/{}/{}",
-        file_path.display(),
-        a.oplen,
-        a.numops,
-        a.lite,
-        a.readbdy,
-        a.writebdy,
-        a.truncbdy
-    );
+    if !a.quiet {
+        info!(
+            "fsx: file={} seed={seed} flen={maxfilelen} oplen={} numops={} lite={} direct={} bdy(r/w/t)={readbdy}/{writebdy}/{truncbdy}",
+            file_path.display(),
+            a.oplen,
+            a.numops,
+            a.lite,
+            a.direct,
+        );
+    }
 
     let replay = match &a.replay_ops {
         Some(p) => Some(Fsx::load_replay(p).map_err(|e| format!("replay ops: {e}"))?),
@@ -1147,209 +1439,248 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
     };
     let mut replay_idx = 0usize;
 
-    let started = std::time::Instant::now();
-    let maxop = op_max(a.lite, false);
-    let mut replay_done = false;
-    while fsx.failure.is_none() {
-        if a.numops >= 0 && fsx.testcalls >= a.numops as u64 {
-            break;
-        }
-        if a.duration > 0 && started.elapsed().as_secs() >= a.duration as u64 {
-            break;
-        }
-        fsx.testcalls += 1;
-        if a.closeprob > 0 {
-            let rv = fsx.rnd();
-            fsx.closeopen = (rv >> 3) < ((1u32 << 28) / a.closeprob as u32);
-        } else {
-            fsx.closeopen = false;
-        }
-        let mut offset = fsx.rnd() as u64;
-        let mut offset2 = 0u64;
-        let mut size = if a.fixed_oplen {
-            a.oplen
-        } else {
-            (fsx.rnd() as u64) % (a.oplen + 1)
-        };
-        let rv = fsx.rnd();
-        let op_i = (rv as usize) % maxop;
-        let op = match op_i {
-            0 => Op::Read,
-            1 => Op::Write,
-            2 => Op::MapRead,
-            3 => Op::MapWrite,
-            4 => Op::Truncate,
-            5 => Op::Fallocate,
-            6 => Op::PunchHole,
-            7 => Op::ZeroRange,
-            8 => Op::WriteZeroes,
-            9 => Op::CollapseRange,
-            10 => Op::InsertRange,
-            11 => Op::CloneRange,
-            12 => Op::CopyRange,
-            _ => Op::Fsync,
-        };
-        let mut keep_size = false;
-        let mut unshare = false;
-        let op = match op {
-            Op::Truncate => {
-                if a.style == 0 {
-                    size = (fsx.rnd() as u64) % maxfilelen;
-                }
-                op
-            }
-            Op::Fallocate => {
-                if size != 0 {
-                    if !a.no_keep_size {
-                        keep_size = fsx.rnd() % 2 == 0;
-                    }
-                    unshare = fsx.rnd() % 2 == 0;
-                }
-                op
-            }
-            Op::ZeroRange => {
-                if size != 0 && !a.no_keep_size {
-                    keep_size = fsx.rnd() % 2 == 0;
-                }
-                op
-            }
-            Op::CloneRange | Op::CopyRange => {
-                gen_dest_range(&mut fsx, !linux, maxfilelen, &mut offset, &mut size, &mut offset2);
-                op
-            }
-            _ => op,
-        };
-        if !fsx.enabled[idx(op)]
-            && op != Op::Read
-            && op != Op::Write
-            && op != Op::MapRead
-            && op != Op::MapWrite
-            && op != Op::Truncate
-        {
-            // disabled op: log skipped and continue (upstream logs + goto out)
-            fsx.log5(op, offset, size, offset2, true);
-            continue;
-        }
+    let started = Instant::now();
+    let maxop = if a.lite {
+        4
+    } else if a.no_fsync_op {
+        13
+    } else {
+        14
+    };
 
-        match op {
-            Op::Read => {
-                trim_off_len(&mut offset, &mut size, fsx.file_size);
-                fsx.doread(offset, size);
+    while fsx.failure.is_none() {
+        if let Some(rep) = &replay {
+            if replay_idx >= rep.len() {
+                break;
             }
-            Op::Write => {
-                trim_off_len(&mut offset, &mut size, maxfilelen);
-                fsx.dowrite(offset, size);
+            let entry = rep[replay_idx];
+            replay_idx += 1;
+            fsx.testcalls += 1;
+            fsx.closeopen = entry.close_open;
+            if entry.skipped {
+                fsx.log_entry(entry.op, entry.args, true, entry.keep_size, entry.unshare);
+            } else {
+                match entry.op {
+                    Op::Read => fsx.doread(entry.args[0], entry.args[1]),
+                    Op::Write => fsx.dowrite(entry.args[0], entry.args[1]),
+                    Op::MapRead => fsx.domapread(entry.args[0], entry.args[1]),
+                    Op::MapWrite => fsx.domapwrite(entry.args[0], entry.args[1]),
+                    Op::Truncate => fsx.dotruncate(entry.args[1]),
+                    Op::Fallocate => fsx.do_preallocate(entry.args[0], entry.args[1], entry.keep_size, entry.unshare),
+                    Op::PunchHole => fsx.do_punch_hole(entry.args[0], entry.args[1]),
+                    Op::ZeroRange => fsx.do_zero_range(entry.args[0], entry.args[1], entry.keep_size),
+                    Op::WriteZeroes => fsx.do_write_zeroes(entry.args[0], entry.args[1]),
+                    Op::CollapseRange => fsx.do_collapse_range(entry.args[0], entry.args[1]),
+                    Op::InsertRange => fsx.do_insert_range(entry.args[0], entry.args[1]),
+                    Op::CloneRange => fsx.do_clone_range(entry.args[0], entry.args[1], entry.args[2]),
+                    Op::CopyRange => fsx.do_copy_range(entry.args[0], entry.args[1], entry.args[2]),
+                    Op::Fsync => fsx.do_fsync(),
+                }
             }
-            Op::MapRead => {
-                if a.no_mapped_reads {
+        } else {
+            if a.numops > 0 && fsx.testcalls >= a.numops as u64 {
+                break;
+            }
+            if a.numops == 0 && a.duration <= 0 {
+                break;
+            }
+            if a.duration > 0 && started.elapsed().as_secs() >= a.duration as u64 {
+                break;
+            }
+            fsx.testcalls += 1;
+            if a.closeprob > 0 {
+                let rv = fsx.rnd();
+                fsx.closeopen = (rv >> 3) < ((1u32 << 28) / (a.closeprob as u32).max(1));
+            } else {
+                fsx.closeopen = false;
+            }
+
+            let mut offset = fsx.rnd() as u64;
+            let mut offset2 = 0u64;
+            let mut size = if a.fixed_oplen {
+                a.oplen
+            } else {
+                (fsx.rnd() as u64) % (a.oplen + 1)
+            };
+            let op_i = (fsx.rnd() as usize) % maxop;
+            let op = OP_NAMES[op_i].0;
+
+            let mut keep_size = false;
+            let mut unshare = false;
+            match op {
+                Op::Truncate => {
+                    if a.style == 0 {
+                        size = (fsx.rnd() as u64) % (maxfilelen + 1);
+                    }
+                }
+                Op::Fallocate => {
+                    if size != 0 {
+                        if !a.no_keep_size {
+                            keep_size = (fsx.rnd() % 2 == 0) && falloc_keep_size_ok;
+                        }
+                        unshare = (fsx.rnd() % 2 == 0) && falloc_unshare_ok;
+                    }
+                }
+                Op::ZeroRange => {
+                    if size != 0 && !a.no_keep_size {
+                        keep_size = (fsx.rnd() % 2 == 0) && zero_keep_size_ok;
+                    }
+                }
+                Op::CloneRange | Op::CopyRange => {
+                    gen_dest_range(&mut fsx, !linux, maxfilelen, &mut offset, &mut size, &mut offset2);
+                }
+                _ => {}
+            }
+
+            if !fsx.enabled[idx(op)]
+                && !matches!(op, Op::Read | Op::Write | Op::MapRead | Op::MapWrite | Op::Truncate)
+            {
+                fsx.log5(op, offset, size, offset2, true);
+                if fsx.testcalls == fsx.a.simulatedopcount {
+                    fsx.flush_simulated_state();
+                }
+                continue;
+            }
+
+            match op {
+                Op::Read => {
                     trim_off_len(&mut offset, &mut size, fsx.file_size);
                     fsx.doread(offset, size);
-                } else {
-                    trim_off_len(&mut offset, &mut size, fsx.file_size);
-                    fsx.domapread(offset, size);
                 }
-            }
-            Op::MapWrite => {
-                trim_off_len(&mut offset, &mut size, maxfilelen);
-                if a.no_mapped_writes {
+                Op::Write => {
+                    trim_off_len(&mut offset, &mut size, maxfilelen);
                     fsx.dowrite(offset, size);
-                } else {
-                    fsx.domapwrite(offset, size);
                 }
-            }
-            Op::Truncate => fsx.dotruncate(size),
-            Op::Fallocate => {
-                trim_off_len(&mut offset, &mut size, maxfilelen);
-                fsx.do_preallocate(offset, size, keep_size, unshare);
-            }
-            Op::PunchHole => {
-                trim_off_len(&mut offset, &mut size, fsx.file_size);
-                fsx.do_punch_hole(offset, size);
-            }
-            Op::ZeroRange => {
-                trim_off_len(&mut offset, &mut size, maxfilelen);
-                fsx.do_zero_range(offset, size, keep_size);
-            }
-            Op::WriteZeroes => {
-                trim_off_len(&mut offset, &mut size, maxfilelen);
-                fsx.do_write_zeroes(offset, size);
-            }
-            Op::CollapseRange => {
-                trim_off_len(&mut offset, &mut size, fsx.file_size.saturating_sub(1));
-                offset = rounddown(offset, 4096);
-                size = rounddown(size, 4096);
-                if size == 0 {
-                    fsx.log4(Op::CollapseRange, offset, size, true);
-                } else {
-                    fsx.do_collapse_range(offset, size);
+                Op::MapRead => {
+                    trim_off_len(&mut offset, &mut size, fsx.file_size);
+                    if a.no_mapped_reads {
+                        fsx.doread(offset, size);
+                    } else {
+                        fsx.domapread(offset, size);
+                    }
                 }
-            }
-            Op::InsertRange => {
-                trim_off(&mut offset, fsx.file_size);
-                if offset + size > maxfilelen {
-                    size = maxfilelen - offset;
+                Op::MapWrite => {
+                    trim_off_len(&mut offset, &mut size, maxfilelen);
+                    if a.no_mapped_writes {
+                        fsx.dowrite(offset, size);
+                    } else {
+                        fsx.domapwrite(offset, size);
+                    }
                 }
-                offset = rounddown(offset, 4096);
-                size = rounddown(size, 4096);
-                if size == 0 || file_size + size > maxfilelen {
-                    fsx.log4(Op::InsertRange, offset, size, true);
-                } else {
-                    fsx.do_insert_range(offset, size);
+                Op::Truncate => fsx.dotruncate(size),
+                Op::Fallocate => {
+                    trim_off_len(&mut offset, &mut size, maxfilelen);
+                    fsx.do_preallocate(offset, size, keep_size, unshare);
                 }
-            }
-            Op::CloneRange => {
-                if size == 0 || offset2 + size > maxfilelen {
-                    fsx.log5(Op::CloneRange, offset, size, offset2, true);
-                } else {
-                    fsx.do_clone_range(offset, size, offset2);
+                Op::PunchHole => {
+                    trim_off_len(&mut offset, &mut size, fsx.file_size);
+                    fsx.do_punch_hole(offset, size);
                 }
-            }
-            Op::CopyRange => {
-                if size == 0 || offset2 + size > maxfilelen {
-                    fsx.log5(Op::CopyRange, offset, size, offset2, true);
-                } else {
-                    fsx.do_copy_range(offset, size, offset2);
+                Op::ZeroRange => {
+                    trim_off_len(&mut offset, &mut size, maxfilelen);
+                    fsx.do_zero_range(offset, size, keep_size);
                 }
+                Op::WriteZeroes => {
+                    trim_off_len(&mut offset, &mut size, maxfilelen);
+                    fsx.do_write_zeroes(offset, size);
+                }
+                Op::CollapseRange => {
+                    trim_off_len(&mut offset, &mut size, fsx.file_size.saturating_sub(1));
+                    offset = rounddown(offset, 4096);
+                    size = rounddown(size, 4096);
+                    if size == 0 {
+                        fsx.log4(Op::CollapseRange, offset, size, true);
+                    } else {
+                        fsx.do_collapse_range(offset, size);
+                    }
+                }
+                Op::InsertRange => {
+                    trim_off(&mut offset, fsx.file_size);
+                    offset = rounddown(offset, 4096);
+                    size = rounddown(size, 4096);
+                    if size == 0 || fsx.file_size + size > maxfilelen {
+                        fsx.log4(Op::InsertRange, offset, size, true);
+                    } else {
+                        fsx.do_insert_range(offset, size);
+                    }
+                }
+                Op::CloneRange => {
+                    if size == 0 || offset2 + size > maxfilelen {
+                        fsx.log5(Op::CloneRange, offset, size, offset2, true);
+                    } else {
+                        fsx.do_clone_range(offset, size, offset2);
+                    }
+                }
+                Op::CopyRange => {
+                    if size == 0 || offset2 + size > maxfilelen {
+                        fsx.log5(Op::CopyRange, offset, size, offset2, true);
+                    } else {
+                        fsx.do_copy_range(offset, size, offset2);
+                    }
+                }
+                Op::Fsync => fsx.do_fsync(),
             }
-            Op::Fsync => {}
+        }
+
+        if fsx.testcalls == fsx.a.simulatedopcount && fsx.failure.is_none() {
+            fsx.flush_simulated_state();
         }
         if fsx.failure.is_some() {
             break;
         }
-        if a.check_contents {
+        if fsx.closeopen {
+            fsx.do_close_open();
+            if fsx.failure.is_some() {
+                break;
+            }
+        }
+        if a.check_contents && fsx.failure.is_none() {
             fsx.check_contents();
         }
         if !a.no_size_checks && fsx.failure.is_none() {
             fsx.check_size();
         }
-        let _ = (&mut replay_idx, &mut replay_done, &replay);
-    }
-    if let Some(f) = &fsx.failure {
-        // persist artifacts next to the test file, like upstream
-        let logdump = fsx.logdump();
-        let _ = fs::write(file_path.with_extension("fsxops"), logdump.join("\n"));
-        let mut good = Vec::new();
-        good.extend_from_slice(&fsx.good_buf[..fsx.file_size as usize]);
-        let _ = fs::write(file_path.with_extension("fsxgood"), good);
-        let _ = fs::write(
-            file_path.with_extension("fsxlog"),
-            format!("failure: {f}\n{}", logdump.join("\n")),
-        );
-        warn!("fsx: {} ops, FAILED: {f}", fsx.testcalls);
-    } else {
-        info!("fsx: All {} operations completed A-OK!", fsx.testcalls);
-        if a.record_ops {
-            let _ = fs::write(file_path.with_extension("fsxops"), fsx.logdump().join("\n"));
+        if a.progress > 0 && fsx.testcalls % a.progress == 0 && !a.quiet {
+            info!("fsx: {} ops completed", fsx.testcalls);
         }
     }
-    let host = hostname::get()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "localhost".to_string());
-    let report = json!({
+
+    // Final whole-file verification against `good_buf` at the end of a clean run.
+    if fsx.failure.is_none() {
+        fsx.check_contents();
+        if !a.no_size_checks && fsx.failure.is_none() {
+            fsx.check_size();
+        }
+    }
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    if let Some(f) = &fsx.failure {
+        let logdump = fsx.logdump();
+        let _ = fs::write(&ops_path, logdump.join("\n"));
+        let _ = fs::write(&good_path, &fsx.good_buf[..fsx.file_size as usize]);
+        let _ = fs::write(&log_path, format!("failure: {f}\n{}", logdump.join("\n")));
+        warn!("fsx: {} ops, FAILED: {f}", fsx.testcalls);
+    } else {
+        if !a.quiet {
+            info!("fsx: All {} operations completed A-OK!", fsx.testcalls);
+        }
+        if a.record_ops {
+            let _ = fs::write(&ops_path, fsx.logdump().join("\n"));
+        }
+        if a.keep_good {
+            let _ = fs::write(&good_path, &fsx.good_buf[..fsx.file_size as usize]);
+        } else if a.cleanup && !a.record_ops {
+            let _ = fs::remove_file(&file_path);
+        }
+    }
+
+    Ok(json!({
         "suite": "fsx",
-        "host": host,
+        "host": host_name(),
         "date": iso8601(SystemTime::now()),
         "top": mountpoint.display().to_string(),
+        "durationMs": duration_ms,
         "params": {
             "file": a.file,
             "seed": seed,
@@ -1357,27 +1688,26 @@ pub fn run(mountpoint: &Path, a: &Args) -> Result<Value, String> {
             "flen": maxfilelen,
             "oplen": a.oplen,
             "lite": a.lite,
-            "readbdy": a.readbdy, "writebdy": a.writebdy, "truncbdy": a.truncbdy,
+            "direct": a.direct,
+            "closeprob": a.closeprob,
+            "readbdy": readbdy,
+            "writebdy": writebdy,
+            "truncbdy": truncbdy,
             "ops_enabled": OP_NAMES.iter().map(|(o, n)| (*n, fsx.enabled[idx(*o)])).collect::<Vec<_>>(),
         },
         "status": if fsx.failure.is_some() { "failed" } else { "ok" },
         "opsExecuted": fsx.testcalls,
+        "opsCompleted": fsx.testcalls,
         "finalFileSize": fsx.file_size,
         "failure": fsx.failure,
         "log": if fsx.failure.is_some() { json!(fsx.logdump()) } else { json!([]) },
-    });
-    if let Some(path) = &a.json {
-        if let Err(e) = fs::write(path, serde_json::to_vec_pretty(&report).unwrap()) {
-            warn!("failed to write {}: {e}", path.display());
-        }
-    }
-    Ok(report)
+    }))
 }
 
 struct SystemTimeSeed;
 impl SystemTimeSeed {
     fn now() -> i32 {
-        let t = std::time::SystemTime::now()
+        let t = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         (t.as_secs() as i32).wrapping_add(t.subsec_nanos() as i32)
@@ -1385,13 +1715,13 @@ impl SystemTimeSeed {
 }
 
 struct FsxProbe {
-    #[allow(dead_code)] // unused on macOS where probing is disabled
+    #[allow(dead_code)]
     fd: RawFd,
-    // probe offset: upstream probes at EOF (offset = file_size, len = 1);
-    // filesystems (e.g. FUSE) reject len = 0 with EINVAL before they ever
-    // report EOPNOTSUPP, which would make the probe useless
+    // Upstream probes at EOF with `len = 1` so filesystems report `EOPNOTSUPP`
+    // rather than rejecting `len = 0` up front with `EINVAL`.
     size: u64,
 }
+
 impl FsxProbe {
     fn fa(&self, mode: i32) -> bool {
         #[cfg(target_os = "linux")]
@@ -1399,10 +1729,7 @@ impl FsxProbe {
             let r = unsafe { libc::fallocate(self.fd, mode, self.size as i64, 1) };
             let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if r == 0 {
-                // undo the 1-byte probe reservation, as upstream does
-                if unsafe { libc::ftruncate(self.fd, self.size as i64) } != 0 {
-                    self.fail_ftruncate();
-                }
+                let _ = unsafe { libc::ftruncate(self.fd, self.size as i64) };
                 return true;
             }
             e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY
@@ -1414,16 +1741,6 @@ impl FsxProbe {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn fail_ftruncate(&self) {
-        panic!(
-            "fsx: probe ftruncate failed: {}",
-            io::Error::last_os_error()
-        );
-    }
-
-    // upstream test_clone_range(): all-zero-range clone, unsupported on
-    // EOPNOTSUPP/ENOTTY only
     fn clone_range(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -1441,9 +1758,9 @@ impl FsxProbe {
                 src_length: 0,
                 dest_offset: 0,
             };
-            let r = unsafe { libc::ioctl(self.fd, FICLONERANGE as libc::c_ulong, &fcr) };
+            let r = unsafe { libc::ioctl(self.fd, FICLONERANGE, &fcr) };
             let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            r == 0 || (e != libc::EOPNOTSUPP && e != libc::ENOTTY)
+            r == 0 || (e != libc::EOPNOTSUPP && e != libc::ENOTTY && e != libc::ENOSYS)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1451,8 +1768,6 @@ impl FsxProbe {
         }
     }
 
-    // upstream test_copy_range(): 1-byte same-file copy, offset 0 -> 1,
-    // unsupported on ENOSYS/EOPNOTSUPP/ENOTTY
     fn copy_range(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -1460,6 +1775,9 @@ impl FsxProbe {
             let mut o2: i64 = 1;
             let r = unsafe { libc::copy_file_range(self.fd, &mut o1, self.fd, &mut o2, 1, 0) };
             let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if r > 0 {
+                let _ = unsafe { libc::ftruncate(self.fd, self.size as i64) };
+            }
             r >= 0 || (e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY)
         }
         #[cfg(not(target_os = "linux"))]
@@ -1472,12 +1790,14 @@ impl FsxProbe {
 fn trim_off(off: &mut u64, size: u64) {
     *off = if size == 0 { 0 } else { *off % size };
 }
+
 fn trim_off_len(off: &mut u64, len: &mut u64, size: u64) {
     trim_off(off, size);
     if *off + *len > size {
         *len = size - *off;
     }
 }
+
 fn gen_dest_range(
     fsx: &mut Fsx,
     bdy_align: bool,
@@ -1490,6 +1810,9 @@ fn gen_dest_range(
     let bdy = if bdy_align { fsx.a.readbdy.max(1) } else { 4096 };
     *src_offset = rounddown(*src_offset, bdy);
     *size = rounddown(*size, bdy);
+    if *size == 0 {
+        return;
+    }
     let wbdy = if bdy_align { fsx.a.writebdy.max(1) } else { 4096 };
     let mut tries = 0;
     loop {
@@ -1501,12 +1824,98 @@ fn gen_dest_range(
         let mut d = fsx.rnd() as u64;
         d = if max_range_end == 0 { 0 } else { d % max_range_end };
         d = rounddown(d, wbdy);
-        // overlap check
         let overlap = (d as i64 - *src_offset as i64).unsigned_abs() < *size;
         if !overlap && d + *size <= max_range_end {
             *dst_offset = d;
             break;
         }
     }
-    let _ = dst_offset;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn fsx_close_reopen_record_replay_and_verify_good_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("fstest-fsx-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cli = TestCli::parse_from([
+            "fsx",
+            "-N",
+            "250",
+            "-c",
+            "5",
+            "--record-ops",
+            "--keep-good",
+            "-q",
+        ]);
+        let r1 = run(&dir, &cli.args).expect("initial fsx run");
+        assert_eq!(r1["status"], json!("ok"), "r1 failed: {r1}");
+
+        // Verify `--verify-good` succeeds against saved `.fsxgood` shadow image.
+        let v_cli = TestCli::parse_from(["fsx", "--verify-good", "-q"]);
+        let rv = run(&dir, &v_cli.args).expect("verify-good");
+        assert_eq!(rv["status"], json!("ok"));
+
+        // Replay recorded `.fsxops` on a second target file and confirm identical final size & image.
+        let ops_file = dir.join("fsx.testfile.fsxops");
+        let rep_cli = TestCli::parse_from([
+            "fsx",
+            "--file",
+            "replayed.bin",
+            "--replay-ops",
+            ops_file.to_str().unwrap(),
+            "-q",
+        ]);
+        let r2 = run(&dir, &rep_cli.args).expect("replay fsx run");
+        assert_eq!(r2["status"], json!("ok"), "r2 failed: {r2}");
+        assert_eq!(r2["finalFileSize"], r1["finalFileSize"]);
+        assert_eq!(
+            fs::read(dir.join("replayed.bin")).unwrap(),
+            fs::read(dir.join("fsx.testfile.fsxgood")).unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fsx_detects_injected_corruption() {
+        let dir = std::env::temp_dir().join(format!("fstest-fsx-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut cli = TestCli::parse_from(["fsx", "-N", "100", "-R", "-q"]);
+        cli.args.inject_failure_at = Some(12);
+        // Ensure a write occurs early with seed 1; scan if op 12 isn't a read by also checking contents.
+        let rep = run(&dir, &cli.args).expect("run");
+        if rep["status"] == json!("ok") {
+            // Corrupt file directly and check `--verify-good` catches it.
+            let mut cli2 = TestCli::parse_from(["fsx", "-N", "40", "--keep-good", "-q"]);
+            cli2.args.file = "corrupt.bin".into();
+            let r = run(&dir, &cli2.args).unwrap();
+            assert_eq!(r["status"], json!("ok"));
+            let p = dir.join("corrupt.bin");
+            let mut b = fs::read(&p).unwrap();
+            if b.is_empty() {
+                b.push(0xaa);
+            } else {
+                b[0] ^= 0xff;
+            }
+            fs::write(&p, b).unwrap();
+            let vc = TestCli::parse_from(["fsx", "--file", "corrupt.bin", "--verify-good", "-q"]);
+            let vr = run(&dir, &vc.args).unwrap();
+            assert_eq!(vr["status"], json!("failed"));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -2,14 +2,31 @@
 
 Filesystem functional & benchmark test suites.
 
-One Rust binary that ports and wraps the community's filesystem test tools as uniform subcommands: `fstest <suite> [OPTIONS] <MOUNTPOINT>` (options via `fstest <suite> --help`). Logs go to stderr (level via `RUST_LOG`), the final result is emitted as JSON on stdout — `--json <file>` writes a copy — and the exit code is 0 only when every phase reports ok.
+One Rust binary that ports and wraps the community's filesystem test tools as uniform subcommands: `fstest <suite> [OPTIONS] <MOUNTPOINT>` (options via `fstest <suite> --help`). Logs go to stderr (level via `RUST_LOG` or `-v`/`--verbose`), the final result is emitted as JSON on stdout — `--json <file>` writes a copy — and the exit code is 0 only when every phase reports ok.
 
 | | suites |
 |---|---|
 | benchmark | [smallfile](#smallfile) · [fsmark](#fsmark) · [fio](#fio) · [mdtest](#mdtest) · [mdworkbench](#mdworkbench) |
-| functional | [pjdfstest](#pjdfstest) · [fsx](#fsx) · [fsstress](#fsstress) · [ltp](#ltp) · [stdfs](#stdfs) · [git](#git) · [sqlite](#sqlite) |
+| functional | [pjdfstest](#pjdfstest) · [errno-diff](#errno-diff) · [fsx](#fsx) · [fsstress](#fsstress) · [fsrand](#fsrand) · [ltp](#ltp) · [stdfs](#stdfs) · [git](#git) · [sqlite](#sqlite) |
+| packaging | [bundle](#bundle) (compile-time self-contained multi-platform binary) |
 
-Defaults policy: ported suites keep the upstream tools' defaults so numbers stay directly comparable; wrapped suites pick mount-point best-practice defaults instead of engine defaults that assume local block devices (see [Platform notes](#platform-notes)).
+### Self-contained single-binary build (`linux-x86_64` · `linux-aarch64` · `macos-aarch64`)
+
+A plain `cargo build --release` automatically builds, caches (`~/.cache/fstest/target-bundles/<os>-<arch>-v5/bundle.tar.gz`), and embeds **every external suite and runtime** directly into the `fstest` binary for the target platform — no post-build packing step or external prepare scripts required:
+
+- **macOS arm64 (`aarch64-apple-darwin`)**: `cargo build --release` (embeds 13/14 suites natively including `fio`, `git`, `stdfs`, `pjdfstest`, and `sqlite`; `ltp` reports `skip` cleanly on non-Linux).
+- **Linux x86_64 (`x86_64-unknown-linux-gnu` / `musl`) & arm64 (`aarch64-unknown-linux-gnu` / `musl`)**: `cargo build --release --target <triple>` (embeds all 14/14 suites including compiled `fio`, `ltp`, and `git`; when cross-compiling from macOS, `build.rs` automatically builds Linux C suites inside `debian:bullseye` via Docker for broad glibc ≥ 2.31 compatibility).
+- Pass `FSTEST_SKIP_BUNDLE=1` or `--no-default-features` during development when you want a lightweight build without embedding external suite assets.
+
+### Canonical JSON envelope & library embedding
+
+Every suite report is enriched with a uniform envelope (`schemaVersion: 1`):
+
+- `mount`: pre/post mountpoint liveness check (`healthy`, `fstype`, `devBefore`, `devAfter`, `disconnectReason`). If a FUSE daemon crashes mid-run (`ENOTCONN`), unmounts (`st_dev` changes), or wedges (`stat` > 5s), the report status is promoted to `mount_disconnected` instead of misreporting cascading `EIO`/`ENOENT` test failures.
+- `cases`: flat array of `{ id, outcome, detail }` (`outcome` ∈ `pass | fail | skip | blocked`) across every functional and benchmark suite.
+- `metrics`: flat numeric map (`f64`, with latencies normalized to `_ms` and rates to `_per_sec` / `iops` / `bw_mibps`) for automated budget regression checks.
+
+`fstest` also exposes `fstest::cli_main_from` and `fstest::try_run_helper_mode` as a Rust library crate (`src/lib.rs`) so external test harnesses can link all suites into a single multi-call binary.
 
 ## smallfile
 
@@ -19,7 +36,7 @@ Port of [distributed-system-analysis/smallfile](https://github.com/distributed-s
 cleanup → create → read(verified) → append → rename → delete-renamed → cleanup
 ```
 
-This mirrors running smallfile operation by operation; stonewall is disabled automatically for the multi-phase run (a stonewalled slow thread would starve later phases of files — smallfile's own regtest.sh disables it the same way). Single-operation mode (`--operation`) keeps stonewall on by default, matching upstream:
+Stonewall is disabled automatically for the default multi-phase run (and `finish_all_rq` is enforced on `create`/`mkdir`/`cleanup`/`swift-put` so subsequent phases never starve for files). Single-operation mode (`--operation`) keeps stonewall on by default, matching upstream:
 
 ```
 fstest smallfile --operation create --threads 4 --files 10000 /mnt/workspace
@@ -31,319 +48,245 @@ fstest smallfile --operation create --threads 4 --files 10000 /mnt/workspace
 | `--files <N>` | 200 | files per thread |
 | `--threads <N>` | 2 | threads |
 | `--file-size <KB>` | 64 | mean file size |
-| `--file-size-distribution <fixed\|exponential>` | fixed | the per-thread random seed is derived deterministically from (top, host, tid), so separate invocations replay identical size sequences |
+| `--file-size-distribution <fixed\|exponential>` | fixed | deterministic per-thread seed derived from `(top, host, tid)` |
 | `--record-size <KB>` | 0 (= file size) | I/O record size, capped at 1 MiB |
-| `--files-per-dir <N>` | 100 | files per directory (radix-named d_000…) |
+| `--files-per-dir <N>` | 100 | files per directory (`d_000…`) |
 | `--dirs-per-dir <N>` | 10 | subdirectories per directory |
 | `--stonewall <Y/N>` | Y | stop measuring once the first thread finishes |
-| `--finish <Y/N>` | N | finish remaining files after stonewall |
+| `--finish <Y/N>` | Y | finish remaining files after stonewall on mutating setup ops |
 | `--verify-read <Y/N>` | Y | read back and verify byte by byte |
-| `--fsync <Y/N>` | N | fsync after each file is written |
-| `--same-dir <Y/N>` | N | all threads share one directory tree (filenames carry tid/host) |
-| `--hash-into-dirs <Y/N>` | N | hash file numbers into directory names (h_000…); readdir/ls-l unsupported in this mode |
-| `--pause <USEC>` | 0 | pause between files |
-| `--auto-pause <Y/N>` | N | auto-tune the pause from response times (Little's law throttle) |
-| `--response-times <Y/N>` | N | record per-op response times to `<top>/network_shared/rsptimes_*.csv` |
-| `--xattr-size <B>` / `--xattr-count <N>` | 0 | xattr value size and count for xattr/swift operations |
-| `--record-ctime-size <Y/N>` | N | record create time + size as an xattr for await-create replication-latency measurement |
+| `--incompressible <Y/N>` | N | high-entropy SplitMix64 payload instead of 7-bit ASCII pattern |
+| `--fsync <Y/N>` | N | `fsync(2)` after each file is written |
+| `--same-dir <Y/N>` | N | all threads share one directory tree |
+| `--hash-into-dirs <Y/N>` | N | hash file numbers into directory names (`h_000…`); readdir/ls-l unsupported |
+| `--pause <USEC>` / `--auto-pause <Y/N>` | 0 / N | fixed or Little's-law adaptive inter-file throttle |
+| `--response-times <Y/N>` | N | write per-op response times to `<top>/network_shared/rsptimes_*.csv` |
+| `--xattr-size <B>` / `--xattr-count <N>` | 0 | xattr value size and count (`fsetxattr`/`fgetxattr`) |
+| `--record-ctime-size <Y/N>` / `--await-timeout <S>` | N / 60 | `await-create` replication-latency xattr & bounded poll timeout |
 | `--prefix` / `--suffix` | empty | filename prefix/suffix |
-
-Directory/file layout matches upstream: `<top>/file_srcdir/<host>/thrd_XX/d_000/_<host>_XX_N_`, with rename targets under `file_dstdir`. File contents are a deterministic pattern (k%128 with a per-file offset), so fstest interoperates with the python original both ways (python `--verify-read Y` validates files written by fstest and vice versa). Result aggregation follows smallfile's `output_results.py`: rates are summed per thread, elapsed is the max, status is the first non-ok thread. In single-operation mode the report has a top-level `results` instead of `phases`.
 
 ## fsmark
 
-Port of [fs_mark 3.3](https://github.com/josefbacik/fs_mark): a synchronous/async file-creation benchmark with per-system-call microsecond statistics. For each file it times creat, write, optional fsync and close separately (min/avg/max per iteration), then unlinks unless files are kept; the iteration rate and the application overhead (loop time minus measured syscall time) are reported, and the run ends with Average plus p50/p90/p99 files/sec.
+Port of [fs_mark 3.3](https://github.com/josefbacik/fs_mark): a synchronous/async file-creation benchmark with per-system-call microsecond statistics (`creat`, `write`, `fsync`, `close`, `unlink`, and `syncfs`).
 
-The positional mount point is the first test directory; pass `-d/--dir` repeatedly for more (thread k uses directory k%N, so the thread count must be an even multiple of the directory count, or directories are raised to the thread count). `-S` selects the sync method 0..6 (no sync, in-band fsync, sync()+single fsync, post-reverse fsync, sync+post-reverse, post-in-order, sync+post-in-order). `-D N` spreads files across N `%02x` subdirectories with a time-based hash policy; adding `-N files` switches to round-robin with a fixed file count per subdirectory. `-L N` runs N iterations (implies keeping files), `-k` keeps files, `-F` runs until the filesystem is full, and `-l <file>` appends the fs_mark-format text report to a log file. Unlike fs_mark, which always writes `fs_log.txt` into the current directory, fstest only writes the log when `-l` is given; the JSON report on stdout (and `--json`) is the primary record.
+The positional mount point is the first test directory; pass `-d/--dir` repeatedly for more. `-S` selects sync method `0..6` (no sync, in-band `fsync`, `syncfs`+single `fsync`, post-reverse `fsync`, `syncfs`+post-reverse, post-in-order, `syncfs`+post-in-order). `-D N` spreads files across `N` `%02x` subdirectories with a time-based hash policy; adding `-N files` switches to round-robin. `-L N` runs `N` iterations (implies keeping files), `-k` keeps files, `-F` runs until `ENOSPC`, `--incompressible` uses pseudo-random bytes instead of zeros, `-v/--verbose-stats` adds per-syscall min/avg/max columns to the text table, and `-l <file>` appends the `fs_mark`-format text report to a file.
 
 ```
 fstest fsmark -n 2000 -s 4096 -S 1 -D 8 -L 5 /mnt/workspace
 ```
 
-The text report (stderr log lines and the `-l` log file) matches fs_mark's column layout, including the `--verbose-stats` variant that adds per-syscall min/avg/max columns. The JSON report adds per-iteration aggregates, per-thread rows and the summary percentiles. fs_mark's per-iteration rates are truncated to integers and sorted descending for the percentiles, exactly like the C code.
-
 ## fio
 
-Thin wrapper around the system [fio](https://github.com/axboe/fio) binary (assumed to be in `PATH`, override with `--fio`): it maps the common best-practice knobs onto one fio invocation, always runs with JSON output (written to a temp file via `--output`, since fio's stdout can interleave non-JSON noise), and repackages the result into the standard fstest JSON envelope. Failures still produce a valid JSON report (`status: failed`, fio exit code, stderr tail).
+Pure pass-through to **compile-time embedded upstream [axboe/fio](https://github.com/axboe/fio)** (`fio-3.38`, zero target-host runtime dependencies; Linux links `libaio` statically alongside `io_uring` and disables `libnuma` so minimal hosts need neither `libaio.so.1` nor `libnuma.so.1`, and macOS uses `posixaio`/`psync`/`mmap`).
+
+- **Zero-option default matrix (`fstest fio <mnt>`)**: runs a **5-phase standard FUSE/cloud-FS benchmark matrix** (`seq-write` `1m`, `seq-read` `1m`, `rand-write` `4k`, `rand-read` `4k`, `rand-rw` `4k` 75/25) inside `<mnt>/.fstest-fio/` (probing `O_DIRECT`/`F_NOCACHE` support automatically) and cleans up afterwards.
+- **100% verbatim native `fio` pass-through (`fstest fio [FIO_OPTIONS...] <mnt>`)**: every native `fio` option or `.fio` job file is forwarded untouched to the embedded `fio` binary with `--directory=<mnt>` and `--output-format=json` (`--json <FILE>` is the only `fstest` envelope flag).
 
 ```
-fstest fio --rw randrw --bs 4k --size 1g --numjobs 4 --iodepth 32 --runtime 30 /mnt/workspace
+fstest fio /mnt/jfs                                                          # default 5-phase benchmark matrix
+fstest fio --rw=randrw --bs=4k --size=1g --numjobs=4 --iodepth=32 --runtime=30 --time_based --group_reporting=1 /mnt/jfs
+fstest fio --rw=randwrite --bs=4k --nrfiles=4 --filesize=16k --fdatasync=1 /mnt/jfs
+fstest fio workload.fio /mnt/jfs
+fstest fio -h                                                                # upstream fio --help + all 226 job options + engines
+fstest fio --cmdhelp=verify                                                  # detailed upstream docs for any option
 ```
-
-| Option | Default | Description |
-|---|---|---|
-| `--rw <pattern>` | randrw | read/write/randread/randwrite/rw/randrw |
-| `--bs <size>` | 4k | block size, fio syntax (4k, 1m, 4k,1m …) |
-| `--size <size>` | 256m | per-job file size |
-| `--numjobs <N>` | 4 | parallel jobs |
-| `--iodepth <N>` | 32 | queue depth per job |
-| `--ioengine <name>` | libaio (Linux), posixaio (macOS) | "auto" lets fio choose |
-| `--direct <Y/N>` | Y | O_DIRECT, bypass the page cache |
-| `--rwmixread <PCT>` | 75 | read share in rw/randrw |
-| `--runtime <SEC>` | 0 (size-based) | time-based run for N seconds (per fio job) |
-| `--group-reporting <Y/N>` | Y | aggregate per-job stats |
-| `--verify <METHOD>` | unset (off) | data-integrity check; the value is passed verbatim to fio `--verify` (crc32, md5, sha256, meta, pattern …; requires a write side in the workload) |
-| `--keep-files` | off | keep fio test files (unlinked by default) |
-| `--job <FILE>` | — | expert mode: pass a fio job file; fstest adds only `--directory` and output plumbing |
-| `--fio-arg <ARG>` | — | extra argument passed verbatim to fio (repeatable) |
-| `--fio <PATH>` | fio | binary to invoke |
-
-The report carries a normalized `summary` (with group reporting: the aggregated group entry) and per-`jobs` rows — read/write iops, bandwidth bytes, io bytes and completion-latency p50/p95/p99 in nanoseconds (both fio's `clat_ns` and the older `clat` layout are understood) — plus the full unmodified fio JSON under `raw`, so nothing upstream reports is lost. The fio version is detected and recorded for reproducibility.
 
 ## mdtest
 
-Behavior-level port of [mdtest](https://github.com/hpc/ior) (LLNL), single-node: MPI ranks become threads, `MPI_Barrier` becomes `std::sync::Barrier`. The directory tree layout (`test-dir.<iter>-<loop>/mdtest_tree.<n>`, item numbers encoding their directory), the rotating directory rename chain, per-rank rates with min/max/mean/sum aggregation across ranks, and the nstride phase-shift trick (each phase accesses items a different rank created, to defeat client caches) all follow the C implementation.
+Single-node threaded port of [mdtest](https://github.com/hpc/ior) (LLNL). Preserves upstream directory tree layout (`test-dir.<iter>-<loop>/mdtest_tree[.<rank>].<n>`), rotating directory rename chains, per-rank min/max/mean/sum aggregation, cross-rank stonewall wear-out top-up, and `-N` rank stride phase shifting. Any operational syscall error (`mkdir`/`open`/`write`/`fsync`/`stat`/`read`/`rename`/`unlink`/`rmdir`) increments `ioErrors` and marks the report `"failed"`.
 
 ```
 fstest mdtest -n 10000 -z 2 -b 4 --threads 4 /mnt/workspace
+fstest mdtest --threads 4 -u -z 2 -b 2 -I 50 -N 1 -w 4096 -e 4096 -X /mnt/workspace
 fstest mdtest -C -n 5000 -w 4096 /mnt/workspace   # create files with data
-fstest mdtest -E -n 5000 -e 4096 -X /mnt/workspace # read back and verify (separate invocation)
+fstest mdtest -E -n 5000 -e 4096 -X /mnt/workspace # read back and verify
 fstest mdtest -r -n 5000 /mnt/workspace            # remove-only cleanup
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--threads <N>` | 1 | number of ranks |
-| `-n/--items <N>` | 0 | items per rank (spread across the tree) |
-| `-I/--items-per-dir <N>` | 0 | items per directory instead |
+| `-n/--items <N>` | 1000 (if `-I` unset) | items per rank (spread across the tree) |
+| `-I/--items-per-dir <N>` | 0 | items per directory |
 | `-z/--depth`, `-b/--branch-factor` | 0, 1 | tree shape |
 | `-i/--iterations <N>` | 1 | iterations |
-| `-u/--unique-dir` | off | one tree per rank instead of a shared tree |
+| `-u/--unique-dir` | off | one `mdtest_tree.<rank>.0` hierarchy per rank |
 | `-F/--files-only`, `-D/--dirs-only` | both on | restrict to files or directories |
 | `-C/-T/-E/-r` | all on | only create/stat/read/remove phase |
 | `-U/--rename-dirs` | off | directory rename phase |
 | `-L/--leaf-only` | off | items only at the leaf level |
 | `-w/--write-bytes`, `-e/--read-bytes` | 0 | data bytes per item |
-| `-y/--sync-file`, `-Y/--sync-after-phase` | off | fsync per file / sync() per phase |
-| `-N/--nstride <N>` | 0 | rank shift between phases (1 avoids client caches) |
+| `-y/--sync-file`, `-Y/--sync-after-phase` | off | `fsync` per file / `syncfs` per phase |
+| `-N/--nstride <N>` | 0 | rank shift between phases (`1` avoids client caches) |
 | `-R/--random`, `--random-seed` | off | random stat order |
-| `-W/--stonewall <SEC>` | 0 | stop file creation after N seconds (branch factor <= 1) |
+| `-W/--stonewall <SEC>` | 0 | stonewall file creation timer with cross-rank wear-out (`-b <= 1`) |
 | `-B/--no-barriers`, `-p/--pre-delay` | off, 0 | phase sync control |
-| `-X` (`--verify-read`) | off | verify data on read (requires `-E` and `-e`, like upstream) |
-
-The report carries per-iteration per-rank times/rates plus a summary with `totalRate` (sum across ranks), `minRate`/`maxRate`/`meanRatePerRank` — mdtest's classic cross-rank statistics. Not ported: shared-file mode (`-S`), collective creates (`-c`), mknod, GPU options and the CSV exports (the JSON covers them).
+| `-X/--verify-read` | off | verify read data back byte-for-byte (requires read phase and `-e > 0`) |
 
 ## mdworkbench
 
-Behavior-level port of [md-workbench](https://github.com/hpc/ior) (Kunkl): a steady-state metadata benchmark over a fixed working set. `precreate` populates N objects per data set, the `benchmark` phase repeatedly stats/reads/deletes the oldest object and recreates a new one (FIFO; readers and writers are rank-shifted by `--offset`, so with 2+ threads each rank works on its neighbor's objects), and `cleanup` removes the remaining tail. Data sets live under `<mountpoint>/<out-dir>/<rank>_<d>/file-<i>`.
+Single-node threaded port of [md-workbench](https://github.com/hpc/ior): steady-state metadata & small-object QoS benchmark over a fixed FIFO working set (`precreate` → `benchmark-<i>` → `cleanup`). Persists `<out-dir>/md-workbench.status` (`current_index` + `seed`) when run without `-3` so split `-1` → `-2 -X` → `-3` runs stay aligned automatically.
 
 ```
-fstest mdworkbench -P 3000 -I 1000 -D 10 -S 3901 -R 3 --threads 2 /mnt/workspace
+fstest mdworkbench -P 3000 -I 1000 -D 10 -S 3901 -R 3 --threads 2 -X /mnt/workspace
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--threads <N>` | 1 | number of ranks |
-| `-I/--obj-per-proc <N>` | 1000 | benchmark ops per data set (<= precreate keeps the FIFO exact) |
+| `-I/--obj-per-proc <N>` | 1000 | benchmark ops per data set (`<= precreate` keeps the FIFO exact) |
 | `-P/--precreate-per-set <N>` | 3000 | objects precreated per data set |
 | `-D/--data-sets <N>` | 10 | data sets per rank |
 | `-S/--object-size <B>` | 3901 | object size |
 | `-R/--iterations <N>` | 3 | benchmark phase repetitions |
 | `-O/--offset <N>` | 1 | rank shift between readers and writers |
 | `-o/--out-dir <NAME>` | out | working directory under the mount point |
-| `-t/--waiting-time <F>` | 0 | sleep F×op-runtime after each op (throttle) |
-| `-w/--stonewall-timer <S>`, `-W` | 0, off | stop benchmark after S seconds; `-W` makes all ranks do the same count |
+| `-t/--waiting-time <F>` | 0 | sleep `F × op-runtime` after each op |
+| `-w/--stonewall-timer <S>`, `-W` | 0, off | stop benchmark after `S` seconds; `-W` aligns iteration counts across ranks |
 | `-1/-2/-3` | all on | run only precreate/benchmark/cleanup |
-| `--read-only` | off | benchmark without deletes/writes |
-| `-X` (`--verify-read`), `-G` (seed), `--start-item` | off/0 | verification and resume controls |
+| `--read-only` | off | benchmark stats+reads without deletes/writes |
+| `-y/--fsync` | off | `fsync` each created object |
+| `-X/--verify-read`, `-G` (seed), `--start-item` | off/0 | byte-level verification and resume controls |
 
-Per-phase output includes per-op latency percentiles (create/read/stat/delete p50/p90/p99), the max op time, cross-rank time balance and the object rates — the steady-state/QoS view mdtest does not provide. Byte-level interop with the C tool's data patterns is not provided (its `dataPacketType` layouts are not replicated); `-X` verification is self-consistent across invocations of this tool.
+Per-phase output reports aggregate and per-rank `p50`/`p90`/`p99`/`max` latencies (`create`, `read`, `stat`, `delete`), phase-specific `iops` (`4 × obj_read` in RW benchmark, `2 × obj_read` in `--read-only`, `dset + obj` in `precreate`/`cleanup`), `rateObjPerSec`, and `throughputMiBps` (`(obj_read + obj_create) × object_size`).
 
 ## pjdfstest
 
-POSIX conformance functional suite from [pjd/pjdfstest](https://github.com/pjd/pjdfstest) — the tool JuiceFS cites for its "8,789 tests" compatibility claim. The upstream shell tests (238 `.t` files, `misc.sh`, `conf`) are vendored under `vendor/pjdfstest/tests/` and **embedded into the binary at compile time**; at runtime each test is piped to `sh -c` with an inline prelude, so a single fstest binary runs the whole suite and nothing but the tests' own scratch files ever touches the filesystem under test (scratch dirs live under `<mount>/.fstest-pjdfstest/` and are removed afterwards). The upstream setuid `pjdfstest` C helper is reimplemented as the hidden `fstest __pjdfstest` mode and invoked through the current executable.
+POSIX conformance functional suite from [pjd/pjdfstest](https://github.com/pjd/pjdfstest) (238 `.t` files embedded at compile time; privileged syscall helper implemented as `fstest __pjdfstest` inside the same binary). Runs `.t` files concurrently across `-j/--jobs` isolated scratch directories under `<mount>/.fstest-pjdfstest/`.
 
 ```
-sudo fstest pjdfstest /mnt/jfs                      # full suite (root needed for chown/mknod cases)
-fstest pjdfstest --filter chmod --filter rename /t  # subset
-fstest pjdfstest --fs FUSE.JUICEFS /mnt/jfs         # force the fs name used by `supported()` gating
+sudo fstest pjdfstest /mnt/jfs                      # full suite in parallel (root needed for chown/mknod cases)
+fstest pjdfstest -j 8 --filter chmod --filter rename /t
+fstest pjdfstest --fs FUSE.JUICEFS /mnt/jfs
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--filter <SUBSTR>` | all | run only files whose path contains the substring (repeatable) |
-| `--fs <NAME>` | auto-detect | override the filesystem type for feature gating (e.g. `FUSE.JUICEFS`) |
-| `--os <NAME>` | auto-detect | override the OS name (`Darwin`, `Linux`, `FreeBSD`) |
-| `--timeout <SEC>` | 120 | per-file timeout |
+| `-j/--jobs <N>` | `min(CPU, 8)` | parallel `.t` worker count |
+| `--fs <NAME>` | auto-detect | override filesystem type for `supported()` gating (e.g. `FUSE.JUICEFS`, `EXT4`, `APFS`) |
+| `--os <NAME>` | auto-detect | override OS name (`Darwin`, `Linux`, `FreeBSD`) |
+| `--timeout <SEC>` | 120 | per-file process-group timeout |
 | `--keep` | off | keep scratch directories |
 
-Results are per-file TAP counts folded into the fstest JSON envelope (per-file `tests/passed/failed`, failing assertion lines, summary totals). Running as root is required for the chown/mknod/permission cases — without root those cases fail identically to upstream. Verification: the runner reproduces the native `pjdfstest` + `sh` + `prove` counts **exactly, per file**, on the same machine and configuration (238/238 files matched). With `os=Linux`, `fs=FUSE.JUICEFS` and root, the totals are directly comparable with JuiceFS's published `Files=237, Tests=8789` numbers. Runtime needs a POSIX `sh` plus basic utilities (`stat`, `df`, `dd`, `openssl` for name generation).
+## errno-diff
+
+Differential syscall & `errno` oracle comparing the target mountpoint against a local POSIX reference directory (`--ref-dir`, avoiding `tmpfs` so xattr/sparse/fallocate probes reflect real disk filesystems). Exercises **84 scenarios across families A–M** (`open` flags, `rename` atomicity/cycles, `unlink`/`rmdir`, `link`/`symlink`/`readlink`, `chmod`/`chown`/`utimensat`, `truncate`/`pread`/`pwrite`, byte-edge filenames, `readdir`, `xattr`, `flock`/`fcntl` locks, `fallocate`/`copy_file_range`/`SEEK_HOLE`/`SEEK_DATA`, and open-unlinked file I/O), plus optional cross-layer (`--alt-root`, family `X`) and git-workspace (`--git-ws-root`, family `W`) checks. Automatically enables `--strict-posix` when the target mountpoint is itself a local kernel filesystem (`ext4`, `xfs`, `btrfs`, `apfs`).
+
+```
+fstest errno-diff /mnt/jfs
+sudo fstest errno-diff --require-ext4 --table-out errno-matrix.txt /mnt/jfs
+fstest errno-diff --strict-posix /mnt/jfs
+fstest errno-diff --diverge-as-record --alt-root /mnt/jfs-observer /mnt/jfs
+```
 
 ## fsx
 
-Behavior-level port of [fsx](https://github.com/kdave/xfstests/blob/master/ltp/fsx.c) from xfstests (originally NeXT, 1991): a single-file data-integrity fuzzer. A shadow buffer tracks the expected file image; every operation (read/write/mapread/mapwrite/truncate/fallocate/punch hole/zero range/collapse/insert range/clone/copy range) is applied to both the shadow and the real file, and after every operation the size is verified and read-back data compared byte by byte. On mismatch fsx dumps the full operation log, saves the expected image (`<file>.fsxgood`), the operation record (`<file>.fsxops`, replayable via `--replay-ops`) and fails. The RNG is glibc's `random()` (TYPE_3), so the same `--seed` reproduces identical operation sequences to C fsx on Linux.
+Port of [fsx](https://github.com/kdave/xfstests/blob/master/ltp/fsx.c) from xfstests: single-file data-integrity fuzzer verified against an in-memory shadow buffer (`good_buf`). Exercises `read`, `write`, `mapread`, `mapwrite`, `truncate`, `fallocate` (with and without `KEEP_SIZE`), `punch_hole`, `zero_range`, `write_zeroes`, `collapse_range`, `insert_range`, `clone_range`, `copy_range`, periodic `fsync`, and `-c` close/reopen cache-flush cycles. Uses glibc's TYPE_3 `random()` so identical seeds replay deterministic sequences.
 
 ```
-fstest fsx -N 100000 -l 262144 /mnt/workspace
+fstest fsx -N 10000 -l 262144 -c 10 /mnt/workspace
+fstest fsx -N 5000 -Z --keep-good /mnt/workspace          # direct I/O + save <file>.fsxgood
+fstest fsx --verify-good --cleanup /mnt/workspace         # post-remount byte-for-byte durability check
+fstest fsx --record-ops /mnt/workspace                    # save <file>.fsxops
+fstest fsx --replay-ops /mnt/workspace/fsx.testfile.fsxops /mnt/workspace
 ```
 
-Key options mirror upstream: `-N` ops, `-l` max file size, `-o` max op size, `-S` seed, `-r/-w/-t` alignment boundaries, `-L` lite (no size changes), `-F/-H/-z/-C/-I/-J/-E` to disable fallocate/punch/zero/collapse/insert/clone/copy, `-R/-W` to disable mapped reads/writes, `-X` full-file compare every op, `-y` fsync per write, `-e` post-EOF pollution, `-c P` close+open probability, `--duration`. Not ported: AIO/io_uring backends, O_DIRECT, atomic/dontcache IO variants, dedupe/exchange-range ioctls and the dmlogwrites integrity mode (the JSON report and replay file cover the record/replay need). Verification includes injected-failure detection tests and clean runs on APFS (where punch hole is block-aligned and clipped to EOF per platform requirement).
+Key options: `-N` ops, `-l` max file size, `-o` max op size, `-S` seed, `-r/-w/-t` alignment boundaries, `-Z/--direct` (`O_DIRECT` + 4K bounce buffers on Linux, `F_NOCACHE` on macOS), `-b/--begin-op` simulated warm-up, `-c P` close+reopen probability (`1/P`), `-L` lite, `-F/-H/-z/-k/-C/-I/-J/-E/--no-fsync-op` op toggles, `-R/-W` mapped I/O toggles, `-X` full-file check every op, `-y` `fsync` every write, `-e` post-EOF page pollution, `--keep-good`, `--verify-good`, `--record-ops`, `--replay-ops`, `--cleanup`, `--duration`.
 
 ## fsstress
 
-Behavior-level port of [fsstress](https://github.com/kdave/xfstests/blob/master/ltp/fsstress.c) from xfstests: randomized directory-tree stress mixing metadata and data operations. Like upstream (which forks children), each thread keeps its own file-entry lists and name sequence starting at 0 in the shared base directory, so cross-thread name collisions are tolerated by design; syscall errors are counted, not fatal. Upstream default frequencies are kept for the ported ops; Linux-ioctl-only and XFS/btrfs-specific ops are disabled.
+Port of [fsstress](https://github.com/kdave/xfstests/blob/master/ltp/fsstress.c) from xfstests: multi-threaded randomized directory-tree stress mixing 37 metadata and data operations (including directory & cross-directory `rename`, `rnoreplace`, `rexchange`, `clonerange`, `copyrange`, `fallocate`/`punch`/`zero`/`collapse`/`insert`, `link`/`symlink`/`mkfifo`/`mknod`, `chmod`/`utimens`, `xattr`, `fsync`/`fdatasync`/`syncfs`). Expected concurrency-race errnos (`ENOENT`, `EEXIST`, `ENOTEMPTY`, `EINVAL`, …) are tolerated, whereas fatal filesystem/transport errors (`EIO`, `ENOTCONN`, `EUCLEAN`, `EBADFD`) fail the run immediately in the report.
 
 ```
-fstest fsstress -n 10000 -p 4 /mnt/workspace          # 4 threads x 10000 ops
-fstest fsstress -n 10000 -p 4 -R /mnt/workspace       # read-only workload
-fstest fsstress -n 5000 -f creat=10 -f write=20 /mnt/workspace
-fstest fsstress -n 10000 -p 4 -c /mnt/workspace       # clean up created files afterwards
+fstest fsstress -n 10000 -p 4 -c /mnt/workspace
+fstest fsstress -n 5000 -z -f creat=10 -f write=20 -f rename=10 -c /mnt/workspace
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `-n/--nops <N>` | 1000 | operations per thread |
-| `-p/--nproc <N>` | 1 | threads |
-| `-l/--loops <N>` | 1 | whole-run loops (0 = until `--duration`) |
-| `-s/--seed <N>` | random | RNG seed (per-thread offset added) |
-| `-f op=N` | upstream freqs | override an op frequency (repeatable); ops: creat write writev read readv mread mwrite mkdir mknod symlink rename truncate setfattr link unlink rmdir readlink stat getdents getfattr removefattr getattr fsync fdatasync sync fallocate punch zero collapse insert clonerange copyrange |
-| `-R` / `-w` / `-z`-like | off | zero write-op freqs (read-only) / zero non-write freqs |
-| `-c/--cleanup` | off | remove every file the run created |
+| `-p/--nproc <N>` | 1 | worker threads |
+| `-l/--loops <N>` | 1 | whole-run loops (`0` = loop until `--duration`) |
+| `-s/--seed <N>` | time-based | RNG seed |
+| `-z/--zero-freq` | off | zero all default frequencies before applying `-f` |
+| `-f op=N` | upstream freqs | override operation frequency (repeatable; `mread`/`mwrite` opt-in) |
+| `-R` / `-w` | off | read-only / write-only frequency filter |
+| `-c/--cleanup` | off | bounded removal of created subtrees after completion |
 | `--duration <SEC>` | 0 | time-based run |
 
-The report carries per-thread op histograms and error counts. Concurrent truncate-vs-mmap races can SIGBUS a thread (upstream recovers per child via sigsetjmp, impossible across Rust threads); fstest installs a SIGBUS handler that emits a failed JSON report (ops/errors completed so far) and exits 1 instead of crashing silently. Because one such race would abort the whole run, the mmap ops `mread`/`mwrite` are disabled by default (upstream frequencies kept for every other op) and are opt-in via `-f mread=N` / `-f mwrite=N`.
+## fsrand
+
+Deterministic model-checked verification suite (`--mode <tree|rw|concurrent|all>`, default `tree`):
+
+- `tree`: maintains an in-memory shadow directory tree (file byte payloads, sparse zero-fill extensions, executable mode bits, hardlink inode-group parity, symlink targets, nested directories) across seeded `create`, `overwrite`, `append`, sparse `pwrite`, `truncate` (shrink & sparse extend), `mkdir`, `rmdir`, `unlink`, cross-dir/overwrite `rename`, `hardlink`, `symlink`, `chmod`, and `fsync` operations (payloads up to 64 KiB crossing 4 KiB page boundaries), walking and diffing the mount every `--check-every` ops.
+- `rw`: performs seeded random-offset `pwrite` (up to 64 KiB) + `fsync` + periodic close/reopen `pread` checks against an exact byte-array shadow buffer.
+- `concurrent`: spawns `--workers` writer threads plus concurrent hot-slot atomic-rename & reader threads verifying zero torn payloads or transient `ENOENT` windows under contention.
+- `all`: executes `tree` → `rw` → `concurrent` sequentially in isolated subdirectories and aggregates all cases/metrics.
+
+```
+fstest fsrand --mode all --ops 1000 --seed 42 /mnt/jfs
+fstest fsrand --mode tree --ops 2000 --seed 42 /mnt/jfs
+fstest fsrand --mode rw --file-size 4194304 --ops 500 /mnt/jfs
+fstest fsrand --mode concurrent --workers 8 --files 64 /mnt/jfs
+```
 
 ## ltp
 
-Adapter for the [Linux Test Project](https://github.com/linux-test-project/ltp) — the suite behind JuiceFS's official compatibility numbers. Suite selection maps to LTP's runtest files. The default suites are a narrowed subset of JuiceFS's published selection — `syscalls` (with JuiceFS's syscall removal list applied), `fs_perms_simple`, and `fcntl-locktests` — dropping `fs_bind` (95 bind-mount/mount-namespace shell tests that exercise kernel mount propagation, not the filesystem under test) and `smoketest` (mixes in process- and network-only tests):
+Adapter for the [Linux Test Project](https://github.com/linux-test-project/ltp) (`20260529`) — aligned with JuiceFS's official POSIX compatibility and CI methodology. Default suites: **`syscalls`**, **`fs`**, **`fs_perms_simple`**, and **`fcntl-locktests`** (with built-in `rm_syscalls` / `rm_fs` filtering, `TMPDIR`/`LTP_TMPDIR` on `<mount>/.fstest-ltp/tmp`, `fcntl-locktests` bound to `$TMPDIR`, and `kirk`-compatible exit-code & sub-assertion accounting).
 
 ```
+sudo fstest ltp /mnt/jfs
 sudo fstest ltp --ltp-dir /opt/ltp /mnt/jfs
-sudo fstest ltp --suite syscalls,fs_bind,fs_perms_simple,smoketest,fcntl-locktests /mnt/jfs  # JuiceFS's full published set
+sudo fstest ltp --suite syscalls,fs,fs_bind,fs_perms_simple,smoketest,fcntl-locktests /mnt/jfs
 ```
-
-LTP ships no prebuilt binaries — the release tarball is source-only (a few MB) and most distributions, Ubuntu included, have no `ltp` package — so the test binaries must be compiled once and pointed at with `--ltp-dir` (a tree containing `runtest/` and `testcases/bin/`, i.e. an LTP `make install` prefix). fstest embeds a prepare script that does the whole job on a fresh machine, so you can bootstrap from the fstest binary alone:
-
-```
-fstest ltp --prepare-script | sh                     # fetch + build + install LTP
-LTP_PREFIX=/opt/ltp fstest ltp --prepare-script | sh # custom prefix
-```
-
-The script needs a C toolchain plus `bison flex m4` and `pkgconf` (header lists the apt/zypper/yum packages); it installs into `~/.cache/fstest/ltp/<version>` by default, prints the resulting prefix as the only thing on stdout (so it composes with `--ltp-dir "$(...)"`), and honours `LTP_VERSION`, `LTP_PREFIX`, `LTP_CACHE`, `LTP_URL`, `LTP_SHA256`, `LTP_JOBS` and `LTP_INSTALL_DEPS=1`. The same file lives at [scripts/prepare-ltp.sh](scripts/prepare-ltp.sh). Then point fstest at the prefix:
-
-```
-sudo fstest ltp --ltp-dir ~/.cache/fstest/ltp/20260529 /mnt/jfs
-```
-
-By default JuiceFS's published syscall removal list (vendored from their repo, 240+ tests their environment excludes) is applied, so `pass/fail` totals are directly comparable with their `1479 run / 1454 passed` numbers. On top of it a small always-on list removes tests that drive kernel subsystems a FUSE/network mount cannot back — loop-device attach (`ioctl_loop05`), kernel module loading (`init_module01/02`) and BSD process accounting (`acct02`) — because a failure there measures the kernel, not the filesystem under test; the two lists are kept separate so their provenance stays distinguishable, and `--no-remove` keeps everything. LTP exit codes map: 0 pass, 1 fail, 2 broken, 32 skip, other warn; a per-test timeout (`--timeout`, default 120s) is reported as `timedout`. Tests run with `TMPDIR`/`LTP_TMPDIR` pointed inside the mount (mode 1777, like `/tmp`, so tests that drop privileges can still create their scratch directories) so file-based tests exercise it, and each test gets `LTPROOT` plus `testcases/bin` on `PATH` (as LTP's own runltp does) so shell and child-spawning tests resolve their helper libraries and binaries. The suite is executed by fstest itself — no external runner is involved. Root is required by most FS tests, exactly as upstream.
 
 ## stdfs
 
-Runs the filesystem-relevant portions of the Go, Python, Node.js and Rust standard-library test suites against the mount. Where pjdfstest/LTP ask "does this filesystem conform to POSIX", stdfs asks "do everyday language runtimes work on it" — the suites exercise `openat`/`dir_fd` families, `copy_file_range`/`sendfile`, `O_TMPFILE`, `readdir` `d_type` reporting, recursive remove/copy and the exact syscall patterns real applications hit through their runtimes. Like ltp/fio, nothing is embedded or redistributed: each suite comes from the user's own toolchain and runs in place, with every language's scratch directories (`TMPDIR`, regrtest `TESTFN`, `NODE_TEST_DIR`) pointed inside the mount.
+Runs the filesystem-relevant portions of the **Go**, **Python**, **Node.js**, and **Rust** standard-library test suites against `<mountpoint>/.fstest-stdfs/` using compile-time embedded runtimes and test suites (**zero target-host runtime dependencies**):
+
+- **go**: precompiled `os`, `path/filepath`, `io/fs` test binaries + staged fixtures (`TestReadDir`, `TestDirFS`, `TestCopyFS`, `TestGlob`, `TestRoot*`, etc.).
+- **python**: standalone CPython `3.12` + `Lib/test` across 13 FS modules (`os`, `posix`, `posixpath`, `genericpath`, `pathlib`, `shutil`, `tarfile`, `stat`, `fileio`, `glob`, `tempfile`, `mmap`, `fcntl`).
+- **node**: Node.js `v22` `node --test` over curated `test/parallel/test-fs-*.js`, including `stat()`-polling `fs.watchFile` on all platforms and event-driven `fs.watch` / `fsPromises.watch` (`inotify` over FUSE) on Linux by default (`--node-watch` / `--no-node-watch`).
+- **rust**: build-time embedded `library/std/src/fs/tests.rs` executed in parallel via `fstest __stdfs-rust`.
 
 ```
 fstest stdfs /mnt/jfs
 fstest stdfs --lang go,rust /mnt/jfs
-fstest stdfs --python-dir ~/cpython-3.14/Lib --node-dir ~/node /mnt/jfs
 ```
-
-| Language | Suite source (default) | Requirement |
-|---|---|---|
-| go | `go env GOROOT` of the `go` on PATH; packages `os`, `path/filepath`, `io/fs` | Go toolchain |
-| python | the interpreter's bundled `test` package | a python3 that ships it (several distributions split it out); otherwise `--python-dir` |
-| node | none — binary distributions never ship tests | `--node-dir` at a nodejs/node checkout (from-source trees are found automatically) |
-| rust | `std/src/fs/tests.rs` from the rustc sysroot's rust-src component | `rustup component add rust-src`, or `--rust-src-dir` |
-
-Languages whose toolchain or sources cannot be resolved are reported as `unavailable` and do not fail the run; real test failures do.
-
-- go: each package is compiled with `go test -c` and the test binary runs with cwd and `TMPDIR` on the mount. Tests that read GOROOT-relative `testdata/` or glob the package's own source files (`TestReadFile`, `TestGlob`, the `DirFS` family) assume cwd equals the GOROOT package dir and are skipped by default; pass `--go-skip ""` to run them anyway. Tests run sequentially within a package (`-test.parallel=1`) because several of them enumerate the shared temp directory.
-- python: `<python> -m test -v <modules>` with the FS-touching module set (os, posix, shutil, stat, fileio, scandir, glob, tempfile, mmap, fcntl). `--python-dir` plus `--python-exe` pin an arbitrary CPython version's `Lib/` tree against a matching interpreter. `test.test_os.ForkTests.test_fork` is ignored by default because its child python re-execs with `-I` and cannot see a PYTHONPATH-injected `test` package; add patterns via `--python-ignore`.
-- node: `node --test --test-reporter=tap` over `test/parallel/test-fs-*.js` with the watch/inotify files excluded (event-notification semantics, not filesystem ones). Requires node >= 18.
-- rust: fstest reads `library/std/src/fs/tests.rs`, rewrites `crate::` paths onto `std`, links the suite against a small shim replacing std's internal test helpers, and compiles a standalone runner with the same rustc on every run. Tests using std-internal or still-unstable APIs (fs::Dir/dirfd, read_buf/BorrowedBuf, free-function `fs::set_times`), windows-only cases and `#[ignore]` tests are excluded or skipped — the run is version-locked to the toolchain that provides the sources.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--lang <LIST>` | go,python,node,rust | languages to run |
-| `--go-dir <GOROOT>` | `go` on PATH | another Go installation's stdlib tests |
-| `--go-packages <LIST>` | os,path/filepath,io/fs | packages to test |
-| `--go-skip <REGEX>` | built-in list | `-test.skip` filter; empty string disables it |
-| `--python-dir <DIR>` | interpreter stdlib | CPython `Lib/` directory whose `test/` package runs |
-| `--python-exe <PATH>` | python3 on PATH, or one next to `--python-dir` | interpreter |
-| `--python-modules <LIST>` | os,posix,shutil,... | test modules |
-| `--python-ignore <LIST>` | test.test_os.ForkTests.test_fork | extra regrtest ignore patterns |
-| `--node-dir <DIR>` | auto (from-source trees) | nodejs/node checkout root |
-| `--node-filter <SUBSTR>` | none | only run matching test-fs files |
-| `--rust-src-dir <DIR>` | sysroot rust-src | rust `library/` source directory |
-| `--timeout <SEC>` | 600 | per-item timeout |
-| `--jobs <N>` | 4 | concurrent items within a language |
 
 ## git
 
-Adapter for git's own test suite (`t/`) — the same suite upstream CI runs, pointed at the mount with `--root`. The suites before this one ask "does this filesystem conform to POSIX" (pjdfstest, LTP) and "do language runtimes work on it" (stdfs); the git suite asks whether the most filesystem-dependent application in wide use still works on it: repo init with the `core.filemode`/`core.ignorecase`/`core.symlinks`/`core.precomposeunicode` probes, lockfile+rename atomicity for the index and refs, loose-object fan-out and pack IO, symlink/case/NFD-NFC semantics through checkout/merge/status, racy-mtime index handling, hardlinked local clones.
+Runs **67 curated filesystem, storage-backend (`files` + `reftable`, `pack`/`mmap`/`MIDX`/`commit-graph`/`gc`/`repack`), index/worktree, and porcelain workflow scripts** from Git's `t/` suite against `<mount>/.fstest-git/` with **`GIT_TEST_FSYNC=1` enabled by default**, using the compile-time embedded Git `v2.55.0` build tree (or `--all` for all ~1,046 scripts).
 
 ```
-fstest git --prepare-script | sh              # clone + build a pinned git release (once)
-fstest git /mnt/jfs                           # default tier a: the fs-coupled scripts, ~1 min
-fstest git --tier b /mnt/jfs                  # + the heavyweights (crlf matrix, sparse-checkout compat …)
-fstest git --tier all --jobs 8 /mnt/jfs       # the whole t/ suite (needs GBs of space on the mount)
-fstest git --tests t0050-filesystem,t1400 /mnt/jfs
+fstest git /mnt/jfs
+fstest git --no-fsync /mnt/jfs
+fstest git --tests t0610,t5319,t7700 /mnt/jfs
 ```
-
-The suite is version-locked to the binary: the scripts exercise their own version's options and usage text, so they are never vendored and never run against a different git build — one checkout provides both. The prepare script (embedded like the LTP one, also at [scripts/prepare-git.sh](scripts/prepare-git.sh)) clones a pinned release tag (`GIT_VERSION`, default v2.55.0; honours `GIT_REPO`, `GIT_CACHE`, `GIT_JOBS`, `GIT_MAKE_OPTS`) and builds it minimally (`NO_CURL NO_EXPAT NO_GETTEXT NO_TCLTK`) into `~/.cache/fstest/git/<tag>`; the only hard dependencies are a C toolchain, make, git and zlib. Network transports and i18n are out of scope for a filesystem suite, and the test suite's own prereq gating turns them into skips. Then point fstest at the tree — `--git-dir`, or the newest build under the cache is found automatically:
-
-```
-fstest git --git-dir ~/.cache/fstest/git/v2.55.0 /mnt/jfs
-```
-
-Each script runs with cwd at the build tree's `t/` (the invocation contract of test-lib.sh) and `--root` inside `<mount>/.fstest-git/` — its trash directory, the entire working repo including `.git`, lives on the filesystem under test — with `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main` and the harness' test-results bookkeeping pointed at the mount too, so a read-only build tree suffices. Scripts run in parallel (`--jobs`; each owns its trash directory) under a per-script timeout (`--timeout`, default 600) whose kill takes the whole process group. The TAP each script emits is parsed into pass/fail/skip/todo/fixed counts: the harness' capability probing turns missing features into `# skip` lines with the per-prereq reasons aggregated per script; `not ok … # TODO known breakage` is upstream's expected breakage and does not fail the run; a script that dies before emitting its trailing `1..N` plan is `broken`; `ok … # TODO known breakage vanished` is reported as `fixed` without failing (upstream exits 1 for it). Failed scripts keep their trash directory (upstream behavior), so the work directory is removed at the end under a time bound — a wedged mount can delay but never block the report; `--keep` preserves everything for diagnosis. Tier a is 44 scripts (~1524 assertions on APFS, about a minute at 4 jobs); tier b adds 11.
-
-| Option | Default | Description |
-|---|---|---|
-| `--git-dir <TREE>` | `$FSTEST_GIT_DIR`, else newest in `~/.cache/fstest/git` | built git source tree (needs `git`, `t/test-lib.sh`, `t/helper/test-tool`) |
-| `--tier <a\|b\|all>` | a | a = curated fs-coupled set; b = a + heavyweights; all = every `tNNNN` script |
-| `--tests <LIST>` | by tier | explicit scripts (comma list of `tNNNN` or `tNNNN-name`), overrides `--tier` |
-| `--filter <SUBSTR>` | all | only scripts whose name contains the substring (repeatable) |
-| `--list` | off | resolve the selection and print it, without running |
-| `--jobs <N>` | 4 | scripts in parallel |
-| `--timeout <SEC>` | 600 | per-script timeout |
-| `--work-dir <NAME>` | `.fstest-git` | work directory under the mount point |
-| `--test-arg <ARG>` | — | extra argument passed verbatim to every script (repeatable): `-x`, `--immediate`, `--debug`, `--run=<n>` … |
-| `--keep` | off | keep the work directory (and the trash directories failed scripts leave behind) |
-| `--json <FILE>` | — | also write the JSON report |
-| `--prepare-script` | — | print the git prepare script and exit |
-
-Selection entries resolve against the tree at runtime — exact name first, then unique number prefix (`t1410` finds `t1410-reflog`) — and an entry that matches nothing is reported as a warning rather than silently dropped, so upstream renames surface instead of losing coverage.
 
 ## sqlite
 
-SQLite's [mptest](https://sqlite.org/mptest.html) suite run against the mount. mptest is SQLite's own tester "for testing the ability of independent processes to access the same SQLite database concurrently" — the filesystem's locking, atomic-rename, fsync and hot-journal recovery paths exercised by real client processes. The parent and its `--client` children (five in the embedded scripts) coordinate through task/client/counters tables inside the shared database itself, so wherever the database file lives is what gets tested: `config01`/`config02` run those clients under different journal modes (PERSIST/TRUNCATE/MEMORY/OFF) and mmap sizes concurrently and verify consistency after a VACUUM, `crash01` kills clients mid-transaction and checks the survivors recover the hot journal, `multiwrite01` is the concurrent write core both source.
-
-Like pjdfstest, everything ships inside the fstest binary — zero dependencies, zero preparation:
+Comprehensive SQLite filesystem verification suite built on bundled SQLite (`rusqlite` `"bundled"`). Runs **7 probe families (20 items)** with `PRAGMA synchronous=FULL` by default (`mptest` 5-process rollback + WAL crash recovery, `crud` relational/FK/JSONB/external-sort/savepoint/`ATTACH`/incremental-BLOB/`FTS5`/`VACUUM INTO`, `speedtest` 5-mode SHA-256 parity, `kvtest`, `walthread`, `wal-lifecycle`, and cross-process `mmap` + `fcntl` lock probes), routing `temp_store_directory` / `SQLITE_TMPDIR` onto `<mount>/.fstest-sqlite/tmp`.
 
 ```
-fstest sqlite /mnt/jfs                      # all four scripts, one fresh database each, ~13 s
-fstest sqlite --journalmode wal /mnt/jfs    # mptest's --journalmode knob
-fstest sqlite --vfs unix-dotfile /mnt/jfs   # exercise a different lock strategy
-fstest sqlite --list                        # show the embedded scripts
+fstest sqlite /mnt/jfs
+fstest sqlite --probes crud,wal-lifecycle,mmap /mnt/jfs
+fstest sqlite --no-sync /mnt/jfs
 ```
 
-The four scripts (+ the `crash02.subtest` they `--source`) are embedded verbatim (SQLite is public domain), and the 1.4k-line mptest.c coordinator is ported behavior-for-behavior on top of the bundled SQLite engine (rusqlite "bundled" — sqlite3.c compiled in at build time; the engine is not ported, it *is* SQLite, the system under test). Upstream semantics are kept exactly: the BEGIN IMMEDIATE task-claim protocol with counter flushing, byte-exact `--match`/`--glob` comparisons, the 30s no-work give-up, the 2s shutdown grace, `--exit N>0` as a crash that leaves a hot journal, the busy-handler timeout, and real client *processes* (threads would share locks and test nothing — clients are spawned as `fstest __sqlite-mptest --client N`). The port is validated as an oracle twin of the C mptest: per script, identical assertion counts and exit codes (163/627/94/81, all 0 errors on APFS).
+## bundle
 
-Scripts run in parallel (`--jobs`, each with its own database and work directory under `<mount>/.fstest-sqlite/`) under a per-script process-group timeout (`--timeout`, default 300 — the kill takes the master and every client down together). Output parsing keys on the upstream `Summary: N errors out of M tests`/`END:` lines: errors > 0 is `fail`, a missing summary (master died, e.g. on a FATAL) is `broken`. The work directory is removed at the end under a time bound; `--keep` preserves it.
+Inspects or pre-extracts the compile-time embedded suite bundle (`fio-3.38`, Go stdlib `.test` binaries, standalone CPython `3.12` + `Lib/test`, Node.js `v22` + `test-fs-*.js`, Git `v2.55.0` + `t/`, and Linux LTP `20260529`). Extracted once by SHA-256 into `~/.cache/fstest/bundles/<hash>/` off the mount under test.
 
-| Option | Default | Description |
-|---|---|---|
-| `--script <LIST>` | config01,config02,crash01,multiwrite01 | embedded scripts to run (comma list, extension optional; a path runs an external mptest script) |
-| `--filter <SUBSTR>` | all | only scripts whose name contains the substring (repeatable) |
-| `--list` | off | list the embedded scripts and exit |
-| `--jobs <N>` | 4 | scripts in parallel |
-| `--timeout <SEC>` | 300 | per-script timeout (process group) |
-| `--repeat <N>` | 1 | mptest `--repeat`: cycles per script |
-| `--journalmode <MODE>` | — | mptest `--journalmode`: DELETE/TRUNCATE/PERSIST/MEMORY/WAL/OFF |
-| `--vfs <NAME>` | — | mptest `--vfs`: VFS under test (unix, unix-dotfile, unix-excl, unix-namedsem) |
-| `--sync` | off | keep synchronous=FULL (mptest `--sync`; default is synchronous=OFF like upstream) |
-| `--sqltrace` / `--quiet` / `--trace <N>` | — | mptest tracing knobs, passed through |
-| `--work-dir <NAME>` | `.fstest-sqlite` | work directory under the mount point |
-| `--keep` | off | keep the work directory when done |
-| `--json <FILE>` | — | also write the JSON report |
+```
+fstest bundle info
+fstest bundle extract
+fstest bundle extract --dir /tmp/suite
+```
 
 ## Platform notes
 
-- fsync means plain `fsync(2)` everywhere. Rust's `File::sync_all()` maps to the much heavier `fcntl(F_FULLFSYNC)` on Apple targets, so fstest calls `fsync` directly; benchmark numbers stay comparable with the C/python originals.
-- swift-put preallocation uses `posix_fallocate` on Linux and `fcntl(F_PREALLOCATE)` on macOS; the post-write `posix_fadvise(DONTNEED)` cache drop is Linux-only (macOS has no equivalent, it is skipped).
-- `--pause` fixes an apparent upstream typo (smallfile gates the sleep on the constant `iterations % 5` instead of `filenum % 5`); fstest implements the per-file average pause.
-- The exponential file-size distribution derives its random seed deterministically instead of smallfile's seed sidecar file, so separate `create`/`read` invocations replay the same sizes naturally.
-
-## Licensing
-
-fstest does not include or link upstream code; all ports are behavior-level reimplementations. Third-party notices and upstream license texts live in [licenses/](licenses/). The license of fstest itself is not chosen yet.
+- `fsync` calls plain `fsync(2)` everywhere rather than Apple `fcntl(F_FULLFSYNC)`, keeping POSIX durability and benchmark numbers comparable with C/Python/Go tools; filesystem-scoped sync uses `syncfs(2)` on Linux instead of host-wide `sync(2)`.
+- Preallocation uses `posix_fallocate(fd, offset, len)` on Linux and `fcntl(F_PREALLOCATE)` + `ftruncate` extension on macOS.
+- Third-party notices and upstream license texts for behaviorally ported and bundled suites live in [licenses/](licenses/).

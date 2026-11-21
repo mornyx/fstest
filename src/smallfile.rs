@@ -1,8 +1,11 @@
-// Port of https://github.com/distributed-system-analysis/smallfile (Apache-2.0).
-// Semantics (dir naming, buffer layout, stonewall, per-op request accounting,
-// result aggregation) intentionally mirror the Python implementation.
+// Port of `smallfile` (https://github.com/distributed-system-analysis/smallfile, Apache-2.0):
+// multi-threaded POSIX small-file metadata and data benchmark.
 
-use log::{debug, error, info, warn};
+use crate::common::{
+    SplitMix64, fsync_raw, host_name, iso8601, posix_fallocate_fd, remove_dir_all_bounded,
+    suffixed,
+};
+use log::{error, info, warn};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use xattr::FileExt as _;
 
 pub const OP_NAMES: &[&str] = &[
     "create",
@@ -69,7 +73,7 @@ const SWIFT_XATTR_PREFIX: &str = "user.smallfile-all-";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// run only this operation instead of the default phase sequence
+    /// run only this operation instead of the default 7-phase sequence
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(OP_NAMES.iter().copied()))]
     pub operation: Option<String>,
 
@@ -101,7 +105,7 @@ pub struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_parser = yn_bool)]
     pub stonewall: bool,
 
-    /// finish remaining files after first thread is done (Y/N)
+    /// finish remaining files after stonewall fires (Y/N)
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_parser = yn_bool)]
     pub finish: bool,
 
@@ -109,9 +113,13 @@ pub struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_parser = yn_bool)]
     pub verify_read: bool,
 
-    /// call fsync() after each file is written (Y/N)
+    /// call fsync() after each file is modified (Y/N)
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_parser = yn_bool)]
     pub fsync: bool,
+
+    /// fill data buffer with deterministic pseudo-random bytes to defeat compression (Y/N)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_parser = yn_bool)]
+    pub incompressible: bool,
 
     /// filename prefix
     #[arg(long, default_value = "")]
@@ -157,7 +165,11 @@ pub struct Args {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_parser = yn_bool)]
     pub record_ctime_size: bool,
 
-    /// also write the JSON result to this file
+    /// timeout in seconds for `await-create` polling
+    #[arg(long, default_value_t = 300)]
+    pub await_timeout: u64,
+
+    /// write the enriched JSON result to this file
     #[arg(long)]
     pub json: Option<PathBuf>,
 
@@ -175,7 +187,6 @@ fn positive_u32(s: &str) -> Result<u32, String> {
     }
 }
 
-// smallfile_cli accepts Y/N for boolean options, mirror that
 pub(crate) fn yn_bool(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "y" | "yes" | "true" => Ok(true),
@@ -213,6 +224,7 @@ struct Params {
     finish_all_rq: bool,
     verify_read: bool,
     fsync: bool,
+    incompressible: bool,
     hash_to_dir: bool,
     is_shared_dir: bool,
     pause_between_files_us: u64,
@@ -221,6 +233,7 @@ struct Params {
     xattr_size: usize,
     xattr_count: usize,
     record_ctime_size: bool,
+    await_timeout_sec: u64,
     top: PathBuf,
     host: String,
 }
@@ -233,7 +246,6 @@ impl Params {
         self.top.join("file_dstdir").join(&self.host)
     }
     fn src_dirs(&self, tid: &str) -> Vec<PathBuf> {
-        // shared dir keeps all threads (and hosts) in one tree; filenames carry tid/host
         if self.is_shared_dir {
             vec![self.top.join("file_srcdir")]
         } else {
@@ -257,13 +269,11 @@ impl Params {
     }
     fn files_between_checks(&self) -> u32 {
         if self.total_sz_kb > 0 {
-            (100 - self.total_sz_kb / 100).max(10)
+            100u32.saturating_sub(self.total_sz_kb / 100).max(10)
         } else {
             20
         }
     }
-    // file numbers whose directory names must be created/removed up front; with
-    // hashing every file number can land in a different directory, so no stepping
     fn subdir_file_nums(&self) -> Vec<usize> {
         if self.hash_to_dir {
             (0..=self.iterations as usize).collect()
@@ -279,14 +289,13 @@ impl Params {
             self.mk_seq_dir_name(file_num)
         }
     }
-    // subdirectories are named like radix-`dirs_per_dir` numbers: d_000, d_001, ... d_000/d_003, ...
     fn mk_seq_dir_name(&self, file_num: u32) -> String {
         let mut dir_in = file_num / self.files_per_dir;
         let mut level_dirs = Vec::new();
-        let mut dirs_for_this_level = self.dirs_per_dir;
-        while dirs_for_this_level <= dir_in {
-            level_dirs.push(dirs_for_this_level);
-            dirs_for_this_level *= self.dirs_per_dir;
+        let mut dirs_for_this_level = self.dirs_per_dir as u64;
+        while dirs_for_this_level <= dir_in as u64 && self.dirs_per_dir > 1 {
+            level_dirs.push(dirs_for_this_level as u32);
+            dirs_for_this_level = dirs_for_this_level.saturating_mul(self.dirs_per_dir as u64);
         }
         let mut parts = Vec::with_capacity(level_dirs.len() + 1);
         for &lvl in level_dirs.iter().rev() {
@@ -301,7 +310,7 @@ impl Params {
         let mut pathlist = Vec::new();
         let mut dir_num =
             ((file_num as u64 * SOME_PRIME) % self.iterations as u64 / self.files_per_dir as u64) as usize;
-        while dir_num > 1 {
+        while dir_num > 1 && self.dirs_per_dir > 1 {
             let dir_num_hash = dir_num as u64 * SOME_PRIME % self.dirs_per_dir as u64;
             pathlist.insert(0, format!("h_{dir_num_hash:03}"));
             dir_num /= self.dirs_per_dir as usize;
@@ -310,11 +319,15 @@ impl Params {
     }
 }
 
-// biggest_buf is deterministic (k%128 pattern, 0x5c replaced by '!') and shared by all
-// threads. The 1 KiB tail exists so each file can start at a different offset
-// ((tid+1)*filenum % 1024) while still being a contiguous slice; read verification
-// depends on this exact layout, so it must never diverge between create and read.
-fn build_biggest_buf() -> Vec<u8> {
+// Shared payload buffer with 1 KiB tail so per-file slices at `unique_offset()` stay
+// contiguous and deterministic between separate `create` and `read` invocations.
+fn build_biggest_buf(incompressible: bool) -> Vec<u8> {
+    if incompressible {
+        let mut buf = vec![0u8; BIGGEST_BUF_SIZE + BUF_OFFSET_RANGE];
+        let mut rng = SplitMix64::new(0x534D_414C_4C46_494C);
+        rng.fill_bytes(&mut buf);
+        return buf;
+    }
     let first: Vec<u8> = (0..BUF_OFFSET_RANGE as u32)
         .map(|k| {
             let b = (k % 128) as u8;
@@ -331,12 +344,6 @@ fn build_biggest_buf() -> Vec<u8> {
     buf
 }
 
-fn suffixed(p: &Path, s: &str) -> PathBuf {
-    let mut os = p.as_os_str().to_os_string();
-    os.push(s);
-    os.into()
-}
-
 fn ensure_deleted(p: &Path) -> io::Result<()> {
     match fs::remove_file(p) {
         Ok(()) => Ok(()),
@@ -345,52 +352,8 @@ fn ensure_deleted(p: &Path) -> io::Result<()> {
     }
 }
 
-// mode-0 fallocate: linux has posix_fallocate, macOS only offers fcntl(F_PREALLOCATE)
-#[cfg(target_os = "linux")]
-pub(crate) fn preallocate(fd: i32, len: i64) -> io::Result<()> {
-    let rc = unsafe { libc::posix_fallocate(fd, 0, len) };
-    if rc != 0 {
-        Err(io::Error::from_raw_os_error(rc))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn preallocate(fd: i32, len: i64) -> io::Result<()> {
-    let mut st = libc::fstore_t {
-        fst_flags: libc::F_ALLOCATEALL,
-        fst_posmode: libc::F_PEOFPOSMODE,
-        fst_offset: 0,
-        fst_length: len,
-        fst_bytesalloc: 0,
-    };
-    if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut st) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn preallocate(_fd: i32, _len: i64) -> io::Result<()> {
-    Ok(())
-}
-
 fn errno(e: &io::Error) -> i32 {
     e.raw_os_error().unwrap_or(EIO)
-}
-
-// pitfall: std's File::sync_all() maps to fcntl(F_FULLFSYNC) on Apple targets,
-// which flushes all the way to stable storage and is orders of magnitude heavier
-// than the plain fsync(2) the upstream tools (smallfile, fs_mark) issue
-pub(crate) fn fsync_raw(f: &File) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    if unsafe { libc::fsync(f.as_raw_fd()) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
 
 fn status_str(status: i32) -> String {
@@ -399,32 +362,6 @@ fn status_str(status: i32) -> String {
     } else {
         io::Error::from_raw_os_error(status).to_string()
     }
-}
-
-pub(crate) fn iso8601(t: SystemTime) -> String {
-    let secs = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
-}
-
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 struct Workload {
@@ -444,10 +381,8 @@ struct Workload {
     filenum_final: Option<usize>,
     rq_final: Option<u64>,
     status: i32,
-    // exponential file-size distribution: deterministic per (top, host, tid) seed, so
-    // separate invocations (create then read) regenerate identical size sequences
-    // without smallfile's seed sidecar file
-    rng_state: u64,
+    err_msg: Option<String>,
+    rng: SplitMix64,
     pause_sec: f64,
     pause_hist: [f64; PAUSE_RSTIME_COUNT],
     pause_idx: Option<usize>,
@@ -470,7 +405,7 @@ impl Workload {
         Workload {
             src_dirs: p.src_dirs(&tid_label),
             dest_dirs: p.dest_dirs(&tid_label),
-            rng_state: h.finish(),
+            rng: SplitMix64::new(h.finish()),
             pause_sec: p.pause_between_files_us as f64 / 1e6,
             pause_hist: [0.0; PAUSE_RSTIME_COUNT],
             pause_idx: None,
@@ -493,6 +428,7 @@ impl Workload {
             filenum_final: None,
             rq_final: None,
             status: OK,
+            err_msg: None,
         }
     }
 
@@ -513,15 +449,9 @@ impl Workload {
     }
 
     fn next_rand_f64(&mut self) -> f64 {
-        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng_state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        (z >> 11) as f64 / (1u64 << 53) as f64
+        (self.rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    // equivalent of python random.Random.expovariate(1.0/mean) with size clamping
     fn get_next_file_size_kb(&mut self) -> u32 {
         if self.p.filesize_distr == Distr::Fixed {
             return self.p.total_sz_kb;
@@ -533,7 +463,6 @@ impl Workload {
             .min(self.p.total_sz_kb.saturating_mul(RANDOM_SIZE_LIMIT))
     }
 
-    // seconds since this thread's measured interval began
     fn now(&self) -> f64 {
         self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0)
     }
@@ -558,8 +487,6 @@ impl Workload {
         }
     }
 
-    // port of smallfile's auto-pause: Little's-law throttle converging on the pause
-    // that keeps utilization just below saturation
     fn adjust_pause_time(&mut self, end: f64, rsp: f64) {
         match self.pause_idx {
             None => {
@@ -568,16 +495,14 @@ impl Workload {
                 self.pause_idx = Some(1);
                 self.pause_samples = 1;
                 self.pause_sec = self.throttle * rsp;
-                info!(
-                    "thread {} per-thread pause initialized to {:.6}",
-                    self.tid_label, self.pause_sec
-                );
             }
             Some(i) => {
                 self.pause_hist[i] = rsp;
                 self.pause_idx = Some((i + 1) % PAUSE_RSTIME_COUNT);
                 self.pause_samples += 1;
-                if self.pause_hist_start + PAUSE_HIST_DURATION < end || self.pause_samples > PAUSE_RSTIME_COUNT / 2 {
+                if self.pause_hist_start + PAUSE_HIST_DURATION < end
+                    || self.pause_samples > PAUSE_RSTIME_COUNT / 2
+                {
                     self.calculate_pause_time(end);
                     self.pause_hist_start = end;
                     self.pause_samples = 0;
@@ -597,10 +522,6 @@ impl Workload {
         let old_pause = self.pause_sec;
         let new_pause = mean_util * mean * self.throttle;
         self.pause_sec = (old_pause + 2.0 * new_pause) / 3.0;
-        info!(
-            "thread {} per-thread pause changed from {old_pause:.6} to {:.6}",
-            self.tid_label, self.pause_sec
-        );
     }
 
     fn save_rsptimes(&self) -> io::Result<()> {
@@ -622,7 +543,6 @@ impl Workload {
             writeln!(f, "{opname:>8}, {rel_start:9.6}, {rsp:9.6}")?;
         }
         fsync_raw(&f)?;
-        debug!("thread {} wrote {}", self.tid_label, path.display());
         Ok(())
     }
 
@@ -634,7 +554,6 @@ impl Workload {
         self.filenum_final = Some(self.filenum);
         self.end = Some(Instant::now());
         if self.filenum >= self.p.iterations as usize {
-            // first thread to finish all its files ends measurement for everyone
             flag.store(true, Ordering::SeqCst);
         }
         self.ended = true;
@@ -649,7 +568,10 @@ impl Workload {
             && (self.filenum as u32 + 1) % self.p.files_between_checks() == 0
             && flag.load(Ordering::SeqCst)
         {
-            info!("thread {} saw stonewall after {} files", self.tid_label, self.filenum);
+            info!(
+                "thread {} saw stonewall after {} files",
+                self.tid_label, self.filenum
+            );
             self.end_test(flag);
         }
         if !self.p.finish_all_rq && self.test_ended() {
@@ -664,18 +586,17 @@ impl Workload {
             return false;
         }
         self.filenum += 1;
-        // python gates the sleep on `iterations % files_between_pause == 0`, an apparent
-        // typo for filenum that garbles pacing; we sleep every 5 files for the same
-        // average per-file pause
         if self.pause_sec > 0.0 && self.filenum % FILES_BETWEEN_PAUSE == 0 {
-            thread::sleep(Duration::from_secs_f64(self.pause_sec * FILES_BETWEEN_PAUSE as f64));
+            thread::sleep(Duration::from_secs_f64(
+                self.pause_sec * FILES_BETWEEN_PAUSE as f64,
+            ));
         }
         true
     }
 
     fn make_all_subdirs(&self) -> io::Result<()> {
         if self.p.is_shared_dir && self.tid != 0 {
-            return Ok(()); // thread 00 pre-creates the shared tree for everyone
+            return Ok(());
         }
         let nums = self.p.subdir_file_nums();
         let mut dirset = BTreeSet::new();
@@ -685,7 +606,6 @@ impl Workload {
             }
         }
         for d in dirset {
-            // create_dir_all tolerates the EEXIST races shared-dir threads run into
             fs::create_dir_all(&d)?;
         }
         Ok(())
@@ -707,15 +627,17 @@ impl Workload {
                 while cur.starts_with(root) && cur != *root {
                     match fs::remove_dir(&cur) {
                         Ok(()) => {}
-                        Err(e) => {
-                            // ENOTEMPTY differs between Linux(39) and macOS(66); other
-                            // "expected" failures: EACCES(13), EBUSY(16); ENOENT(2) falls through
-                            match e.raw_os_error() {
-                                Some(2) => {}
-                                Some(13) | Some(16) | Some(39) | Some(66) => break,
-                                _ => return Err(e),
+                        Err(e) => match e.raw_os_error() {
+                            Some(x) if x == libc::ENOENT => {}
+                            Some(x)
+                                if x == libc::EACCES
+                                    || x == libc::EBUSY
+                                    || x == libc::ENOTEMPTY =>
+                            {
+                                break;
                             }
-                        }
+                            _ => return Err(e),
+                        },
                     }
                     cur = match cur.parent() {
                         Some(p) => p.to_path_buf(),
@@ -723,6 +645,7 @@ impl Workload {
                     };
                 }
             }
+            let _ = fs::remove_dir(root);
         }
         Ok(())
     }
@@ -754,7 +677,6 @@ impl Workload {
         while self.do_another_file(flag) {
             let fnm = self.this_file_nm(&self.src_dirs);
             let t0 = self.now();
-            // O_CREAT|O_EXCL: a pre-existing file must fail the run, not be reused
             let mut f = OpenOptions::new().write(true).create_new(true).open(&fnm)?;
             let biggest = self.biggest_buf.clone();
             let mut remaining_kb = self.get_next_file_size_kb();
@@ -767,7 +689,7 @@ impl Workload {
                 remaining_kb -= next_kb;
             }
             if self.p.record_ctime_size {
-                self.remember_ctime_size(&fnm, &f)?;
+                self.remember_ctime_size(&f)?;
             }
             if self.p.fsync {
                 fsync_raw(&f)?;
@@ -777,15 +699,13 @@ impl Workload {
         Ok(())
     }
 
-    // async-replication latency support: remember wall time + size via xattr so a
-    // later await-create pass can measure how long propagation took
-    fn remember_ctime_size(&self, fnm: &Path, f: &File) -> io::Result<()> {
+    fn remember_ctime_size(&self, f: &File) -> io::Result<()> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         let kb = f.metadata()?.len() / 1024;
-        xattr::set(fnm, CTIME_XATTR, format!("{ts},{kb}").as_bytes())
+        f.set_xattr(CTIME_XATTR, format!("{ts},{kb}").as_bytes())
     }
 
     fn do_write(&mut self, flag: &AtomicBool, append: bool, truncate: bool) -> io::Result<()> {
@@ -793,8 +713,6 @@ impl Workload {
             let fnm = self.this_file_nm(&self.src_dirs);
             let t0 = self.now();
             let mut f = OpenOptions::new().write(true).truncate(truncate).open(&fnm)?;
-            // deliberately lseek instead of O_APPEND: O_APPEND changes write atomicity
-            // semantics, smallfile's append is "seek to end then write"
             if append {
                 f.seek(SeekFrom::End(0))?;
             }
@@ -809,7 +727,7 @@ impl Workload {
                 remaining_kb -= next_kb;
             }
             if self.p.record_ctime_size {
-                self.remember_ctime_size(&fnm, &f)?;
+                self.remember_ctime_size(&f)?;
             }
             if self.p.fsync {
                 fsync_raw(&f)?;
@@ -827,8 +745,6 @@ impl Workload {
             let mut f = File::open(&fnm)?;
             let biggest = self.biggest_buf.clone();
             let uo = self.unique_offset();
-            // reads expect the first next_fsz of the file regardless of appends, because
-            // get_next_file_size() replays the same (fixed or seeded) size sequence
             let mut remaining_kb = next_fsz;
             let rszkb = self.p.record_size_to_use();
             while remaining_kb > 0 {
@@ -843,9 +759,8 @@ impl Workload {
                         .position(|(a, b)| a != b)
                         .unwrap_or(n);
                     return Err(io::Error::other(format!(
-                        "read: file {} contents matched up through byte {}",
+                        "read: file {} contents matched up through byte {matched}",
                         fnm.display(),
-                        matched
                     )));
                 }
                 remaining_kb -= next_kb;
@@ -877,21 +792,13 @@ impl Workload {
             let fnm = self.this_file_nm(&self.src_dirs);
             let t0 = self.now();
             match self.p.opname.as_str() {
-                "delete" => {
-                    fs::remove_file(&fnm)?;
-                }
+                "delete" => fs::remove_file(&fnm)?,
                 "stat" => {
-                    fs::metadata(&fnm)?;
+                    let _ = fs::metadata(&fnm)?;
                 }
-                "chmod" => {
-                    fs::set_permissions(&fnm, fs::Permissions::from_mode(0o646))?;
-                }
-                "mkdir" => {
-                    fs::create_dir(suffixed(&fnm, ".d"))?;
-                }
-                "rmdir" => {
-                    fs::remove_dir(suffixed(&fnm, ".d"))?;
-                }
+                "chmod" => fs::set_permissions(&fnm, fs::Permissions::from_mode(0o646))?,
+                "mkdir" => fs::create_dir(suffixed(&fnm, ".d"))?,
+                "rmdir" => fs::remove_dir(suffixed(&fnm, ".d"))?,
                 _ => unreachable!(),
             }
             self.op_end(t0);
@@ -928,10 +835,14 @@ impl Workload {
 
     fn do_readdir(&mut self, flag: &AtomicBool, stat_each: bool) -> io::Result<()> {
         if self.p.hash_to_dir {
-            return Err(io::Error::other("cannot do readdir test with --hash-into-dirs option"));
+            return Err(io::Error::other(
+                "cannot do readdir test with --hash-into-dirs option",
+            ));
         }
         let top = self.p.top.clone();
         let opname = self.p.opname.clone();
+        let thread_tag = format!("_{}_{}_", self.p.host, self.tid_label);
+        let shared = self.p.is_shared_dir;
         let mut prev_dir = String::new();
         let mut dir_map: HashSet<String> = HashSet::new();
         let mut file_count = 0usize;
@@ -944,9 +855,11 @@ impl Workload {
                 .to_string_lossy()
                 .into_owned();
             if common_dir != prev_dir {
-                if file_count != dir_map.len() {
+                if !prev_dir.is_empty() && file_count != dir_map.len() {
                     return Err(io::Error::other(format!(
-                        "readdir: not all files in directory {prev_dir} were found"
+                        "readdir: expected {} files in {prev_dir}, saw {}",
+                        file_count,
+                        dir_map.len()
                     )));
                 }
                 let t0 = self.now();
@@ -954,7 +867,8 @@ impl Workload {
                     .map(|e| e.map(|d| d.file_name().to_string_lossy().into_owned()))
                     .collect::<Result<HashSet<_>, _>>()?
                     .into_iter()
-                    .filter(|n| !n.starts_with('d'))
+                    .filter(|n| !n.starts_with("d_") && !n.starts_with("h_"))
+                    .filter(|n| !shared || n.contains(&thread_tag))
                     .collect();
                 self.op_end_as(t0, &format!("{opname}-readdir"));
                 prev_dir = common_dir;
@@ -966,11 +880,22 @@ impl Workload {
                 self.op_end_as(t0, &format!("{opname}-stat"));
             }
             file_count += 1;
-            if !dir_map.contains(&fnm.file_name().unwrap().to_string_lossy().into_owned()) {
+            let leaf = fnm.file_name().unwrap().to_string_lossy().into_owned();
+            if !dir_map.contains(&leaf) {
                 return Err(io::Error::other(format!(
-                    "readdir: file missing from directory {prev_dir}"
+                    "readdir: file {leaf} missing from directory {prev_dir}"
                 )));
             }
+        }
+        if !prev_dir.is_empty()
+            && self.filenum >= self.p.iterations as usize
+            && file_count != dir_map.len()
+        {
+            return Err(io::Error::other(format!(
+                "readdir: expected {} files in final directory {prev_dir}, saw {}",
+                file_count,
+                dir_map.len()
+            )));
         }
         Ok(())
     }
@@ -978,12 +903,13 @@ impl Workload {
     fn do_cleanup(&mut self, flag: &AtomicBool) -> io::Result<()> {
         let (saved_stonewall, saved_finish) = (self.p.stonewall, self.p.finish_all_rq);
         self.p.stonewall = false;
-        self.p.finish_all_rq = true; // cleanup must always run to completion
+        self.p.finish_all_rq = true;
         let result = (|| {
             while self.do_another_file(flag) {
                 ensure_deleted(&suffixed(&self.this_file_nm(&self.dest_dirs), ".s"))?;
                 let basenm = self.this_file_nm(&self.src_dirs);
                 ensure_deleted(&basenm)?;
+                ensure_deleted(&suffixed(&basenm, ".tmp"))?;
                 ensure_deleted(&suffixed(&basenm, RENAME_SUFFIX))?;
                 ensure_deleted(&self.this_file_nm(&self.dest_dirs))?;
                 ensure_deleted(&suffixed(&self.this_file_nm(&self.dest_dirs), RENAME_SUFFIX))?;
@@ -999,8 +925,6 @@ impl Workload {
         result
     }
 
-    // xattr j gets the pattern bytes [j, j+xattr_size) of this file's buffer slice,
-    // exactly what do_getxattr compares against
     fn xattr_value<'a>(&self, biggest: &'a [u8], uo: usize, j: usize) -> &'a [u8] {
         let begin = (uo + j).min(biggest.len());
         let end = (uo + j + self.p.xattr_size).min(biggest.len());
@@ -1015,10 +939,10 @@ impl Workload {
             let t0 = self.now();
             let f = OpenOptions::new().write(true).open(&fnm)?;
             for j in 0..self.p.xattr_count {
-                xattr::set(&fnm, &format!("{XATTR_SUFFIX}{j}"), self.xattr_value(&biggest, uo, j))?;
+                f.set_xattr(&format!("{XATTR_SUFFIX}{j}"), self.xattr_value(&biggest, uo, j))?;
             }
             if self.p.fsync {
-                fsync_raw(&f)?; // fsync also flushes xattr values and metadata
+                fsync_raw(&f)?;
             }
             drop(f);
             self.op_end(t0);
@@ -1032,9 +956,10 @@ impl Workload {
             let biggest = self.biggest_buf.clone();
             let uo = self.unique_offset();
             let t0 = self.now();
+            let f = File::open(&fnm)?;
             for j in 0..self.p.xattr_count {
                 let name = format!("{XATTR_SUFFIX}{j}");
-                match xattr::get(&fnm, &name)? {
+                match f.get_xattr(&name)? {
                     Some(v) if v == self.xattr_value(&biggest, uo, j) => {}
                     Some(v) => {
                         return Err(io::Error::other(format!(
@@ -1055,8 +980,6 @@ impl Workload {
         Ok(())
     }
 
-    // emulates an OpenStack Swift PUT: preallocate, write, attach xattrs, drop the
-    // page cache, then rename into place -- one request per file regardless of records
     fn do_swift_put(&mut self, flag: &AtomicBool) -> io::Result<()> {
         while self.do_another_file(flag) {
             let finalnm = self.this_file_nm(&self.src_dirs);
@@ -1066,13 +989,15 @@ impl Workload {
             let uo = self.unique_offset();
             let t0 = self.now();
             let result = (|| -> io::Result<()> {
-                let mut f = OpenOptions::new().write(true).create(true).open(&tmpnm)?;
+                let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmpnm)?;
                 let fd = f.as_raw_fd();
                 if unsafe { libc::fchmod(fd, 0o667) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 let fszbytes = next_fsz as i64 * 1024;
-                preallocate(fd, fszbytes)?;
+                if fszbytes > 0 {
+                    let _ = posix_fallocate_fd(fd, 0, fszbytes);
+                }
                 let mut remaining_kb = next_fsz;
                 let rszkb = self.p.record_size_to_use();
                 while remaining_kb > 0 {
@@ -1081,33 +1006,35 @@ impl Workload {
                     remaining_kb -= next_kb;
                 }
                 for j in 0..self.p.xattr_count {
-                    let name = format!("{SWIFT_XATTR_PREFIX}{j}");
-                    if xattr::get(&tmpnm, &name)?.is_none() {
-                        error!("xattr {name} does not exist");
-                    }
+                    let _ = f.get_xattr(&format!("{SWIFT_XATTR_PREFIX}{j}"))?;
                 }
                 for j in 0..self.p.xattr_count {
-                    xattr::set(
-                        &tmpnm,
+                    f.set_xattr(
                         &format!("{SWIFT_XATTR_PREFIX}{j}"),
                         self.xattr_value(&biggest, uo, j),
                     )?;
                 }
                 if self.p.fsync {
-                    fsync_raw(&f)?; // flush both data and metadata with one fsync
+                    fsync_raw(&f)?;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // `posix_fadvise` returns a positive errno directly without setting `errno`,
+                    // and MUST run while `f` is still open.
+                    let rc = unsafe {
+                        libc::posix_fadvise(fd, 0, fszbytes, libc::POSIX_FADV_DONTNEED)
+                    };
+                    if rc != 0 {
+                        return Err(io::Error::from_raw_os_error(rc));
+                    }
                 }
                 drop(f);
-                #[cfg(target_os = "linux")]
-                // we assume here that data will not be read anytime soon
-                if unsafe { libc::posix_fadvise(fd, 0, fszbytes, libc::POSIX_FADV_DONTNEED) } != 0 {
-                    return Err(io::Error::last_os_error());
-                }
                 fs::rename(&tmpnm, &finalnm)?;
                 self.rq += 1;
                 Ok(())
             })();
             if let Err(e) = result {
-                ensure_deleted(&tmpnm)?;
+                let _ = ensure_deleted(&tmpnm);
                 return Err(e);
             }
             self.op_end(t0);
@@ -1139,21 +1066,26 @@ impl Workload {
                 self.rq += 1;
             }
             for j in 0..self.p.xattr_count {
-                xattr::get(&fnm, &format!("{SWIFT_XATTR_PREFIX}{j}"))?;
+                let _ = f.get_xattr(&format!("{SWIFT_XATTR_PREFIX}{j}"))?;
             }
             self.op_end(t0);
         }
         Ok(())
     }
 
-    // for async (geo-)replication testing: wait for files created elsewhere to appear
-    // and reach their original size; the response time then measures replication lag
     fn do_await_create(&mut self, flag: &AtomicBool) -> io::Result<()> {
+        let bound = Duration::from_secs(self.p.await_timeout_sec.max(1));
         while self.do_another_file(flag) {
             let fnm = self.this_file_nm(&self.src_dirs);
-            debug!("awaiting file {}", fnm.display());
+            let wait_t0 = Instant::now();
             while !fnm.exists() {
-                thread::sleep(Duration::from_secs(1));
+                if wait_t0.elapsed() > bound {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("await-create timed out waiting for {}", fnm.display()),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
             }
             let (ctime, size_kb) = loop {
                 if let Some(v) = xattr::get(&fnm, CTIME_XATTR)? {
@@ -1170,7 +1102,13 @@ impl Workload {
                         .ok_or_else(|| io::Error::other("await-create: bad size xattr"))?;
                     break (ctime, kb);
                 }
-                thread::sleep(Duration::from_secs(1));
+                if wait_t0.elapsed() > bound {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("await-create timed out waiting for xattr on {}", fnm.display()),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
             };
             loop {
                 let len = fs::metadata(&fnm)?.len();
@@ -1183,7 +1121,13 @@ impl Workload {
                 if len == size_kb * 1024 {
                     break;
                 }
-                thread::sleep(Duration::from_millis(1));
+                if wait_t0.elapsed() > bound {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("await-create timed out waiting for full size on {}", fnm.display()),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
             }
             let now_ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1202,6 +1146,7 @@ impl Workload {
         Outcome {
             tid: self.tid_label,
             status: self.status,
+            err_msg: self.err_msg,
             elapsed: self.end.zip(self.start).map(|(e, s)| (e - s).as_secs_f64()),
             files: self.filenum_final.unwrap_or(0),
             records: self.rq_final.unwrap_or(0),
@@ -1212,23 +1157,28 @@ impl Workload {
 struct Outcome {
     tid: String,
     status: i32,
+    err_msg: Option<String>,
     elapsed: Option<f64>,
     files: usize,
     records: u64,
 }
 
-fn run_phase(p: &Params) -> io::Result<Vec<Outcome>> {
-    for d in [p.src_base(), p.dest_base()] {
-        fs::create_dir_all(&d)?;
+fn run_phase(p: &Params, biggest_buf: &Arc<Vec<u8>>) -> io::Result<Vec<Outcome>> {
+    if p.opname != "cleanup" {
+        for d in [p.src_base(), p.dest_base()] {
+            fs::create_dir_all(&d)?;
+        }
     }
     let n = p.threads as usize;
     let barrier = Barrier::new(n);
+    let setup_failed = AtomicBool::new(false);
     let stonewall_flag = AtomicBool::new(false);
-    let biggest_buf = Arc::new(build_biggest_buf());
-    let outcomes = thread::scope(|s| {
+
+    let outcomes: Vec<Outcome> = thread::scope(|s| {
         let mut joins = Vec::with_capacity(n);
         for tid in 0..n {
             let barrier = &barrier;
+            let setup_failed = &setup_failed;
             let flag = &stonewall_flag;
             let buf = biggest_buf.clone();
             let tp = p.clone();
@@ -1241,32 +1191,44 @@ fn run_phase(p: &Params) -> io::Result<Vec<Outcome>> {
                 };
                 if let Err(e) = pre {
                     w.status = errno(&e);
+                    w.err_msg = Some(e.to_string());
+                    setup_failed.store(true, Ordering::SeqCst);
                     error!("thread {}: {}", w.tid_label, e);
+                }
+                // Always enter `barrier.wait()` even after setup failure so sibling threads never deadlock.
+                barrier.wait();
+                if setup_failed.load(Ordering::SeqCst) {
                     return w.into_outcome();
                 }
-                barrier.wait();
                 w.start = Some(Instant::now());
                 w.start_wall = Some(SystemTime::now());
                 if let Err(e) = w.run_op(flag) {
                     w.status = errno(&e);
+                    w.err_msg = Some(e.to_string());
                     error!("thread {} op {} failed: {}", w.tid_label, w.p.opname, e);
                 }
                 w.end_test(flag);
                 if let Err(e) = w.save_rsptimes() {
                     warn!("thread {}: could not save rsptimes: {}", w.tid_label, e);
                 }
-                let o = w.into_outcome();
-                debug!("thread {} done: {:?}", o.tid, (o.files, o.records, o.status));
-                o
+                w.into_outcome()
             }));
         }
         joins.into_iter().map(|j| j.join().unwrap()).collect()
     });
+
+    if p.opname == "cleanup" {
+        let _ = fs::remove_dir(p.src_base());
+        let _ = fs::remove_dir(p.dest_base());
+        let _ = fs::remove_dir(p.top.join("file_srcdir"));
+        let _ = fs::remove_dir(p.top.join("file_dstdir"));
+    }
     Ok(outcomes)
 }
 
 struct Agg {
     status: i32,
+    failure: Option<String>,
     elapsed: f64,
     files: usize,
     records: u64,
@@ -1280,6 +1242,7 @@ fn phase_results(p: &Params, outcomes: &[Outcome], phase_start: SystemTime) -> (
     let mut threads = Map::new();
     let mut agg = Agg {
         status: OK,
+        failure: None,
         elapsed: 0.0,
         files: 0,
         records: 0,
@@ -1302,13 +1265,11 @@ fn phase_results(p: &Params, outcomes: &[Outcome], phase_start: SystemTime) -> (
                     (el, fps, 0.0, 0.0)
                 }
             }
-            _ => {
-                warn!("thread {} never completed", o.tid);
-                (1e8, 0.0, 0.0, 0.0)
-            }
+            _ => (0.0, 0.0, 0.0, 0.0),
         };
+        let t_status = o.err_msg.clone().unwrap_or_else(|| status_str(o.status));
         let mut t = json!({
-            "status": status_str(o.status),
+            "status": if o.status == OK { "ok".into() } else { t_status.clone() },
             "elapsed": elapsed,
             "files": o.files,
             "records": o.records,
@@ -1319,10 +1280,9 @@ fn phase_results(p: &Params, outcomes: &[Outcome], phase_start: SystemTime) -> (
             t["MiBps"] = json!(mibps);
         }
         threads.insert(o.tid.clone(), t);
-        // aggregation semantics from smallfile's output_results: rates are summed
-        // per-thread, elapsed is the max, status is the first non-OK thread
-        if agg.status == OK {
+        if agg.status == OK && o.status != OK {
             agg.status = o.status;
+            agg.failure = Some(t_status);
         }
         agg.elapsed = agg.elapsed.max(elapsed);
         agg.files += o.files;
@@ -1335,10 +1295,10 @@ fn phase_results(p: &Params, outcomes: &[Outcome], phase_start: SystemTime) -> (
             }
         }
     }
-    let max_files = p.iterations as f64 * outcomes.len() as f64;
+    let max_files = (p.iterations as f64 * outcomes.len() as f64).max(1.0);
     let pct_files = 100.0 * agg.files as f64 / max_files;
     let mut r = json!({
-        "status": status_str(agg.status),
+        "status": if agg.status == OK { "ok".into() } else { agg.failure.clone().unwrap_or_else(|| status_str(agg.status)) },
         "elapsed": agg.elapsed,
         "files": agg.files,
         "records": agg.records,
@@ -1367,26 +1327,23 @@ pub fn run(top: &Path, args: &Args) -> io::Result<Value> {
         return Err(io::Error::other(format!("{} is not a directory", top.display())));
     }
     if args.record_size > args.file_size && args.file_size != 0 {
-        return Err(io::Error::other("record size must not be greater than file size"));
+        return Err(io::Error::other(
+            "record size must not be greater than file size",
+        ));
     }
     let ops: Vec<String> = match &args.operation {
         Some(op) => vec![op.clone()],
         None => DEFAULT_PHASES.iter().map(|s| s.to_string()).collect(),
     };
-    let host = hostname::get()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "localhost".to_string());
+    let host = host_name();
     let mut stonewall = args.stonewall;
     if args.files < 10 {
         stonewall = false;
     }
     if args.operation.is_none() && stonewall {
-        // multi-phase suite must not truncate slow threads: later phases would fail
-        // on files the stonewalled threads never wrote (smallfile's regtest.sh
-        // likewise disables stonewall for sequential op runs)
         stonewall = false;
-        info!("stonewall disabled for multi-phase suite run");
     }
+
     let p = Params {
         opname: String::new(),
         iterations: args.files,
@@ -1406,6 +1363,7 @@ pub fn run(top: &Path, args: &Args) -> io::Result<Value> {
         finish_all_rq: args.finish,
         verify_read: args.verify_read,
         fsync: args.fsync,
+        incompressible: args.incompressible,
         hash_to_dir: args.hash_into_dirs,
         is_shared_dir: args.same_dir,
         pause_between_files_us: args.pause,
@@ -1414,36 +1372,53 @@ pub fn run(top: &Path, args: &Args) -> io::Result<Value> {
         xattr_size: args.xattr_size,
         xattr_count: args.xattr_count,
         record_ctime_size: args.record_ctime_size,
+        await_timeout_sec: args.await_timeout,
         top: top.to_path_buf(),
         host: host.clone(),
     };
+
     info!(
-        "fstest smallfile: top={} threads={} files/thread={} file_size={}KB record_size={}KB files_per_dir={} dirs_per_dir={} stonewall={} fsync={} verify_read={}",
+        "smallfile: top={} threads={} files/thread={} file_size={}KB record_size={}KB stonewall={} fsync={} incompressible={} verify_read={}",
         top.display(),
         p.threads,
         p.iterations,
         p.total_sz_kb,
         p.record_sz_kb,
-        p.files_per_dir,
-        p.dirs_per_dir,
         p.stonewall,
         p.fsync,
+        p.incompressible,
         p.verify_read
     );
+
+    let biggest_buf = Arc::new(build_biggest_buf(p.incompressible));
     let suite_start = SystemTime::now();
     let mut phases = Vec::new();
     let mut all_ok = true;
-    for op in &ops {
+    let mut first_failure: Option<String> = None;
+
+    for (idx, op) in ops.iter().enumerate() {
         let mut po = p.clone();
         po.opname = op.clone();
+        // Populate/cleanup operations must always finish creating/removing all items even when
+        // stonewall ends measurement early (upstream `parse.py` behavior).
+        if matches!(op.as_str(), "cleanup" | "create" | "mkdir" | "swift-put") {
+            po.finish_all_rq = true;
+        }
+        if op == "cleanup" {
+            po.pause_between_files_us = 0;
+            po.auto_pause = false;
+        }
         let phase_start = SystemTime::now();
-        info!("phase '{op}' started");
-        let outcomes = run_phase(&po)?;
+        let outcomes = run_phase(&po, &biggest_buf)?;
         let (results, agg) = phase_results(&po, &outcomes, phase_start);
-        all_ok &= agg.status == OK;
+        let ok = agg.status == OK;
+        all_ok &= ok;
+        if !ok && first_failure.is_none() {
+            first_failure = agg.failure.clone();
+        }
         let mut line = format!(
             "phase '{op}' finished: status={} elapsed={:.3}s files={} filesPerSec={:.1}",
-            status_str(agg.status),
+            if ok { "ok" } else { "failed" },
             agg.elapsed,
             agg.files,
             agg.files_per_sec
@@ -1457,12 +1432,23 @@ pub fn run(top: &Path, args: &Args) -> io::Result<Value> {
             );
         }
         info!("{line}");
-        phases.push(json!({
+        let mut phase_obj = json!({
             "operation": op,
+            "status": if ok { "ok" } else { "failed" },
             "date": iso8601(phase_start),
             "results": results,
-        }));
+        });
+        if let Some(f) = &agg.failure {
+            phase_obj["failure"] = json!(f);
+        }
+        phases.push(phase_obj);
+
+        if op == "cleanup" && idx + 1 == ops.len() && ops.len() > 1 {
+            remove_dir_all_bounded(&top.join("file_srcdir"), Duration::from_secs(10));
+            remove_dir_all_bounded(&top.join("file_dstdir"), Duration::from_secs(10));
+        }
     }
+
     let params_json = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "top": top.display().to_string(),
@@ -1479,6 +1465,7 @@ pub fn run(top: &Path, args: &Args) -> io::Result<Value> {
         "finish_all_requests": p.finish_all_rq,
         "verify_read": p.verify_read,
         "fsync_after_modify": p.fsync,
+        "incompressible": p.incompressible,
         "fname_prefix": p.prefix,
         "fname_suffix": p.suffix,
         "share_dir": p.is_shared_dir,
@@ -1498,10 +1485,110 @@ pub fn run(top: &Path, args: &Args) -> io::Result<Value> {
         "params": params_json,
         "status": if all_ok { "ok" } else { "failed" },
     });
+    if let Some(f) = first_failure {
+        report["failure"] = json!(f);
+    }
     if ops.len() == 1 {
         report["results"] = phases.remove(0)["results"].clone();
     } else {
         report["phases"] = json!(phases);
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn smallfile_multiphase_and_swift_and_readdir_shared_dir_pass_cleanly() {
+        let dir = std::env::temp_dir().join(format!("fstest-smallfile-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. Default multi-phase run with `--incompressible Y` leaves zero leftover directories.
+        let cli = TestCli::parse_from([
+            "smallfile",
+            "--files",
+            "20",
+            "--threads",
+            "2",
+            "--file-size",
+            "8",
+            "--incompressible",
+            "Y",
+        ]);
+        let rep = run(&dir, &cli.args).expect("multiphase");
+        assert_eq!(rep["status"], json!("ok"), "rep: {rep}");
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+
+        // 2. Single-op `swift-put` -> `swift-get` -> `readdir` (`--same-dir Y` + `--prefix data`) -> `cleanup`.
+        for op in ["swift-put", "swift-get", "ls-l", "cleanup"] {
+            let op_cli = TestCli::parse_from([
+                "smallfile",
+                "--operation",
+                op,
+                "--files",
+                "16",
+                "--threads",
+                "2",
+                "--files-per-dir",
+                "8",
+                "--file-size",
+                "4",
+                "--same-dir",
+                "Y",
+                "--prefix",
+                "data",
+                "--xattr-count",
+                "2",
+                "--xattr-size",
+                "16",
+            ]);
+            let r = run(&dir, &op_cli.args).expect(op);
+            assert_eq!(r["status"], json!("ok"), "{op} failed: {r}");
+        }
+
+        // 3. Large `--file-size` (>= 10100 KB) never underflows `files_between_checks()`.
+        let mut p_large = Params {
+            opname: "create".into(),
+            iterations: 10,
+            threads: 1,
+            record_sz_kb: 0,
+            total_sz_kb: 25_000,
+            filesize_distr: Distr::Fixed,
+            files_per_dir: 10,
+            dirs_per_dir: 2,
+            prefix: String::new(),
+            suffix: String::new(),
+            stonewall: true,
+            finish_all_rq: false,
+            verify_read: true,
+            fsync: false,
+            incompressible: false,
+            hash_to_dir: false,
+            is_shared_dir: false,
+            pause_between_files_us: 0,
+            auto_pause: false,
+            measure_rsptimes: false,
+            xattr_size: 0,
+            xattr_count: 0,
+            record_ctime_size: false,
+            await_timeout_sec: 5,
+            top: dir.clone(),
+            host: "test".into(),
+        };
+        assert_eq!(p_large.files_between_checks(), 10);
+        p_large.total_sz_kb = 0;
+        assert_eq!(p_large.files_between_checks(), 20);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
