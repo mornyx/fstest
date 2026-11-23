@@ -129,23 +129,13 @@ fn op_by_name(n: &str) -> Option<Op> {
 }
 
 fn op_name(o: Op) -> &'static str {
-    OP_TABLE
-        .iter()
-        .find(|(x, ..)| *x == o)
-        .map(|(_, n, _, _)| *n)
-        .unwrap()
+    OP_TABLE.iter().find(|(x, ..)| *x == o).map(|(_, n, _, _)| *n).unwrap()
 }
 
 fn is_linux_only_op(o: Op) -> bool {
     matches!(
         o,
-        Op::Fallocate
-            | Op::Punch
-            | Op::Zero
-            | Op::Collapse
-            | Op::Insert
-            | Op::CloneRange
-            | Op::CopyRange
+        Op::Fallocate | Op::Punch | Op::Zero | Op::Collapse | Op::Insert | Op::CloneRange | Op::CopyRange
     )
 }
 
@@ -384,12 +374,7 @@ fn write_pattern(st: &mut ThreadState, fd: i32, path: &Path, off: u64, len: usiz
 // `O_NONBLOCK` + `S_IFREG` check is mandatory: cross-thread `rename`/`rexchange`
 // can place a FIFO (`mkfifo`) or device node (`mknod`) at a path tracked as `Ft::Reg`,
 // and blocking `open(2)` on a FIFO without `O_NONBLOCK` hangs forever in the kernel.
-fn open_reg_fd(
-    st: &mut ThreadState,
-    path: &Path,
-    write: bool,
-    verbose: bool,
-) -> Option<(i32, libc::stat)> {
+fn open_reg_fd(st: &mut ThreadState, path: &Path, write: bool, verbose: bool) -> Option<(i32, libc::stat)> {
     let flags = (if write { libc::O_WRONLY } else { libc::O_RDONLY }) | libc::O_NONBLOCK;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
     let fd = unsafe { libc::open(c.as_ptr(), flags) };
@@ -419,10 +404,8 @@ fn do_fallocate(st: &mut ThreadState, fd: i32, mode: i32, off: u64, len: u64, pa
 }
 
 fn rename_flags_call(src: &Path, dst: &Path, flags: u32) -> Result<(), std::io::Error> {
-    let cs = CString::new(src.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-    let cd = CString::new(dst.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let cs = CString::new(src.as_os_str().as_bytes()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let cd = CString::new(dst.as_os_str().as_bytes()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     #[cfg(target_os = "linux")]
     unsafe {
         let rc = libc::syscall(
@@ -467,7 +450,11 @@ extern "C" fn sigbus_handler(_: libc::c_int) {
     const CAUSE: &[u8] = b"SIGBUS: concurrent truncate vs mmap race aborted the run";
     let mut buf = [0u8; 512];
     let mut w = 0usize;
-    w = push_bytes(&mut buf, w, b"{\"suite\":\"fsstress\",\"status\":\"failed\",\"failure\":\"");
+    w = push_bytes(
+        &mut buf,
+        w,
+        b"{\"suite\":\"fsstress\",\"status\":\"failed\",\"failure\":\"",
+    );
     w = push_bytes(&mut buf, w, CAUSE);
     w = push_bytes(&mut buf, w, b"\",\"totalOps\":");
     w = push_u64(&mut buf, w, SIGBUS_OPS.load(Ordering::Relaxed));
@@ -785,10 +772,7 @@ impl Proc {
             return;
         }
         let mut sb: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut sb) } != 0
-            || (sb.st_mode & libc::S_IFMT) != libc::S_IFREG
-            || sb.st_size == 0
-        {
+        if unsafe { libc::fstat(fd, &mut sb) } != 0 || (sb.st_mode & libc::S_IFMT) != libc::S_IFREG || sb.st_size == 0 {
             unsafe { libc::close(fd) };
             return;
         }
@@ -872,7 +856,13 @@ impl Proc {
         let Some(path) = pick_path(&mut self.st, &[Ft::Reg, Ft::Dir], r, &self.base) else {
             return;
         };
-        let mode = if path.is_dir() { 0o755 } else if r % 2 == 0 { 0o644 } else { 0o600 };
+        let mode = if path.is_dir() {
+            0o755
+        } else if r % 2 == 0 {
+            0o644
+        } else {
+            0o600
+        };
         if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(mode)) {
             report_err(&mut self.st, "chmod", &path, &e, self.verbose);
         }
@@ -1032,8 +1022,7 @@ impl Proc {
     }
 
     fn getdents(&mut self, r: u64) {
-        let path = pick_path(&mut self.st, &[Ft::Dir], r, &self.base)
-            .unwrap_or_else(|| self.base.clone());
+        let path = pick_path(&mut self.st, &[Ft::Dir], r, &self.base).unwrap_or_else(|| self.base.clone());
         match fs::read_dir(&path) {
             Ok(entries) => {
                 for e in entries.flatten() {
@@ -1112,7 +1101,7 @@ impl Proc {
         #[cfg(target_os = "linux")]
         unsafe {
             let mut fl: u32 = 0;
-            let _ = libc::ioctl(fd, 0x80086601u64 as libc::c_ulong, &mut fl);
+            let _ = libc::ioctl(fd, 0x80086601u32 as libc::Ioctl, &mut fl);
         }
         #[cfg(target_os = "macos")]
         unsafe {
@@ -1191,7 +1180,7 @@ impl Proc {
                 src_length: i64,
                 dest_offset: i64,
             }
-            const FICLONERANGE: libc::c_ulong = 0x4020940D;
+            const FICLONERANGE: libc::Ioctl = 0x4020940Du32 as libc::Ioctl;
 
             let Some(src_path) = pick_path(&mut self.st, &[Ft::Reg], r, &self.base) else {
                 return;
@@ -1266,8 +1255,7 @@ impl Proc {
                 let size = sb.st_size as u64;
                 let mut o1 = ((self.st.rng.next() as u64) % size) as i64;
                 let mut o2 = ((self.st.rng.next() as u64) % FILELEN_MAX as u64) as i64;
-                let len = (((self.st.rng.next() as u64) % (size - o1 as u64)) + 1)
-                    .min(FILELEN_MAX as u64) as usize;
+                let len = (((self.st.rng.next() as u64) % (size - o1 as u64)) + 1).min(FILELEN_MAX as u64) as usize;
                 if unsafe { libc::copy_file_range(sfd, &mut o1, dfd, &mut o2, len, 0) } < 0 {
                     report_err(
                         &mut self.st,
@@ -1291,8 +1279,7 @@ impl Proc {
 }
 
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
-    let meta = fs::symlink_metadata(mountpoint)
-        .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let meta = fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
@@ -1310,10 +1297,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     let mut freqs: HashMap<&'static str, u32> = OP_TABLE
         .iter()
         .map(|(o, n, f, _)| {
-            let def = if args.zero_freq
-                || (!linux && is_linux_only_op(*o))
-                || matches!(o, Op::MRead | Op::MWrite)
-            {
+            let def = if args.zero_freq || (!linux && is_linux_only_op(*o)) || matches!(o, Op::MRead | Op::MWrite) {
                 0
             } else {
                 *f
@@ -1358,7 +1342,11 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     SIGBUS_OPS.store(0, Ordering::Relaxed);
     SIGBUS_ERRORS.store(0, Ordering::Relaxed);
     if let Some(path) = &args.json
-        && let Ok(f) = fs::OpenOptions::new().create(true).write(true).truncate(true).open(path)
+        && let Ok(f) = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
     {
         use std::os::unix::io::IntoRawFd;
         SIGBUS_JSON_FD.store(f.into_raw_fd(), Ordering::Relaxed);
@@ -1412,12 +1400,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
                         SIGBUS_OPS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                let hist: Map<String, Value> = proc
-                    .st
-                    .hist
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), json!(v)))
-                    .collect();
+                let hist: Map<String, Value> = proc.st.hist.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
                 json!({
                     "proc": tid,
                     "opsDone": current_index,
@@ -1462,10 +1445,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     let duration_ms = t0.elapsed().as_millis() as u64;
     let total_ops: u64 = per_thread.iter().map(|v| v["opsDone"].as_u64().unwrap_or(0)).sum();
     let total_errors: u64 = per_thread.iter().map(|v| v["errors"].as_u64().unwrap_or(0)).sum();
-    let fatal_errors: u64 = per_thread
-        .iter()
-        .map(|v| v["fatalErrors"].as_u64().unwrap_or(0))
-        .sum();
+    let fatal_errors: u64 = per_thread.iter().map(|v| v["fatalErrors"].as_u64().unwrap_or(0)).sum();
     let first_fatal = per_thread
         .iter()
         .find_map(|v| v["firstFatal"].as_str().map(String::from));
@@ -1540,17 +1520,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let cli = TestCli::parse_from([
-            "fsstress",
-            "-z",
-            "-f",
-            "mkdir=2",
-            "-f",
-            "rename=2",
-            "-n",
-            "50",
-            "-c",
-        ]);
+        let cli = TestCli::parse_from(["fsstress", "-z", "-f", "mkdir=2", "-f", "rename=2", "-n", "50", "-c"]);
         let rep = run(&dir, &cli.args).expect("fsstress -z");
         assert_eq!(rep["status"], json!("ok"));
         let hist = rep["proc"][0]["opHistogram"].as_object().unwrap();
