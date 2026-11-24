@@ -3,8 +3,7 @@
 // C syscall helper is implemented as `fstest __pjdfstest` inside the same binary.
 
 use crate::common::{
-     detect_fstype, exec_with_timeout, host_name, iso8601, posix_fallocate_fd,
-    remove_dir_all_bounded, tail_utf8,
+    detect_fstype, exec_with_timeout, host_name, iso8601, posix_fallocate_fd, remove_dir_all_bounded, tail_utf8,
 };
 use log::{info, warn};
 use serde_json::{Value, json};
@@ -366,9 +365,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
             cvt(unsafe { libc::unlinkat(dirfd_get(fds, arg(0))?, cptr(arg(1)), flag) })
         }
         "mkdir" => cvt(unsafe { libc::mkdir(cptr(arg(0)), num(1) as libc::mode_t) }),
-        "mkdirat" => cvt(unsafe {
-            libc::mkdirat(dirfd_get(fds, arg(0))?, cptr(arg(1)), num(2) as libc::mode_t)
-        }),
+        "mkdirat" => cvt(unsafe { libc::mkdirat(dirfd_get(fds, arg(0))?, cptr(arg(1)), num(2) as libc::mode_t) }),
         "rmdir" => cvt(unsafe { libc::rmdir(cptr(arg(0))) }),
         "link" => cvt(unsafe { libc::link(cptr(arg(0)), cptr(arg(1))) }),
         "linkat" => {
@@ -384,9 +381,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
             })
         }
         "symlink" => cvt(unsafe { libc::symlink(cptr(arg(0)), cptr(arg(1))) }),
-        "symlinkat" => cvt(unsafe {
-            libc::symlinkat(cptr(arg(0)), dirfd_get(fds, arg(1))?, cptr(arg(2)))
-        }),
+        "symlinkat" => cvt(unsafe { libc::symlinkat(cptr(arg(0)), dirfd_get(fds, arg(1))?, cptr(arg(2))) }),
         "readlink" | "readlinkat" => {
             let mut buf = vec![0u8; 4096];
             let n = if name == "readlinkat" {
@@ -399,13 +394,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
                     )
                 }
             } else {
-                unsafe {
-                    libc::readlink(
-                        cptr(arg(0)),
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len(),
-                    )
-                }
+                unsafe { libc::readlink(cptr(arg(0)), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) }
             };
             if n < 0 {
                 return Err(last_errno());
@@ -478,9 +467,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
             }
         }
         "mkfifo" => cvt(unsafe { libc::mkfifo(cptr(arg(0)), num(1) as libc::mode_t) }),
-        "mkfifoat" => cvt(unsafe {
-            libc::mkfifoat(dirfd_get(fds, arg(0))?, cptr(arg(1)), num(2) as libc::mode_t)
-        }),
+        "mkfifoat" => cvt(unsafe { libc::mkfifoat(dirfd_get(fds, arg(0))?, cptr(arg(1)), num(2) as libc::mode_t) }),
         "mknod" | "mknodat" => {
             let base = if name == "mknodat" { 1 } else { 0 };
             let ftype = match arg(base + 1) {
@@ -518,11 +505,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
                 sa.sun_len = len as u8;
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    sa.sun_path.as_mut_ptr() as *mut u8,
-                    bytes.len(),
-                );
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), sa.sun_path.as_mut_ptr() as *mut u8, bytes.len());
                 let r = if name == "bind" {
                     libc::bind(fd, &sa as *const _ as *const libc::sockaddr, len as libc::socklen_t)
                 } else {
@@ -558,14 +541,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
         "fchmod" => cvt(unsafe { libc::fchmod(fd_get(fds, num(0))?, num(1) as libc::mode_t) }),
         "fchmodat" => {
             let flag = parse_at_flag(arg(3));
-            cvt(unsafe {
-                libc::fchmodat(
-                    dirfd_get(fds, arg(0))?,
-                    cptr(arg(1)),
-                    num(2) as libc::mode_t,
-                    flag,
-                )
-            })
+            cvt(unsafe { libc::fchmodat(dirfd_get(fds, arg(0))?, cptr(arg(1)), num(2) as libc::mode_t, flag) })
         }
         "chflags" | "lchflags" | "fchflags" => {
             #[cfg(target_os = "macos")]
@@ -586,19 +562,9 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
                 Err(libc::ENOSYS)
             }
         }
-        "chown" => cvt(unsafe {
-            libc::chown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t)
-        }),
-        "lchown" => cvt(unsafe {
-            libc::lchown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t)
-        }),
-        "fchown" => cvt(unsafe {
-            libc::fchown(
-                fd_get(fds, num(0))?,
-                num(1) as libc::uid_t,
-                num(2) as libc::gid_t,
-            )
-        }),
+        "chown" => cvt(unsafe { libc::chown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t) }),
+        "lchown" => cvt(unsafe { libc::lchown(cptr(arg(0)), num(1) as libc::uid_t, num(2) as libc::gid_t) }),
+        "fchown" => cvt(unsafe { libc::fchown(fd_get(fds, num(0))?, num(1) as libc::uid_t, num(2) as libc::gid_t) }),
         "fchownat" => {
             let flag = parse_at_flag(arg(4));
             cvt(unsafe {
@@ -639,9 +605,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
             }
         }
         "truncate" => cvt(unsafe { libc::truncate(cptr(arg(0)), num(1) as libc::off_t) }),
-        "ftruncate" => cvt(unsafe {
-            libc::ftruncate(fd_get(fds, num(0))?, num(1) as libc::off_t)
-        }),
+        "ftruncate" => cvt(unsafe { libc::ftruncate(fd_get(fds, num(0))?, num(1) as libc::off_t) }),
         "posix_fallocate" => {
             posix_fallocate_fd(fd_get(fds, num(0))?, num(1), num(2))
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
@@ -656,9 +620,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
                 _ => {
                     let flag = parse_at_flag(arg(3));
                     (
-                        unsafe {
-                            libc::fstatat(dirfd_get(fds, arg(0))?, cptr(arg(1)), &mut sb, flag)
-                        },
+                        unsafe { libc::fstatat(dirfd_get(fds, arg(0))?, cptr(arg(1)), &mut sb, flag) },
                         arg(2),
                     )
                 }
@@ -690,9 +652,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
             {
                 let times = [timespec_arg(num(2), arg(3)), timespec_arg(num(4), arg(5))];
                 let flag = parse_at_flag(arg(6));
-                let r = unsafe {
-                    libc::utimensat(dirfd_get(fds, arg(0))?, cptr(arg(1)), times.as_ptr(), flag)
-                };
+                let r = unsafe { libc::utimensat(dirfd_get(fds, arg(0))?, cptr(arg(1)), times.as_ptr(), flag) };
                 cvt(r)
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -713,13 +673,7 @@ pub(crate) fn exec_syscall(name: &str, a: &[&str], fds: &mut Vec<RawFd>) -> Resu
         }
         "write" => {
             let data = arg(1).as_bytes();
-            let r = unsafe {
-                libc::write(
-                    fd_get(fds, num(0))?,
-                    data.as_ptr() as *const libc::c_void,
-                    data.len(),
-                )
-            };
+            let r = unsafe { libc::write(fd_get(fds, num(0))?, data.as_ptr() as *const libc::c_void, data.len()) };
             cvt_ssize(r)
         }
         "pwrite" => {
@@ -1009,8 +963,7 @@ fn detect_os_name() -> &'static str {
 }
 
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
-    let meta = fs::symlink_metadata(mountpoint)
-        .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let meta = fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
@@ -1021,10 +974,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         .nth(1)
         .ok_or("unexpected misc.sh layout")?;
 
-    let resolved_os = args
-        .os
-        .clone()
-        .unwrap_or_else(|| detect_os_name().to_string());
+    let resolved_os = args.os.clone().unwrap_or_else(|| detect_os_name().to_string());
     let resolved_fs = args
         .fs
         .clone()
@@ -1064,16 +1014,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
                     }
                     let (name, body) = selected[idx];
                     let scratch = scratch_root.join(format!("{idx:03}-{}", name.replace('/', "_")));
-                    let res = run_one(
-                        &scratch,
-                        name,
-                        body,
-                        &resolved_os,
-                        &resolved_fs,
-                        misc_body,
-                        &exe,
-                        args,
-                    );
+                    let res = run_one(&scratch, name, body, &resolved_os, &resolved_fs, misc_body, &exe, args);
                     if !args.keep {
                         remove_dir_all_bounded(&scratch, Duration::from_secs(10));
                     }
@@ -1087,10 +1028,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         remove_dir_all_bounded(&scratch_root, Duration::from_secs(30));
     }
 
-    let results: Vec<FileResult> = slots
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().unwrap())
-        .collect();
+    let results: Vec<FileResult> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
 
     let total_tests: u64 = results.iter().map(|r| r.tests).sum();
     let total_passed: u64 = results.iter().map(|r| r.passed).sum();
@@ -1294,10 +1232,8 @@ fn parse_tap_output(stdout: &str, stderr: &str, timeout_sec: u64, r: &mut FileRe
         if n > r.tests {
             let missing = n - r.tests;
             r.failed += missing;
-            r.failures.push(format!(
-                "script stopped early: declared {n} tests, ran {}",
-                r.tests
-            ));
+            r.failures
+                .push(format!("script stopped early: declared {n} tests, ran {}", r.tests));
         }
     } else if r.tests == 0 {
         r.failed += 1;
@@ -1341,13 +1277,21 @@ mod tests {
 
         let mut fds = Vec::new();
         let d_str = dir.to_str().unwrap();
-        assert_eq!(exec_syscall("open", &[d_str, "O_RDONLY,O_DIRECTORY"], &mut fds).unwrap(), "0");
+        assert_eq!(
+            exec_syscall("open", &[d_str, "O_RDONLY,O_DIRECTORY"], &mut fds).unwrap(),
+            "0"
+        );
         assert_eq!(
             exec_syscall("fstatat", &["0", "probe.txt", "type,size", "0"], &mut fds).unwrap(),
             "regular,11"
         );
         assert_eq!(
-            exec_syscall("fstatat", &["AT_FDCWD", file.to_str().unwrap(), "type,size", "0"], &mut fds).unwrap(),
+            exec_syscall(
+                "fstatat",
+                &["AT_FDCWD", file.to_str().unwrap(), "type,size", "0"],
+                &mut fds
+            )
+            .unwrap(),
             "regular,11"
         );
         // Reading from directory fd (`0`) or bad fd (`99`) must fail rather than returning `Ok("")`.
@@ -1355,7 +1299,10 @@ mod tests {
 
         let f_str = file.to_str().unwrap();
         assert_eq!(exec_syscall("open", &[f_str, "O_RDWR"], &mut fds).unwrap(), "0");
-        assert_eq!(exec_syscall("posix_fallocate", &["1", "1000", "234"], &mut fds).unwrap(), "0");
+        assert_eq!(
+            exec_syscall("posix_fallocate", &["1", "1000", "234"], &mut fds).unwrap(),
+            "0"
+        );
         assert_eq!(exec_syscall("fstat", &["1", "size"], &mut fds).unwrap(), "1234");
 
         for fd in fds {

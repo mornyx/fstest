@@ -380,7 +380,13 @@ impl RankCtx<'_> {
                     warn!("unable to process directory {}: {e}", p.display());
                 }
             } else if create {
-                match OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(&p) {
+                match OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o644)
+                    .open(&p)
+                {
                     Ok(mut f) => {
                         if self.p.write_bytes > 0 {
                             let buf = content_pattern(
@@ -444,14 +450,7 @@ impl RankCtx<'_> {
         }
     }
 
-    fn read_phase(
-        &self,
-        tree_root: &Path,
-        base: &str,
-        stop: u64,
-        io_errors: &mut u64,
-        verify_errors: &mut u64,
-    ) {
+    fn read_phase(&self, tree_root: &Path, base: &str, stop: u64, io_errors: &mut u64, verify_errors: &mut u64) {
         let offset = self.p.leaf_offset();
         let prefix = self.prefix(2);
         let mut scratch = vec![0u8; self.p.read_bytes as usize];
@@ -699,8 +698,8 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
                     "items ({raw_items}) must be a multiple of items per tree ({per_tree})"
                 ));
             }
-            let loops = u32::try_from(raw_items / per_tree)
-                .map_err(|_| "directory loop count overflows u32".to_string())?;
+            let loops =
+                u32::try_from(raw_items / per_tree).map_err(|_| "directory loop count overflows u32".to_string())?;
             (raw_items, args.items_per_dir, loops.max(1))
         }
     } else {
@@ -767,15 +766,13 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         p.directory_loops
     );
     let barrier = Arc::new(Barrier::new(threads as usize));
-    let stonewall_max: Arc<Vec<AtomicU64>> =
-        Arc::new((0..p.iterations).map(|_| AtomicU64::new(0)).collect());
+    let stonewall_max: Arc<Vec<AtomicU64>> = Arc::new((0..p.iterations).map(|_| AtomicU64::new(0)).collect());
     let all_stats: Arc<Mutex<Vec<Vec<[OpStat; 10]>>>> = Arc::new(Mutex::new(
         (0..p.iterations)
             .map(|_| (0..threads).map(|_| [OpStat::default(); 10]).collect())
             .collect(),
     ));
-    let rank_errors: Arc<Mutex<Vec<(u64, u64)>>> =
-        Arc::new(Mutex::new(vec![(0, 0); threads as usize]));
+    let rank_errors: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(vec![(0, 0); threads as usize]));
 
     thread::scope(|s| {
         let mut joins = Vec::new();
@@ -799,9 +796,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     let io_errors: u64 = rank_errors.iter().map(|(io_e, _)| *io_e).sum();
     let verification_errors: u64 = rank_errors.iter().map(|(_, ve)| *ve).sum();
     if io_errors > 0 || verification_errors > 0 {
-        warn!(
-            "mdtest finished with io_errors={io_errors} verification_errors={verification_errors}"
-        );
+        warn!("mdtest finished with io_errors={io_errors} verification_errors={verification_errors}");
     }
 
     let mut iterations_json = Vec::new();
@@ -1084,13 +1079,7 @@ fn run_rank(
                     if take == 0 {
                         break;
                     }
-                    ctx.read_phase(
-                        &root(2, dir_iter),
-                        &b2,
-                        take,
-                        &mut io_errors,
-                        &mut verification_errors,
-                    );
+                    ctx.read_phase(&root(2, dir_iter), &b2, take, &mut io_errors, &mut verification_errors);
                 }
                 let tbb = t0.elapsed().as_secs_f64();
                 ctx.phase_end();
@@ -1106,7 +1095,13 @@ fn run_rank(
                 }
                 let tbb = t0.elapsed().as_secs_f64();
                 ctx.phase_end();
-                set_stat(&mut res, Op::FileRemove, effective_items, t0.elapsed().as_secs_f64(), tbb);
+                set_stat(
+                    &mut res,
+                    Op::FileRemove,
+                    effective_items,
+                    t0.elapsed().as_secs_f64(),
+                    tbb,
+                );
             }
         }
 
@@ -1227,11 +1222,7 @@ mod tests {
     #[test]
     fn multi_directory_loops_and_failure_on_missing_stat_or_repeat_create() {
         let dir = make_temp_dir("loops");
-        let loops_res = run(
-            &dir,
-            &parse_args(&["--threads", "2", "-n", "12", "-I", "4", "-R"]),
-        )
-        .unwrap();
+        let loops_res = run(&dir, &parse_args(&["--threads", "2", "-n", "12", "-I", "4", "-R"])).unwrap();
         assert_eq!(loops_res["status"], "ok");
         assert_eq!(loops_res["ioErrors"], 0);
 

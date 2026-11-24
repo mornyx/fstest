@@ -249,11 +249,7 @@ fn mdw_wait(runtime: f64, factor: f64) {
 }
 
 fn create_object(p: &Params, path: &Path, writer_rank: u32, d: u64, index: u64) -> io::Result<()> {
-    let mut fh = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
+    let mut fh = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
     if p.file_size > 0 {
         let buf = content_pattern(p.seed, writer_rank, index * p.dset_count + d, p.file_size);
         fh.write_all(&buf)?;
@@ -292,13 +288,7 @@ fn run_precreate_rank(p: &Params, rank: u32, s: &mut PhaseStat, current_index: u
     }
 }
 
-fn run_benchmark_rank(
-    p: &Params,
-    rank: u32,
-    s: &mut PhaseStat,
-    current_index: &mut u64,
-    wo: &WearOut,
-) {
+fn run_benchmark_rank(p: &Params, rank: u32, s: &mut PhaseStat, current_index: &mut u64, wo: &WearOut) {
     let _finish_guard = FinishGuard(wo);
     let mut scratch = vec![0u8; p.file_size];
     let size = p.threads as u64;
@@ -311,9 +301,8 @@ fn run_benchmark_rank(
     while f < total_num {
         for d in 0..p.dset_count {
             let prev_file = f + start_index;
-            let read_rank = ((rank as i64 + size as i64)
-                .wrapping_sub((p.offset * (d + 1)) as i64))
-            .rem_euclid(size as i64) as u32;
+            let read_rank =
+                ((rank as i64 + size as i64).wrapping_sub((p.offset * (d + 1)) as i64)).rem_euclid(size as i64) as u32;
             let obj = p.obj(read_rank, d, prev_file);
 
             let t0 = Instant::now();
@@ -339,8 +328,7 @@ fn run_benchmark_rank(
                         warn!("rank {rank}: short/failed read on {}", obj.display());
                     } else if p.verify_read
                         && p.file_size > 0
-                        && scratch
-                            != content_pattern(p.seed, read_rank, prev_file * p.dset_count + d, p.file_size)
+                        && scratch != content_pattern(p.seed, read_rank, prev_file * p.dset_count + d, p.file_size)
                     {
                         s.errors += 1;
                         warn!("rank {rank}: verify error on {}", obj.display());
@@ -400,8 +388,7 @@ fn run_benchmark_rank(
                     wo.armed.store(1, Ordering::SeqCst);
                     wo.total.fetch_max(f.min(p.num), Ordering::SeqCst);
                     wo.contributors.fetch_add(1, Ordering::SeqCst);
-                    while wo.contributors.load(Ordering::SeqCst) + wo.finished.load(Ordering::SeqCst)
-                        < p.threads as u64
+                    while wo.contributors.load(Ordering::SeqCst) + wo.finished.load(Ordering::SeqCst) < p.threads as u64
                     {
                         thread::yield_now();
                     }
@@ -560,8 +547,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         top: mountpoint.to_path_buf(),
     };
 
-    let workingset_mib =
-        threads as f64 * p.dset_count as f64 * p.precreate as f64 * p.file_size as f64 / 1_048_576.0;
+    let workingset_mib = threads as f64 * p.dset_count as f64 * p.precreate as f64 * p.file_size as f64 / 1_048_576.0;
     info!(
         "mdworkbench: top={} threads={} dsets={} precreate={} num={} size={}B iterations={} offset={} workingset={:.1}MiB",
         p.top.display(),
@@ -595,8 +581,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     let shared = Arc::new(Shared {
         barrier: Barrier::new(threads as usize),
     });
-    let wear_outs: Arc<Vec<Arc<WearOut>>> =
-        Arc::new((0..p.iterations).map(|_| Arc::new(WearOut::new())).collect());
+    let wear_outs: Arc<Vec<Arc<WearOut>>> = Arc::new((0..p.iterations).map(|_| Arc::new(WearOut::new())).collect());
     let final_index = AtomicU64::new(p.start_item);
 
     thread::scope(|s| {

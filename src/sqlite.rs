@@ -1652,22 +1652,86 @@ pub fn list(args: &Args) {
         println!("{name:28} [mptest       ] {desc}");
     }
     let extra = [
-        ("multiwrite01-wal", "mptest", "5-process concurrent table/index/VACUUM stress over WAL + -shm locks"),
-        ("crash01-wal", "mptest", "5-process WAL mid-transaction _exit(1) crash & survivor WAL recovery"),
-        ("crud-delete", "crud", "Core SQL CRUD + FK cascade + external sort + rollback + ATTACH + blob + FTS5 (DELETE)"),
-        ("crud-wal", "crud", "Core SQL CRUD + FK cascade + external sort + rollback + ATTACH + blob + FTS5 (WAL)"),
-        ("speedtest-delete", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (DELETE journal)"),
-        ("speedtest-truncate", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (TRUNCATE journal)"),
-        ("speedtest-persist", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (PERSIST journal)"),
-        ("speedtest-wal-mmap", "speedtest", "B-tree/index/trigger/savepoint/VACUUM + 4MiB mmap (WAL journal)"),
-        ("speedtest-wal-exclusive", "speedtest", "B-tree/index/trigger/savepoint/VACUUM (WAL + locking_mode=EXCLUSIVE)"),
-        ("kvtest-wal", "kvtest", "4KiB-page overflow-blob KV updates + PRAGMA integrity_check (WAL)"),
-        ("kvtest-delete", "kvtest", "4KiB-page overflow-blob KV updates + PRAGMA integrity_check (DELETE)"),
-        ("walthread-concurrent", "walthread", "Concurrent multi-thread WAL readers + writers + PASSIVE/FULL/RESTART/TRUNCATE checkpointer"),
-        ("wal-checkpoint-truncate-cycle", "wal-lifecycle", "Repeated WAL RESTART/TRUNCATE 0-byte truncation + immediate frame-1 reuse"),
-        ("wal-journal-mode-transitions", "wal-lifecycle", "Live DELETE <-> WAL <-> TRUNCATE <-> PERSIST mode switches & sidecar cleanup"),
-        ("mmap-probe-wal", "mmap", "MAP_SHARED kernel mmap probe of SQLite main DB and -shm WAL index"),
-        ("mmap-shared-rw-multiprocess", "mmap", "Cross-process O_RDWR MAP_SHARED coherence + fcntl WAL byte-range lock probe"),
+        (
+            "multiwrite01-wal",
+            "mptest",
+            "5-process concurrent table/index/VACUUM stress over WAL + -shm locks",
+        ),
+        (
+            "crash01-wal",
+            "mptest",
+            "5-process WAL mid-transaction _exit(1) crash & survivor WAL recovery",
+        ),
+        (
+            "crud-delete",
+            "crud",
+            "Core SQL CRUD + FK cascade + external sort + rollback + ATTACH + blob + FTS5 (DELETE)",
+        ),
+        (
+            "crud-wal",
+            "crud",
+            "Core SQL CRUD + FK cascade + external sort + rollback + ATTACH + blob + FTS5 (WAL)",
+        ),
+        (
+            "speedtest-delete",
+            "speedtest",
+            "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (DELETE journal)",
+        ),
+        (
+            "speedtest-truncate",
+            "speedtest",
+            "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (TRUNCATE journal)",
+        ),
+        (
+            "speedtest-persist",
+            "speedtest",
+            "B-tree/index/trigger/savepoint/VACUUM + SHA-256 verify (PERSIST journal)",
+        ),
+        (
+            "speedtest-wal-mmap",
+            "speedtest",
+            "B-tree/index/trigger/savepoint/VACUUM + 4MiB mmap (WAL journal)",
+        ),
+        (
+            "speedtest-wal-exclusive",
+            "speedtest",
+            "B-tree/index/trigger/savepoint/VACUUM (WAL + locking_mode=EXCLUSIVE)",
+        ),
+        (
+            "kvtest-wal",
+            "kvtest",
+            "4KiB-page overflow-blob KV updates + PRAGMA integrity_check (WAL)",
+        ),
+        (
+            "kvtest-delete",
+            "kvtest",
+            "4KiB-page overflow-blob KV updates + PRAGMA integrity_check (DELETE)",
+        ),
+        (
+            "walthread-concurrent",
+            "walthread",
+            "Concurrent multi-thread WAL readers + writers + PASSIVE/FULL/RESTART/TRUNCATE checkpointer",
+        ),
+        (
+            "wal-checkpoint-truncate-cycle",
+            "wal-lifecycle",
+            "Repeated WAL RESTART/TRUNCATE 0-byte truncation + immediate frame-1 reuse",
+        ),
+        (
+            "wal-journal-mode-transitions",
+            "wal-lifecycle",
+            "Live DELETE <-> WAL <-> TRUNCATE <-> PERSIST mode switches & sidecar cleanup",
+        ),
+        (
+            "mmap-probe-wal",
+            "mmap",
+            "MAP_SHARED kernel mmap probe of SQLite main DB and -shm WAL index",
+        ),
+        (
+            "mmap-shared-rw-multiprocess",
+            "mmap",
+            "Cross-process O_RDWR MAP_SHARED coherence + fcntl WAL byte-range lock probe",
+        ),
     ];
     for (name, kind, desc) in extra {
         if !args.filter.is_empty() && !args.filter.iter().any(|f| name.contains(f)) {
@@ -1784,11 +1848,26 @@ fn sql_quote_path(p: &Path) -> String {
 
 // ---------- Incremental BLOB helpers via bundled sqlite3_blob_* ----------
 
-fn blob_rmw_write(conn: &Connection, table: &CStr, col: &CStr, rowid: i64, expected_len: usize, edits: &[(usize, &[u8])]) -> Result<(), String> {
+fn blob_rmw_write(
+    conn: &Connection,
+    table: &CStr,
+    col: &CStr,
+    rowid: i64,
+    expected_len: usize,
+    edits: &[(usize, &[u8])],
+) -> Result<(), String> {
     unsafe {
         let db = dbh(conn);
         let mut p_blob: *mut ffi::sqlite3_blob = std::ptr::null_mut();
-        let rc = ffi::sqlite3_blob_open(db, c"main".as_ptr(), table.as_ptr(), col.as_ptr(), rowid, 1, &mut p_blob);
+        let rc = ffi::sqlite3_blob_open(
+            db,
+            c"main".as_ptr(),
+            table.as_ptr(),
+            col.as_ptr(),
+            rowid,
+            1,
+            &mut p_blob,
+        );
         if rc != ffi::SQLITE_OK || p_blob.is_null() {
             return Err(format!("sqlite3_blob_open(rw) failed (rc={rc}): {}", last_errmsg(db)));
         }
@@ -1807,7 +1886,10 @@ fn blob_rmw_write(conn: &Connection, table: &CStr, col: &CStr, rowid: i64, expec
             if wrc != ffi::SQLITE_OK {
                 let msg = last_errmsg(db);
                 ffi::sqlite3_blob_close(p_blob);
-                return Err(format!("sqlite3_blob_write(off={off}, len={}) failed (rc={wrc}): {msg}", patch.len()));
+                return Err(format!(
+                    "sqlite3_blob_write(off={off}, len={}) failed (rc={wrc}): {msg}",
+                    patch.len()
+                ));
             }
         }
         let crc = ffi::sqlite3_blob_close(p_blob);
@@ -1818,11 +1900,25 @@ fn blob_rmw_write(conn: &Connection, table: &CStr, col: &CStr, rowid: i64, expec
     Ok(())
 }
 
-fn blob_incremental_read(conn: &Connection, table: &CStr, col: &CStr, rowid: i64, total_len: usize) -> Result<Vec<u8>, String> {
+fn blob_incremental_read(
+    conn: &Connection,
+    table: &CStr,
+    col: &CStr,
+    rowid: i64,
+    total_len: usize,
+) -> Result<Vec<u8>, String> {
     unsafe {
         let db = dbh(conn);
         let mut p_blob: *mut ffi::sqlite3_blob = std::ptr::null_mut();
-        let rc = ffi::sqlite3_blob_open(db, c"main".as_ptr(), table.as_ptr(), col.as_ptr(), rowid, 0, &mut p_blob);
+        let rc = ffi::sqlite3_blob_open(
+            db,
+            c"main".as_ptr(),
+            table.as_ptr(),
+            col.as_ptr(),
+            rowid,
+            0,
+            &mut p_blob,
+        );
         if rc != ffi::SQLITE_OK || p_blob.is_null() {
             return Err(format!("sqlite3_blob_open(ro) failed (rc={rc}): {}", last_errmsg(db)));
         }
@@ -1840,7 +1936,9 @@ fn blob_incremental_read(conn: &Connection, table: &CStr, col: &CStr, rowid: i64
             if rrc != ffi::SQLITE_OK {
                 let msg = last_errmsg(db);
                 ffi::sqlite3_blob_close(p_blob);
-                return Err(format!("sqlite3_blob_read(off={off}, len={take}) failed (rc={rrc}): {msg}"));
+                return Err(format!(
+                    "sqlite3_blob_read(off={off}, len={take}) failed (rc={rrc}): {msg}"
+                ));
             }
             off += take;
         }
@@ -1867,7 +1965,10 @@ fn compute_crud_canonical_digest(db_path: &Path, aux_path: &Path) -> Result<Stri
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
         .map_err(|e| format!("foreign_key_check: {e}"))?;
     if fk_errs != 0 {
-        return Err(format!("{}: foreign_key_check found {fk_errs} violations", db_path.display()));
+        return Err(format!(
+            "{}: foreign_key_check found {fk_errs} violations",
+            db_path.display()
+        ));
     }
 
     let mut hasher = Sha256::new();
@@ -2166,7 +2267,9 @@ fn run_crud_case(work_root: &Path, journal: &str, sync_full: bool) -> (Value, Op
             )
             .map_err(|e| e.to_string())?;
         if ap_users < 70 {
-            return Err(format!("JSONB expression index query returned unexpectedly low count {ap_users}"));
+            return Err(format!(
+                "JSONB expression index query returned unexpectedly low count {ap_users}"
+            ));
         }
 
         // 2. External temp-file merge-sort query (forces VDBE sorter to spill unlinked etilqs_* onto <mnt>)
@@ -2237,7 +2340,9 @@ fn run_crud_case(work_root: &Path, journal: &str, sync_full: bool) -> (Value, Op
             )
             .map_err(|e| e.to_string())?;
         if pre_snap != post_snap {
-            return Err(format!("ROLLBACK state mismatch: before={pre_snap:?}, after={post_snap:?}"));
+            return Err(format!(
+                "ROLLBACK state mismatch: before={pre_snap:?}, after={post_snap:?}"
+            ));
         }
 
         let target_uid: i64 = conn
@@ -2352,7 +2457,9 @@ fn run_crud_case(work_root: &Path, journal: &str, sync_full: bool) -> (Value, Op
         }
         conn.execute("INSERT INTO blobs(id, payload) VALUES(1, ?1)", [&expected_blob])
             .map_err(|e| format!("insert initial blob: {e}"))?;
-        let offsets = [0usize, 4088, 4096, 8184, 16372, 24570, 32760, 40952, 49144, 57336, 65420];
+        let offsets = [
+            0usize, 4088, 4096, 8184, 16372, 24570, 32760, 40952, 49144, 57336, 65420,
+        ];
         let mut patches: Vec<(usize, Vec<u8>)> = Vec::new();
         for (p_idx, &off) in offsets.iter().enumerate() {
             let plen = 96usize;
@@ -2564,8 +2671,7 @@ fn run_speedtest_case(
         .map_err(|e| format!("tx2: {e}"))?;
 
         // Batch 3: WITHOUT ROWID multi-page blobs + VACUUM + reopen check
-        conn.execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| e.to_string())?;
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
         for k in 0..32u32 {
             let mut blob = vec![0u8; 6000];
             for (idx, byte) in blob.iter_mut().enumerate() {
@@ -2808,11 +2914,8 @@ fn run_walthread_case(work_root: &Path, sync_full: bool) -> Value {
             .map_err(|e| e.to_string())?;
             // Zero-sum invariant across 32 accounts: total balance == 32_000 at every committed snapshot!
             for id in 0..32i64 {
-                conn.execute(
-                    "INSERT INTO accounts(id, bal, ver) VALUES(?1, 1000, 0)",
-                    [id],
-                )
-                .map_err(|e| e.to_string())?;
+                conn.execute("INSERT INTO accounts(id, bal, ver) VALUES(?1, 1000, 0)", [id])
+                    .map_err(|e| e.to_string())?;
             }
             conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
         }
@@ -3059,7 +3162,9 @@ fn run_wal_checkpoint_truncate_case(work_root: &Path, sync_full: bool) -> Value 
                 .map(|m| m.len())
                 .map_err(|e| format!("round {round} stat -wal before checkpoint: {e}"))?;
             if wal_len_before == 0 {
-                return Err(format!("round {round}: expected non-empty -wal before checkpoint, got 0 bytes"));
+                return Err(format!(
+                    "round {round}: expected non-empty -wal before checkpoint, got 0 bytes"
+                ));
             }
 
             if round % 2 == 1 {
@@ -3121,7 +3226,9 @@ fn run_wal_checkpoint_truncate_case(work_root: &Path, sync_full: bool) -> Value 
             for (i, &b) in got_blob.iter().enumerate() {
                 let want_b = ((want_r as usize * 37 + slot_id * 13 + i) & 0xff) as u8;
                 if b != want_b {
-                    return Err(format!("slot {slot_id} byte {i} corrupted: got {b:#x}, want {want_b:#x}"));
+                    return Err(format!(
+                        "slot {slot_id} byte {i} corrupted: got {b:#x}, want {want_b:#x}"
+                    ));
                 }
             }
         }
@@ -3169,9 +3276,7 @@ fn run_wal_mode_transitions_case(work_root: &Path, sync_full: bool) -> Value {
     let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
     let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
     let sync_mode = if sync_full { "FULL" } else { "OFF" };
-    let transitions = [
-        "delete", "wal", "delete", "wal", "truncate", "wal", "persist", "delete",
-    ];
+    let transitions = ["delete", "wal", "delete", "wal", "truncate", "wal", "persist", "delete"];
 
     let step = || -> Result<u64, String> {
         {
@@ -3192,7 +3297,9 @@ fn run_wal_mode_transitions_case(work_root: &Path, sync_full: bool) -> Value {
                 .query_row(&format!("PRAGMA journal_mode={mode}"), [], |r| r.get(0))
                 .map_err(|e| format!("step {step_no} journal_mode={mode}: {e}"))?;
             if !got_jm.eq_ignore_ascii_case(mode) {
-                return Err(format!("step {step_no}: got journal_mode {got_jm:?}, expected {mode:?}"));
+                return Err(format!(
+                    "step {step_no}: got journal_mode {got_jm:?}, expected {mode:?}"
+                ));
             }
             conn.execute_batch(&format!("PRAGMA synchronous={sync_mode};"))
                 .map_err(|e| e.to_string())?;
@@ -3217,11 +3324,8 @@ fn run_wal_mode_transitions_case(work_root: &Path, sync_full: bool) -> Value {
             )
             .map_err(|e| format!("step {step_no} insert: {e}"))?;
             if step_no > 1 {
-                conn.execute(
-                    "UPDATE seq_log SET mode = mode || '+ok' WHERE step = ?1",
-                    [step_no - 1],
-                )
-                .map_err(|e| format!("step {step_no} update prior: {e}"))?;
+                conn.execute("UPDATE seq_log SET mode = mode || '+ok' WHERE step = ?1", [step_no - 1])
+                    .map_err(|e| format!("step {step_no} update prior: {e}"))?;
             }
             conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
 
@@ -3312,7 +3416,10 @@ pub fn shm_child_main(args: &[String]) -> i32 {
     };
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
     if fd < 0 {
-        eprintln!("__sqlite-shm-child: open O_RDWR failed: {}", std::io::Error::last_os_error());
+        eprintln!(
+            "__sqlite-shm-child: open O_RDWR failed: {}",
+            std::io::Error::last_os_error()
+        );
         return 1;
     }
     let addr = unsafe {
@@ -3371,7 +3478,10 @@ pub fn shm_child_main(args: &[String]) -> i32 {
         }
         let mrc = unsafe { libc::msync(addr, SHM_PROBE_SIZE, libc::MS_SYNC) };
         if mrc < 0 {
-            return Err(format!("child msync(MS_SYNC) failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "child msync(MS_SYNC) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let _ = fcntl_setlk(fd, libc::F_UNLCK, 124, 2);
         Ok(())
@@ -3415,7 +3525,11 @@ fn run_mmap_shared_rw_multiprocess_case(work_root: &Path, exe: &Path) -> Value {
             )
         };
         if fd < 0 {
-            return Err(format!("open {}: {}", shm_path.display(), std::io::Error::last_os_error()));
+            return Err(format!(
+                "open {}: {}",
+                shm_path.display(),
+                std::io::Error::last_os_error()
+            ));
         }
         if unsafe { libc::ftruncate(fd, SHM_PROBE_SIZE as libc::off_t) } < 0 {
             let err = std::io::Error::last_os_error();
@@ -3442,7 +3556,10 @@ fn run_mmap_shared_rw_multiprocess_case(work_root: &Path, exe: &Path) -> Value {
                     shm_path.display()
                 ));
             }
-            return Err(format!("mmap(PROT_READ|PROT_WRITE, MAP_SHARED) {}: {err}", shm_path.display()));
+            return Err(format!(
+                "mmap(PROT_READ|PROT_WRITE, MAP_SHARED) {}: {err}",
+                shm_path.display()
+            ));
         }
 
         let inner_res = (|| -> Result<(), String> {
@@ -3497,7 +3614,11 @@ fn run_mmap_shared_rw_multiprocess_case(work_root: &Path, exe: &Path) -> Value {
             // 2. Verify pread() on a fresh descriptor sees coherent MAP_SHARED pages
             let rfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
             if rfd < 0 {
-                return Err(format!("reopen O_RDONLY {}: {}", shm_path.display(), std::io::Error::last_os_error()));
+                return Err(format!(
+                    "reopen O_RDONLY {}: {}",
+                    shm_path.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
             let mut pbuf0 = [0u8; 96];
             let mut pbuf1 = [0u8; 96];
@@ -3565,11 +3686,7 @@ fn mmap_shared_check(path: &Path, require_sqlite_magic: bool) -> Result<u64, Str
     let cpath = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
     if fd < 0 {
-        return Err(format!(
-            "open {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("open {}: {}", path.display(), std::io::Error::last_os_error()));
     }
     let addr = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
     unsafe { libc::close(fd) };
@@ -3823,8 +3940,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
         }
     }
     let want_probe = |name: &str| args.probes.iter().any(|p| p == name || p == "all");
-    let matches_filter =
-        |case_name: &str| args.filter.is_empty() || args.filter.iter().any(|f| case_name.contains(f));
+    let matches_filter = |case_name: &str| args.filter.is_empty() || args.filter.iter().any(|f| case_name.contains(f));
     let sync_on = args.sync_enabled();
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot resolve fstest binary: {e}"))?;

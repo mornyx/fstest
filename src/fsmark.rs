@@ -213,10 +213,7 @@ fn resolve(args: &Args, mountpoint: &Path) -> Result<Params, String> {
     let num_per_subdir = match args.files_per_subdir {
         Some(n) => {
             if num_subdirs == 0 {
-                return Err(
-                    "Must specify more than 1 subdirectory with -D for files-per-subdir to make sense"
-                        .into(),
-                );
+                return Err("Must specify more than 1 subdirectory with -D for files-per-subdir to make sense".into());
             }
             dir_policy = DirPolicy::RoundRobin;
             n.max(1)
@@ -341,8 +338,7 @@ fn mkdir_eexist(dir: &Path) -> io::Result<()> {
 }
 
 fn statfs_vals(dir: &Path) -> io::Result<(u64, u64, u64)> {
-    let c = CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| io::Error::other("path contains NUL"))?;
+    let c = CString::new(dir.as_os_str().as_bytes()).map_err(|_| io::Error::other("path contains NUL"))?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
         return Err(io::Error::last_os_error());
@@ -444,13 +440,7 @@ fn setup_file_name(p: &Params, st: &mut ThreadState) -> io::Result<(PathBuf, Str
     Ok((target_dir, name))
 }
 
-fn write_file(
-    f: &mut File,
-    buf: &[u8],
-    sz: u64,
-    write_stat: &mut Stat,
-    write_avg_acc: &mut u64,
-) -> io::Result<()> {
+fn write_file(f: &mut File, buf: &[u8], sz: u64, write_stat: &mut Stat, write_avg_acc: &mut u64) -> io::Result<()> {
     let mut left = sz as usize;
     let mut calls = 0u64;
     let mut local = 0u64;
@@ -495,8 +485,7 @@ fn run_thread(p: &Params, tid: usize, io_buffer: &[u8]) -> Result<Row, RunErr> {
     let mut names: Vec<PathBuf> = Vec::with_capacity(p.num_files as usize);
     let loop_start = Instant::now();
     for _ in 0..p.num_files {
-        let (target_dir, fname) =
-            setup_file_name(p, &mut st).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
+        let (target_dir, fname) = setup_file_name(p, &mut st).map_err(|e| map_io_err(e, &dir, p.fill_fs))?;
         let path = target_dir.join(&fname);
         let t0 = Instant::now();
         let mut f = OpenOptions::new()
@@ -558,8 +547,7 @@ fn run_thread(p: &Params, tid: usize, io_buffer: &[u8]) -> Result<Row, RunErr> {
             row.unlink.add(us(t0.elapsed()));
         }
     }
-    let total_ops =
-        row.creat.total + row.write.total + row.fsync.total + row.sync_usec + row.close.total;
+    let total_ops = row.creat.total + row.write.total + row.fsync.total + row.sync_usec + row.close.total;
     row.app_overhead_usec = loop_usecs as i64 - total_ops as i64;
     row.file_count = p.num_files as u64;
     row.files_per_sec = p.num_files as f64 / (loop_usecs.max(1) as f64 / 1e6);
@@ -941,25 +929,65 @@ mod tests {
             file_count: 10,
             files_per_sec: 100.0,
             app_overhead_usec: 50,
-            creat: Stat { min: 10, max: 30, total: 200 },
-            write: Stat { min: 5, max: 15, total: 100 },
+            creat: Stat {
+                min: 10,
+                max: 30,
+                total: 200,
+            },
+            write: Stat {
+                min: 5,
+                max: 15,
+                total: 100,
+            },
             write_avg_acc: 100,
-            fsync: Stat { min: 40, max: 80, total: 600 },
+            fsync: Stat {
+                min: 40,
+                max: 80,
+                total: 600,
+            },
             sync_usec: 1000,
-            close: Stat { min: 2, max: 6, total: 40 },
-            unlink: Stat { min: 3, max: 9, total: 60 },
+            close: Stat {
+                min: 2,
+                max: 6,
+                total: 40,
+            },
+            unlink: Stat {
+                min: 3,
+                max: 9,
+                total: 60,
+            },
         };
         let r2 = Row {
             file_count: 10,
             files_per_sec: 100.0,
             app_overhead_usec: 50,
-            creat: Stat { min: 20, max: 40, total: 300 },
-            write: Stat { min: 5, max: 15, total: 100 },
+            creat: Stat {
+                min: 20,
+                max: 40,
+                total: 300,
+            },
+            write: Stat {
+                min: 5,
+                max: 15,
+                total: 100,
+            },
             write_avg_acc: 100,
-            fsync: Stat { min: 50, max: 90, total: 700 },
+            fsync: Stat {
+                min: 50,
+                max: 90,
+                total: 700,
+            },
             sync_usec: 1400,
-            close: Stat { min: 4, max: 8, total: 60 },
-            unlink: Stat { min: 5, max: 11, total: 80 },
+            close: Stat {
+                min: 4,
+                max: 8,
+                total: 60,
+            },
+            unlink: Stat {
+                min: 5,
+                max: 11,
+                total: 80,
+            },
         };
         let agg = aggregate(&[r1, r2], 10);
         assert_eq!(agg.file_count, 20);

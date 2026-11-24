@@ -31,14 +31,20 @@ const RUST_EXCLUDE: &[(&str, &str)] = &[
     ("test_dir_smoke_test", "uses unstable std-internal fs::Dir (dirfd)"),
     ("test_dir_read_file", "uses unstable std-internal fs::Dir (dirfd)"),
     ("file_test_io_smoke_test", "uses unstable read_buf/BorrowedBuf APIs"),
-    ("file_test_io_non_positional_read", "uses unstable read_buf/BorrowedBuf APIs"),
+    (
+        "file_test_io_non_positional_read",
+        "uses unstable read_buf/BorrowedBuf APIs",
+    ),
     ("test_read_buf_at", "uses unstable read_buf/BorrowedBuf APIs"),
     ("test_read_buf_exact_at", "uses unstable read_buf/BorrowedBuf APIs"),
     ("test_seek_read_buf", "uses unstable read_buf/BorrowedBuf APIs"),
     ("file_test_read_buf", "uses unstable read_buf/BorrowedBuf APIs"),
     ("test_fs_set_times", "uses unstable free-fn fs::set_times"),
     ("test_fs_set_times_nofollow", "uses unstable free-fn fs::set_times"),
-    ("test_fs_set_times_follows_symlink", "uses unstable free-fn fs::set_times"),
+    (
+        "test_fs_set_times_follows_symlink",
+        "uses unstable free-fn fs::set_times",
+    ),
     ("test_fs_set_times_on_dir", "uses unstable free-fn fs::set_times"),
     ("metadata_access_times", "uses unstable io ErrorKind::Uncategorized"),
     ("dir_entry_debug", "touches std-internal DirEntry field"),
@@ -192,7 +198,12 @@ fn exec_with_timeout(mut cmd: Command, timeout: Duration) -> Exec {
     {
         Ok(c) => c,
         Err(e) => {
-            return Exec { code: None, timed_out: false, out: String::new(), spawn_err: Some(e.to_string()) };
+            return Exec {
+                code: None,
+                timed_out: false,
+                out: String::new(),
+                spawn_err: Some(e.to_string()),
+            };
         }
     };
     let mut so = child.stdout.take().unwrap();
@@ -235,7 +246,12 @@ fn exec_with_timeout(mut cmd: Command, timeout: Duration) -> Exec {
         out.push('\n');
         out.push_str(&err);
     }
-    Exec { code, timed_out, out, spawn_err: None }
+    Exec {
+        code,
+        timed_out,
+        out,
+        spawn_err: None,
+    }
 }
 
 fn run_parallel<R: Send>(n: usize, jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
@@ -243,17 +259,23 @@ fn run_parallel<R: Send>(n: usize, jobs: usize, f: impl Fn(usize) -> R + Sync) -
     let out: Mutex<Vec<Option<R>>> = Mutex::new((0..n).map(|_| None).collect());
     std::thread::scope(|s| {
         for _ in 0..jobs.max(1) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::SeqCst);
-                if i >= n {
-                    break;
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= n {
+                        break;
+                    }
+                    let r = f(i);
+                    out.lock().unwrap()[i] = Some(r);
                 }
-                let r = f(i);
-                out.lock().unwrap()[i] = Some(r);
             });
         }
     });
-    out.into_inner().unwrap().into_iter().map(|x| x.expect("worker result")).collect()
+    out.into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|x| x.expect("worker result"))
+        .collect()
 }
 
 fn unavailable(reason: String) -> Value {
@@ -296,7 +318,12 @@ struct GoParsed {
 }
 
 fn parse_go_v(out: &str) -> GoParsed {
-    let mut p = GoParsed { pass: 0, fail: 0, skip: 0, failures: Vec::new() };
+    let mut p = GoParsed {
+        pass: 0,
+        fail: 0,
+        skip: 0,
+        failures: Vec::new(),
+    };
     // Track per-test log buffers keyed by top-level test name so `-test.parallel=N`
     // (`=== RUN`, `=== PAUSE`, `=== CONT`) never drops or mixes failure details.
     let mut current_top = String::new();
@@ -318,7 +345,9 @@ fn parse_go_v(out: &str) -> GoParsed {
         }
         if line.starts_with("--- ") {
             let rest = &line[4..];
-            let Some((verb, tailpart)) = rest.split_once(' ') else { continue };
+            let Some((verb, tailpart)) = rest.split_once(' ') else {
+                continue;
+            };
             let name = tailpart.split(" (").next().unwrap_or(tailpart).trim();
             let detail = logs_by_test.remove(name).unwrap_or_default();
             match verb {
@@ -417,7 +446,10 @@ fn run_go_test_bin(
     let p = parse_go_v(&ex.out);
     let ok = ex.code == Some(0) && !ex.timed_out && p.fail == 0;
     if !ok {
-        warn!("stdfs[go]: {} FAILED ({} pass {} fail {} skip)", pkg, p.pass, p.fail, p.skip);
+        warn!(
+            "stdfs[go]: {} FAILED ({} pass {} fail {} skip)",
+            pkg, p.pass, p.fail, p.skip
+        );
     }
     info!(
         "stdfs[go]: {} {} pass={} fail={} skip={} ({}s)",
@@ -428,7 +460,13 @@ fn run_go_test_bin(
         p.skip,
         t0.elapsed().as_secs()
     );
-    let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "fail" };
+    let status = if ex.timed_out {
+        "timedout"
+    } else if ok {
+        "ok"
+    } else {
+        "fail"
+    };
     json!({
         "name": pkg, "status": status,
         "pass": p.pass, "fail": p.fail, "skip": p.skip,
@@ -491,7 +529,10 @@ fn run_go(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -> 
         Some(d) => {
             let g = d.join("bin/go");
             if !g.is_file() {
-                return unavailable(format!("{} not found; --go-dir must be a GOROOT containing bin/go", g.display()));
+                return unavailable(format!(
+                    "{} not found; --go-dir must be a GOROOT containing bin/go",
+                    g.display()
+                ));
             }
             g
         }
@@ -511,7 +552,12 @@ fn run_go(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -> 
     if !goroot_path.join("src/os").is_dir() {
         return unavailable(format!("GOROOT {} has no src/os", goroot));
     }
-    info!("stdfs[go]: GOROOT {} ({} packages, skip filter: {:?})", goroot, args.go_packages.len(), skip);
+    info!(
+        "stdfs[go]: GOROOT {} ({} packages, skip filter: {:?})",
+        goroot,
+        args.go_packages.len(),
+        skip
+    );
     let items = run_parallel(args.go_packages.len(), args.jobs, |i| {
         let pkg = &args.go_packages[i];
         let safe = pkg.replace(['/', '.'], "_");
@@ -561,7 +607,12 @@ struct PyParsed {
 }
 
 fn parse_python_v(out: &str) -> PyParsed {
-    let mut p = PyParsed { pass: 0, fail: 0, skip: 0, failures: Vec::new() };
+    let mut p = PyParsed {
+        pass: 0,
+        fail: 0,
+        skip: 0,
+        failures: Vec::new(),
+    };
     for line in out.lines() {
         let Some(pos) = line.find(" ... ") else { continue };
         let id = line[..pos].trim();
@@ -698,7 +749,13 @@ fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
     let modules: Vec<String> = args
         .python_modules
         .iter()
-        .map(|m| if m.starts_with("test_") { m.clone() } else { format!("test_{m}") })
+        .map(|m| {
+            if m.starts_with("test_") {
+                m.clone()
+            } else {
+                format!("test_{m}")
+            }
+        })
         .collect();
     let mut pyenv = test_lib.display().to_string();
     if let Ok(existing) = std::env::var("PYTHONPATH") {
@@ -749,7 +806,10 @@ fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         let mod_exists = test_lib.join("test").join(format!("{m}.py")).is_file()
             || test_lib.join("test").join(m).join("__init__.py").is_file();
         if !mod_exists {
-            warn!("stdfs[python]: module {m} missing in {}", test_lib.join("test").display());
+            warn!(
+                "stdfs[python]: module {m} missing in {}",
+                test_lib.join("test").display()
+            );
             return json!({
                 "name": m,
                 "status": "missing",
@@ -772,13 +832,18 @@ fn run_python(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         let p = parse_python_v(&ex.out);
         let ok = ex.code == Some(0) && !ex.timed_out && p.fail == 0;
         if !ok {
-            warn!("stdfs[python]: {} FAILED ({} pass {} fail {} skip)", m, p.pass, p.fail, p.skip);
+            warn!(
+                "stdfs[python]: {} FAILED ({} pass {} fail {} skip)",
+                m, p.pass, p.fail, p.skip
+            );
         }
         info!(
             "stdfs[python]: {} {} pass={} fail={} skip={} ({}s)",
             m,
             if ok { "ok" } else { "fail" },
-            p.pass, p.fail, p.skip,
+            p.pass,
+            p.fail,
+            p.skip,
             t0.elapsed().as_secs()
         );
         let status = if ex.timed_out {
@@ -823,7 +888,11 @@ struct TapParsed {
 }
 
 fn parse_tap(out: &str) -> TapParsed {
-    let mut p = TapParsed { pass: 0, fail: 0, failures: Vec::new() };
+    let mut p = TapParsed {
+        pass: 0,
+        fail: 0,
+        failures: Vec::new(),
+    };
     let lines: Vec<&str> = out.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -922,7 +991,12 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         c.arg("--version");
         c
     }) {
-        let major: usize = v.trim_start_matches('v').split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let major: usize = v
+            .trim_start_matches('v')
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         if major < 18 {
             return unavailable(format!("node {v} lacks the --test runner (need >= 18)"));
         }
@@ -932,9 +1006,14 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
     let dir: PathBuf = match &args.node_dir {
         Some(d) => d.clone(),
         None => {
-            let from_bundle = bundled_node_root
-                .filter(|r| r.join("test/parallel").is_dir() && r.join("test/common").is_dir());
-            let cand = node.parent().unwrap_or(Path::new("/")).ancestors().nth(2).map(|p| p.join("test"));
+            let from_bundle =
+                bundled_node_root.filter(|r| r.join("test/parallel").is_dir() && r.join("test/common").is_dir());
+            let cand = node
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .ancestors()
+                .nth(2)
+                .map(|p| p.join("test"));
             let from_tree = cand
                 .filter(|c| c.join("parallel").is_dir())
                 .and_then(|c| c.parent().map(Path::to_path_buf));
@@ -961,7 +1040,10 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            let n = p.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+            let n = p
+                .file_name()
+                .map(|x| x.to_string_lossy().into_owned())
+                .unwrap_or_default();
             n.starts_with("test-fs-")
                 && n.ends_with(".js")
                 && (include_event_watch || !is_node_event_watch_test(&n))
@@ -970,7 +1052,11 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
         .collect();
     files.sort();
     if let Some(f) = &args.node_filter {
-        files.retain(|p| p.file_name().map(|n| n.to_string_lossy().contains(f.as_str())).unwrap_or(false));
+        files.retain(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().contains(f.as_str()))
+                .unwrap_or(false)
+        });
     }
     if files.is_empty() {
         return unavailable("no test-fs-*.js files matched in test/parallel".into());
@@ -1007,10 +1093,17 @@ fn run_node(_mountpoint: &Path, args: &Args, work_root: &Path) -> Value {
             "stdfs[node]: {} {} pass={} fail={} ({}s)",
             names[i],
             if ok { "ok" } else { "fail" },
-            p.pass, p.fail,
+            p.pass,
+            p.fail,
             t0.elapsed().as_secs()
         );
-        let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "fail" };
+        let status = if ex.timed_out {
+            "timedout"
+        } else if ok {
+            "ok"
+        } else {
+            "fail"
+        };
         json!({
             "name": names[i], "status": status,
             "pass": p.pass, "fail": p.fail,
@@ -1443,7 +1536,13 @@ fn collect_rust_runner_report(
         per_test_timeout,
         elapsed.as_secs()
     );
-    let status = if ex.timed_out { "timedout" } else if ok { "ok" } else { "failed" };
+    let status = if ex.timed_out {
+        "timedout"
+    } else if ok {
+        "ok"
+    } else {
+        "failed"
+    };
     json!({
         "available": true,
         "status": status,
@@ -1465,8 +1564,7 @@ fn collect_rust_runner_report(
 }
 
 fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -> Value {
-    let per_test_env = std::env::var("STDFS_TEST_TIMEOUT")
-        .unwrap_or_else(|_| args.rust_test_timeout.to_string());
+    let per_test_env = std::env::var("STDFS_TEST_TIMEOUT").unwrap_or_else(|_| args.rust_test_timeout.to_string());
     let jobs_str = args.jobs.max(1).to_string();
 
     // Fast, zero-dependency path: run the std::fs suite compiled directly into this binary
@@ -1568,7 +1666,11 @@ fn run_rust(_mountpoint: &Path, args: &Args, work_root: &Path, hosttmp: &Path) -
             runner.push_str(a);
             runner.push('\n');
         }
-        let ignored = if attrs.iter().any(|a| a.starts_with("#[ignore")) { "true" } else { "false" };
+        let ignored = if attrs.iter().any(|a| a.starts_with("#[ignore")) {
+            "true"
+        } else {
+            "false"
+        };
         runner.push_str(&format!("    ({name:?}, tests_impl::{name}, {ignored}),\n"));
     }
     runner.push_str("];\n\n");
@@ -1731,15 +1833,18 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     // best-effort, bounded cleanup of the on-mount work tree unless `--keep` / `FSTEST_KEEP_TMP=1`.
     let keep = args.keep || std::env::var("FSTEST_KEEP_TMP").map(|v| v == "1").unwrap_or(false);
     if keep {
-        info!("stdfs: keeping work_root={} and hosttmp={}", work_root.display(), hosttmp.display());
+        info!(
+            "stdfs: keeping work_root={} and hosttmp={}",
+            work_root.display(),
+            hosttmp.display()
+        );
     } else {
         remove_dir_all_bounded(&work_root, Duration::from_secs(20));
         let _ = fs::remove_dir_all(&hosttmp);
     }
-    let any_failed = languages.values().any(|v| {
-        v.get("available").and_then(Value::as_bool).unwrap_or(false)
-            && v.get("status") != Some(&json!("ok"))
-    });
+    let any_failed = languages
+        .values()
+        .any(|v| v.get("available").and_then(Value::as_bool).unwrap_or(false) && v.get("status") != Some(&json!("ok")));
     let host = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "localhost".to_string());
@@ -1810,7 +1915,9 @@ mod tests {
         assert!(is_node_stat_watchfile_test("test-fs-watchfile.js"));
         assert!(is_node_stat_watchfile_test("test-fs-watchfile-bigint.js"));
         assert!(is_node_stat_watchfile_test("test-fs-watchfile-ref-unref.js"));
-        assert!(is_node_stat_watchfile_test("test-fs-watch-file-enoent-after-deletion.js"));
+        assert!(is_node_stat_watchfile_test(
+            "test-fs-watch-file-enoent-after-deletion.js"
+        ));
         assert!(!is_node_event_watch_test("test-fs-watchfile.js"));
         assert!(!is_node_event_watch_test("test-fs-watch-file-enoent-after-deletion.js"));
 

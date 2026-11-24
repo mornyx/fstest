@@ -120,10 +120,7 @@ fstest envelope option:\n  \
 /// - Extracts `--json <FILE>` (the only `fstest` envelope option) and `<MOUNTPOINT>`, leaving all
 ///   remaining tokens untouched for direct pass-through to embedded `fio`.
 pub fn parse_invocation(raw_argv: &[OsString]) -> Result<ParsedInvocation, String> {
-    let tokens: Vec<String> = raw_argv
-        .iter()
-        .map(|s| s.to_string_lossy().into_owned())
-        .collect();
+    let tokens: Vec<String> = raw_argv.iter().map(|s| s.to_string_lossy().into_owned()).collect();
 
     if tokens.is_empty() || tokens.iter().any(|t| t == "-h" || t == "--help") {
         return Ok(ParsedInvocation::InfoHandled(print_combined_help()));
@@ -214,8 +211,7 @@ pub fn parse_invocation(raw_argv: &[OsString]) -> Result<ParsedInvocation, Strin
     if mnt_idx.is_none() {
         for idx in (0..cleaned.len()).rev() {
             let tok = &cleaned[idx];
-            let preceded_by_bare_flag =
-                idx > 0 && cleaned[idx - 1].starts_with('-') && !cleaned[idx - 1].contains('=');
+            let preceded_by_bare_flag = idx > 0 && cleaned[idx - 1].starts_with('-') && !cleaned[idx - 1].contains('=');
             if !tok.starts_with('-') && !tok.ends_with(".fio") && !preceded_by_bare_flag {
                 mnt_idx = Some(idx);
                 break;
@@ -309,9 +305,7 @@ fn clat_percentiles(side: &Value, names: &[&str]) -> Value {
             out.insert(format!("p{n}"), v.clone());
         }
     }
-    let mean = side
-        .pointer("/clat_ns/mean")
-        .or_else(|| side.pointer("/clat/mean"));
+    let mean = side.pointer("/clat_ns/mean").or_else(|| side.pointer("/clat/mean"));
     if let Some(m) = mean {
         out.insert("mean".into(), m.clone());
     }
@@ -376,10 +370,7 @@ fn summarize_jobs(jobs: &[Value]) -> Value {
         [] => Value::Null,
         [single] => single.clone(),
         many => {
-            let runtime_ms = many
-                .iter()
-                .filter_map(|j| j["runtimeMs"].as_u64())
-                .max();
+            let runtime_ms = many.iter().filter_map(|j| j["runtimeMs"].as_u64()).max();
             json!({
                 "jobname": many[0].get("jobname").cloned().unwrap_or(json!("all")),
                 "runtimeMs": runtime_ms,
@@ -469,8 +460,7 @@ fn invoke_fio(bin: &Path, mut cmd: Vec<String>) -> Result<FioExecResult, String>
                     stderr_tail = crate::common::tail_utf8(preamble, 4000);
                 }
             }
-            serde_json::from_str::<Value>(json_str)
-                .map_err(|e| format!("fio output is not valid JSON: {e}"))
+            serde_json::from_str::<Value>(json_str).map_err(|e| format!("fio output is not valid JSON: {e}"))
         });
     let _ = fs::remove_file(&out_path);
     if !stderr_tail.is_empty() {
@@ -529,8 +519,7 @@ fn has_name_or_jobfile(fio_args: &[String]) -> bool {
 }
 
 pub fn run(mountpoint: &Path, fio_args: &[String]) -> Result<Value, String> {
-    let meta = fs::symlink_metadata(mountpoint)
-        .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let meta = fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
@@ -601,7 +590,18 @@ fn run_default_matrix(
     let specs: &[(&str, &str, &str, &str, &str, u32, u32, bool, bool, bool)] = &[
         ("seq-write", "seq", "write", "1m", "256m", 16, 30, false, false, true),
         ("seq-read", "seq", "read", "1m", "256m", 16, 30, false, true, false),
-        ("rand-write", "rand", "randwrite", "4k", "64m", 32, 10, true, false, true),
+        (
+            "rand-write",
+            "rand",
+            "randwrite",
+            "4k",
+            "64m",
+            32,
+            10,
+            true,
+            false,
+            true,
+        ),
         ("rand-read", "rand", "randread", "4k", "64m", 32, 10, true, true, false),
         ("rand-rw", "rand", "randrw", "4k", "64m", 32, 10, true, false, true),
     ];
@@ -777,9 +777,7 @@ mod tests {
         let tmp = std::env::temp_dir();
         let argv = vec![OsString::from(tmp.to_str().unwrap())];
         let ParsedInvocation::Run {
-            mountpoint,
-            fio_args,
-            ..
+            mountpoint, fio_args, ..
         } = parse_invocation(&argv).expect("parse")
         else {
             panic!("expected Run");

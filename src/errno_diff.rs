@@ -356,11 +356,7 @@ fn getxattr_raw(p: &Path, name: &[u8], buf: &mut [u8]) -> (i32, usize) {
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let n: isize = -1;
-    if n < 0 {
-        (last_errno(), 0)
-    } else {
-        (0, n as usize)
-    }
+    if n < 0 { (last_errno(), 0) } else { (0, n as usize) }
 }
 
 fn listxattr_raw(p: &Path, size: usize) -> i32 {
@@ -620,9 +616,7 @@ fn build_catalog(with_alt: bool, with_gitws: bool) -> Vec<ProbeCase> {
             fam: "C",
             cls: RowClass::Parity,
             note: "",
-            run: |ws, _| {
-                Obs::Errno(open_close_errno(&ws.join("a/f"), libc::O_CREAT | libc::O_WRONLY, 0o644))
-            },
+            run: |ws, _| Obs::Errno(open_close_errno(&ws.join("a/f"), libc::O_CREAT | libc::O_WRONLY, 0o644)),
         },
         ProbeCase {
             id: "C4-open-missing",
@@ -784,7 +778,11 @@ fn build_catalog(with_alt: bool, with_gitws: bool) -> Vec<ProbeCase> {
             run: |ws, _| {
                 mkfile(&ws.join("f1"), b"1");
                 mkfile(&ws.join("f2"), b"2");
-                Obs::Errno(rename_flags_errno(&ws.join("f1"), &ws.join("f2"), RENAME_NOREPLACE_FLAG))
+                Obs::Errno(rename_flags_errno(
+                    &ws.join("f1"),
+                    &ws.join("f2"),
+                    RENAME_NOREPLACE_FLAG,
+                ))
             },
         },
         ProbeCase {
@@ -794,7 +792,11 @@ fn build_catalog(with_alt: bool, with_gitws: bool) -> Vec<ProbeCase> {
             note: "ext4 succeeds; documented divergence EINVAL",
             run: |ws, _| {
                 mkfile(&ws.join("f1"), b"1");
-                Obs::Errno(rename_flags_errno(&ws.join("f1"), &ws.join("f2"), RENAME_NOREPLACE_FLAG))
+                Obs::Errno(rename_flags_errno(
+                    &ws.join("f1"),
+                    &ws.join("f2"),
+                    RENAME_NOREPLACE_FLAG,
+                ))
             },
         },
         ProbeCase {
@@ -996,12 +998,8 @@ fn build_catalog(with_alt: bool, with_gitws: bool) -> Vec<ProbeCase> {
                     return Obs::Errno(last_errno());
                 }
                 let mut buf = [0u8; 4];
-                let r1 = cvt_ssize(unsafe {
-                    libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, 4, -1)
-                });
-                let r2 = cvt_ssize(unsafe {
-                    libc::pwrite(fd, b"abcd".as_ptr() as *const libc::c_void, 4, -1)
-                });
+                let r1 = cvt_ssize(unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, 4, -1) });
+                let r2 = cvt_ssize(unsafe { libc::pwrite(fd, b"abcd".as_ptr() as *const libc::c_void, 4, -1) });
                 unsafe { libc::close(fd) };
                 let mut stages = BTreeMap::new();
                 stages.insert("pread", r1);
@@ -1048,18 +1046,14 @@ fn build_catalog(with_alt: bool, with_gitws: bool) -> Vec<ProbeCase> {
                 let ffd = unsafe { libc::open(cpath(&f).as_ptr(), libc::O_RDONLY) };
                 let mut buf = [0u8; 4];
                 let rd_dir = if dfd >= 0 {
-                    let e = cvt_ssize(unsafe {
-                        libc::read(dfd, buf.as_mut_ptr() as *mut libc::c_void, 4)
-                    });
+                    let e = cvt_ssize(unsafe { libc::read(dfd, buf.as_mut_ptr() as *mut libc::c_void, 4) });
                     unsafe { libc::close(dfd) };
                     e
                 } else {
                     last_errno()
                 };
                 let wr_ro = if ffd >= 0 {
-                    let e = cvt_ssize(unsafe {
-                        libc::write(ffd, b"xy".as_ptr() as *const libc::c_void, 2)
-                    });
+                    let e = cvt_ssize(unsafe { libc::write(ffd, b"xy".as_ptr() as *const libc::c_void, 2) });
                     unsafe { libc::close(ffd) };
                     e
                 } else {
@@ -1421,26 +1415,16 @@ fn build_catalog(with_alt: bool, with_gitws: bool) -> Vec<ProbeCase> {
             run: |ws, _| {
                 let f = ws.join("unlinked");
                 let cp = cpath(&f);
-                let fd = unsafe {
-                    libc::open(
-                        cp.as_ptr(),
-                        libc::O_CREAT | libc::O_RDWR,
-                        0o644 as libc::c_uint,
-                    )
-                };
+                let fd = unsafe { libc::open(cp.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644 as libc::c_uint) };
                 if fd < 0 {
                     return Obs::Errno(last_errno());
                 }
                 let u_rc = cvt_rc(unsafe { libc::unlink(cp.as_ptr()) });
-                let w_rc = cvt_ssize(unsafe {
-                    libc::pwrite(fd, b"alive".as_ptr() as *const libc::c_void, 5, 0)
-                });
+                let w_rc = cvt_ssize(unsafe { libc::pwrite(fd, b"alive".as_ptr() as *const libc::c_void, 5, 0) });
                 let mut sb: libc::stat = unsafe { std::mem::zeroed() };
                 let st_rc = cvt_rc(unsafe { libc::fstat(fd, &mut sb) });
                 let mut rbuf = [0u8; 5];
-                let r_rc = cvt_ssize(unsafe {
-                    libc::pread(fd, rbuf.as_mut_ptr() as *mut libc::c_void, 5, 0)
-                });
+                let r_rc = cvt_ssize(unsafe { libc::pread(fd, rbuf.as_mut_ptr() as *mut libc::c_void, 5, 0) });
                 unsafe { libc::close(fd) };
                 let ok = u_rc == 0 && w_rc == 0 && st_rc == 0 && sb.st_nlink == 0 && r_rc == 0 && &rbuf == b"alive";
                 Obs::Errno(if ok { 0 } else { libc::EIO })
@@ -1457,8 +1441,14 @@ fn build_catalog(with_alt: bool, with_gitws: bool) -> Vec<ProbeCase> {
                 let c_miss = cvt_rc(unsafe { libc::chmod(cpath(&ws.join("missing")).as_ptr(), 0o600) });
                 let c_notdir = cvt_rc(unsafe { libc::chmod(cpath(&ws.join("f/child")).as_ptr(), 0o600) });
                 let ts = [
-                    libc::timespec { tv_sec: 1_700_000_000, tv_nsec: 0 },
-                    libc::timespec { tv_sec: 1_700_000_000, tv_nsec: 0 },
+                    libc::timespec {
+                        tv_sec: 1_700_000_000,
+                        tv_nsec: 0,
+                    },
+                    libc::timespec {
+                        tv_sec: 1_700_000_000,
+                        tv_nsec: 0,
+                    },
                 ];
                 let u_miss = cvt_rc(unsafe {
                     libc::utimensat(libc::AT_FDCWD, cpath(&ws.join("missing")).as_ptr(), ts.as_ptr(), 0)
@@ -1616,10 +1606,7 @@ fn evaluate(
                 }
                 _ => false,
             };
-            (
-                if ok { "PASS" } else { "FAIL" },
-                "doc-shape=deferred-eio".into(),
-            )
+            (if ok { "PASS" } else { "FAIL" }, "doc-shape=deferred-eio".into())
         }
         RowClass::CrossLayerExdev => {
             let ok = *tgt_obs == Obs::Errno(libc::EXDEV);
@@ -1689,8 +1676,7 @@ fn run_side(root: &Path, ctx: &SideCtx<'_>, pc: &ProbeCase) -> Obs {
 }
 
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
-    let meta = fs::symlink_metadata(mountpoint)
-        .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let meta = fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }

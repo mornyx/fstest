@@ -20,12 +20,7 @@ use common::{MountSnapshot, enrich_report};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const HIDDEN_HELPER_MODES: &[&str] = &[
-    "__pjdfstest",
-    "__sqlite-mptest",
-    "__sqlite-shm-child",
-    "__stdfs-rust",
-];
+pub const HIDDEN_HELPER_MODES: &[&str] = &["__pjdfstest", "__sqlite-mptest", "__sqlite-shm-child", "__stdfs-rust"];
 
 /// Check whether `argv_after_bin` begins with one of fstest's internal child-helper
 /// modes (`__pjdfstest`, `__sqlite-mptest`, `__sqlite-shm-child`, `__stdfs-rust`) and execute it if so.
@@ -188,9 +183,11 @@ pub enum Command {
 }
 
 fn init_log(verbose: bool) {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(if verbose { "debug" } else { "info" }),
-    )
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if verbose {
+        "debug"
+    } else {
+        "info"
+    }))
     .try_init();
 }
 
@@ -201,11 +198,7 @@ where
     T: Into<OsString> + Clone,
 {
     let raw: Vec<OsString> = itr.into_iter().map(Into::into).collect();
-    let tail_strings: Vec<String> = raw
-        .iter()
-        .skip(1)
-        .map(|s| s.to_string_lossy().into_owned())
-        .collect();
+    let tail_strings: Vec<String> = raw.iter().skip(1).map(|s| s.to_string_lossy().into_owned()).collect();
     if let Some(code) = try_run_helper_mode(&tail_strings) {
         return code;
     }
@@ -355,7 +348,11 @@ where
             match bundle::run(&cmd) {
                 Ok(report) => {
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                    if report["status"] == serde_json::json!("ok") { 0 } else { 1 }
+                    if report["status"] == serde_json::json!("ok") {
+                        0
+                    } else {
+                        1
+                    }
                 }
                 Err(e) => {
                     log::error!("{e}");
@@ -366,11 +363,7 @@ where
     }
 }
 
-fn finish(
-    report: Result<serde_json::Value, String>,
-    snap: Option<&MountSnapshot>,
-    json_path: Option<&Path>,
-) -> i32 {
+fn finish(report: Result<serde_json::Value, String>, snap: Option<&MountSnapshot>, json_path: Option<&Path>) -> i32 {
     match report {
         Ok(mut report) => {
             enrich_report(&mut report, snap);

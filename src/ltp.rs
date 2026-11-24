@@ -18,8 +18,8 @@
 //   `TBROK` or signal => `broken`) and reports both per-command counts and
 //   `kirk`-style sub-assertion totals (`summary.assertions`).
 
-use crate::common::{remove_dir_all_bounded, tail_utf8};
 use crate::common::iso8601;
+use crate::common::{remove_dir_all_bounded, tail_utf8};
 use log::{info, warn};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -109,22 +109,14 @@ fn default_ltp_dir_candidates() -> Vec<PathBuf> {
     for base in crate::common::cache_dir_candidates() {
         let ltp_cache = base.join("ltp");
         if let Ok(rd) = fs::read_dir(&ltp_cache) {
-            let mut dirs: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
+            let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
             dirs.sort();
             dirs.reverse();
             for d in dirs {
                 if d.join("runtest").is_dir() && d.join("testcases/bin").is_dir() {
                     v.push(d);
                 } else if let Ok(sub_rd) = fs::read_dir(&d) {
-                    let mut subs: Vec<PathBuf> = sub_rd
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_dir())
-                        .collect();
+                    let mut subs: Vec<PathBuf> = sub_rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
                     subs.sort();
                     subs.reverse();
                     v.extend(subs);
@@ -180,8 +172,7 @@ fn extra_user_skips(args: &Args) -> Result<HashSet<String>, String> {
         }
     }
     if let Some(path) = &args.skip_file {
-        let text = fs::read_to_string(path)
-            .map_err(|e| format!("cannot read --skip-file {}: {e}", path.display()))?;
+        let text = fs::read_to_string(path).map_err(|e| format!("cannot read --skip-file {}: {e}", path.display()))?;
         out.extend(parse_removal_names(&text));
     }
     Ok(out)
@@ -219,9 +210,7 @@ fn builtin_removal_for_suite(suite: &str) -> HashSet<String> {
             if let Some((maj, min)) = linux_kernel_version()
                 && (maj < 6 || (maj == 6 && min < 11))
             {
-                info!(
-                    "ltp: skipping listmount04 on kernel {maj}.{min} (< 6.11, per JuiceFS ltpsyscalls.yml)"
-                );
+                info!("ltp: skipping listmount04 on kernel {maj}.{min} (< 6.11, per JuiceFS ltpsyscalls.yml)");
                 set.insert("listmount04".to_string());
             }
             set
@@ -247,10 +236,7 @@ fn resolve_runfile_path(ltp_dir: &Path, suite: &str) -> PathBuf {
 /// so they actually exercise the mounted filesystem under test rather than host `/tmp`.
 fn rewrite_mount_bound_cmd(name: &str, cmd: &str) -> String {
     if name.eq_ignore_ascii_case("FCNTL_LOCKTESTS") || cmd.contains("/tmp/fcntl_locktest_testfile") {
-        return cmd.replace(
-            "/tmp/fcntl_locktest_testfile",
-            "\"$TMPDIR/fcntl_locktest_testfile\"",
-        );
+        return cmd.replace("/tmp/fcntl_locktest_testfile", "\"$TMPDIR/fcntl_locktest_testfile\"");
     }
     cmd.to_string()
 }
@@ -506,12 +492,7 @@ fn exec_shell_test(
     (code, timed_out, combined, None)
 }
 
-fn run_direct(
-    mountpoint: &Path,
-    args: &Args,
-    ltp_dir: &Path,
-    tests: Vec<(String, String, String)>,
-) -> Value {
+fn run_direct(mountpoint: &Path, args: &Args, ltp_dir: &Path, tests: Vec<(String, String, String)>) -> Value {
     let bin_dir = ltp_dir.join("testcases/bin");
     let work = mountpoint.join(&args.work_dir);
     let tmp = work.join("tmp");
@@ -535,8 +516,7 @@ fn run_direct(
     };
 
     let mut results = Vec::new();
-    let (mut pass, mut fail, mut broken, mut skip, mut warnn, mut tout) =
-        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut pass, mut fail, mut broken, mut skip, mut warnn, mut tout) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut assertions = AssertionCounts::default();
     let start = Instant::now();
     let deadline = Duration::from_secs(args.timeout.max(1));
@@ -637,16 +617,12 @@ fn run_direct(
 }
 
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
-    let meta =
-        fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let meta = fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
     if !cfg!(target_os = "linux") && args.ltp_dir.is_none() {
-        let reason = format!(
-            "LTP targets Linux only (current OS: {})",
-            std::env::consts::OS
-        );
+        let reason = format!("LTP targets Linux only (current OS: {})", std::env::consts::OS);
         info!("ltp: skipping ({reason})");
         let host = hostname::get()
             .map(|h| h.to_string_lossy().into_owned())
@@ -706,8 +682,8 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
     let mut tests: Vec<(String, String, String)> = Vec::new();
     for suite in &args.suite {
         let runfile = resolve_runfile_path(&ltp_dir, suite);
-        let text = fs::read_to_string(&runfile)
-            .map_err(|e| format!("cannot read runfile {}: {e}", runfile.display()))?;
+        let text =
+            fs::read_to_string(&runfile).map_err(|e| format!("cannot read runfile {}: {e}", runfile.display()))?;
         let remove = removal_set_for_suite(suite, args, &user_skips);
         let parsed = parse_runfile(&text, &remove);
         info!(
@@ -801,10 +777,7 @@ mod tests {
         );
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, "FCNTL_LOCKTESTS");
-        assert_eq!(
-            parsed[0].1,
-            "locktests -n 100 -f \"$TMPDIR/fcntl_locktest_testfile\""
-        );
+        assert_eq!(parsed[0].1, "locktests -n 100 -f \"$TMPDIR/fcntl_locktest_testfile\"");
     }
 
     #[test]
@@ -826,7 +799,8 @@ mod tests {
 
     #[test]
     fn assertion_parser_handles_new_summary_and_legacy_output() {
-        let new_api = "\x1b[1;32mSummary:\x1b[0m\nSummary:\npassed   12\nfailed   0\nbroken   0\nskipped  2\nwarnings 1\n";
+        let new_api =
+            "\x1b[1;32mSummary:\x1b[0m\nSummary:\npassed   12\nfailed   0\nbroken   0\nskipped  2\nwarnings 1\n";
         let clean = strip_ansi(new_api);
         assert_eq!(
             parse_assertions(&clean, "pass"),

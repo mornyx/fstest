@@ -1,10 +1,7 @@
 // Port of `smallfile` (https://github.com/distributed-system-analysis/smallfile, Apache-2.0):
 // multi-threaded POSIX small-file metadata and data benchmark.
 
-use crate::common::{
-    SplitMix64, fsync_raw, host_name, iso8601, posix_fallocate_fd, remove_dir_all_bounded,
-    suffixed,
-};
+use crate::common::{SplitMix64, fsync_raw, host_name, iso8601, posix_fallocate_fd, remove_dir_all_bounded, suffixed};
 use log::{error, info, warn};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashSet};
@@ -500,9 +497,7 @@ impl Workload {
                 self.pause_hist[i] = rsp;
                 self.pause_idx = Some((i + 1) % PAUSE_RSTIME_COUNT);
                 self.pause_samples += 1;
-                if self.pause_hist_start + PAUSE_HIST_DURATION < end
-                    || self.pause_samples > PAUSE_RSTIME_COUNT / 2
-                {
+                if self.pause_hist_start + PAUSE_HIST_DURATION < end || self.pause_samples > PAUSE_RSTIME_COUNT / 2 {
                     self.calculate_pause_time(end);
                     self.pause_hist_start = end;
                     self.pause_samples = 0;
@@ -568,10 +563,7 @@ impl Workload {
             && (self.filenum as u32 + 1) % self.p.files_between_checks() == 0
             && flag.load(Ordering::SeqCst)
         {
-            info!(
-                "thread {} saw stonewall after {} files",
-                self.tid_label, self.filenum
-            );
+            info!("thread {} saw stonewall after {} files", self.tid_label, self.filenum);
             self.end_test(flag);
         }
         if !self.p.finish_all_rq && self.test_ended() {
@@ -587,9 +579,7 @@ impl Workload {
         }
         self.filenum += 1;
         if self.pause_sec > 0.0 && self.filenum % FILES_BETWEEN_PAUSE == 0 {
-            thread::sleep(Duration::from_secs_f64(
-                self.pause_sec * FILES_BETWEEN_PAUSE as f64,
-            ));
+            thread::sleep(Duration::from_secs_f64(self.pause_sec * FILES_BETWEEN_PAUSE as f64));
         }
         true
     }
@@ -629,11 +619,7 @@ impl Workload {
                         Ok(()) => {}
                         Err(e) => match e.raw_os_error() {
                             Some(x) if x == libc::ENOENT => {}
-                            Some(x)
-                                if x == libc::EACCES
-                                    || x == libc::EBUSY
-                                    || x == libc::ENOTEMPTY =>
-                            {
+                            Some(x) if x == libc::EACCES || x == libc::EBUSY || x == libc::ENOTEMPTY => {
                                 break;
                             }
                             _ => return Err(e),
@@ -835,9 +821,7 @@ impl Workload {
 
     fn do_readdir(&mut self, flag: &AtomicBool, stat_each: bool) -> io::Result<()> {
         if self.p.hash_to_dir {
-            return Err(io::Error::other(
-                "cannot do readdir test with --hash-into-dirs option",
-            ));
+            return Err(io::Error::other("cannot do readdir test with --hash-into-dirs option"));
         }
         let top = self.p.top.clone();
         let opname = self.p.opname.clone();
@@ -887,10 +871,7 @@ impl Workload {
                 )));
             }
         }
-        if !prev_dir.is_empty()
-            && self.filenum >= self.p.iterations as usize
-            && file_count != dir_map.len()
-        {
+        if !prev_dir.is_empty() && self.filenum >= self.p.iterations as usize && file_count != dir_map.len() {
             return Err(io::Error::other(format!(
                 "readdir: expected {} files in final directory {prev_dir}, saw {}",
                 file_count,
@@ -989,7 +970,11 @@ impl Workload {
             let uo = self.unique_offset();
             let t0 = self.now();
             let result = (|| -> io::Result<()> {
-                let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmpnm)?;
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmpnm)?;
                 let fd = f.as_raw_fd();
                 if unsafe { libc::fchmod(fd, 0o667) } != 0 {
                     return Err(io::Error::last_os_error());
@@ -1009,10 +994,7 @@ impl Workload {
                     let _ = f.get_xattr(&format!("{SWIFT_XATTR_PREFIX}{j}"))?;
                 }
                 for j in 0..self.p.xattr_count {
-                    f.set_xattr(
-                        &format!("{SWIFT_XATTR_PREFIX}{j}"),
-                        self.xattr_value(&biggest, uo, j),
-                    )?;
+                    f.set_xattr(&format!("{SWIFT_XATTR_PREFIX}{j}"), self.xattr_value(&biggest, uo, j))?;
                 }
                 if self.p.fsync {
                     fsync_raw(&f)?;
@@ -1021,9 +1003,7 @@ impl Workload {
                 {
                     // `posix_fadvise` returns a positive errno directly without setting `errno`,
                     // and MUST run while `f` is still open.
-                    let rc = unsafe {
-                        libc::posix_fadvise(fd, 0, fszbytes, libc::POSIX_FADV_DONTNEED)
-                    };
+                    let rc = unsafe { libc::posix_fadvise(fd, 0, fszbytes, libc::POSIX_FADV_DONTNEED) };
                     if rc != 0 {
                         return Err(io::Error::from_raw_os_error(rc));
                     }
@@ -1327,9 +1307,7 @@ pub fn run(top: &Path, args: &Args) -> io::Result<Value> {
         return Err(io::Error::other(format!("{} is not a directory", top.display())));
     }
     if args.record_size > args.file_size && args.file_size != 0 {
-        return Err(io::Error::other(
-            "record size must not be greater than file size",
-        ));
+        return Err(io::Error::other("record size must not be greater than file size"));
     }
     let ops: Vec<String> = match &args.operation {
         Some(op) => vec![op.clone()],

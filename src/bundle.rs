@@ -53,10 +53,7 @@ pub fn ensure_extracted() -> Option<PathBuf> {
             match extract_embedded_to(&dest) {
                 Ok(()) => Some(dest),
                 Err(e) => {
-                    warn!(
-                        "failed to extract embedded suite bundle to {}: {e}",
-                        dest.display()
-                    );
+                    warn!("failed to extract embedded suite bundle to {}: {e}", dest.display());
                     None
                 }
             }
@@ -72,10 +69,7 @@ fn extract_embedded_to(dest: &Path) -> Result<(), String> {
         .parent()
         .ok_or_else(|| format!("invalid bundle dest {}", dest.display()))?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    let staging = parent.join(format!(
-        ".staging-{EMBEDDED_BUNDLE_HASH}-{}",
-        std::process::id()
-    ));
+    let staging = parent.join(format!(".staging-{EMBEDDED_BUNDLE_HASH}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging).map_err(|e| format!("mkdir {}: {e}", staging.display()))?;
 
@@ -92,19 +86,14 @@ fn extract_embedded_to(dest: &Path) -> Result<(), String> {
         .map_err(|e| format!("unpack embedded bundle tar: {e}"))?;
 
     relocate_git_tree(&staging, dest)?;
-    fs::write(staging.join(".ready"), EMBEDDED_BUNDLE_HASH.as_bytes())
-        .map_err(|e| e.to_string())?;
+    fs::write(staging.join(".ready"), EMBEDDED_BUNDLE_HASH.as_bytes()).map_err(|e| e.to_string())?;
 
     if let Err(e) = fs::rename(&staging, dest) {
         let _ = fs::remove_dir_all(&staging);
         if dest.join(".ready").is_file() {
             return Ok(());
         }
-        return Err(format!(
-            "rename {} -> {}: {e}",
-            staging.display(),
-            dest.display()
-        ));
+        return Err(format!("rename {} -> {}: {e}", staging.display(), dest.display()));
     }
     Ok(())
 }
@@ -154,9 +143,7 @@ fn relocate_git_tree(staging_root: &Path, final_dest: &Path) -> Result<(), Strin
         if let Ok(text) = fs::read_to_string(&p)
             && text.contains(orig_dir)
         {
-            let mode = fs::metadata(&p)
-                .map(|m| m.permissions().mode())
-                .unwrap_or(0o755);
+            let mode = fs::metadata(&p).map(|m| m.permissions().mode()).unwrap_or(0o755);
             let replaced = text.replace(orig_dir, &final_git_str);
             fs::write(&p, replaced).map_err(|e| format!("relocate {}: {e}", p.display()))?;
             let _ = fs::set_permissions(&p, fs::Permissions::from_mode(mode));

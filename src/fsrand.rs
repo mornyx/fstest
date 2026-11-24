@@ -2,9 +2,7 @@
 // (`tree` directory shadow-oracle, `rw` single-file pwrite+fsync shadow-buffer,
 // `concurrent` multi-thread atomic-rename + reader-consistency stress, or `all`).
 
-use crate::common::{
-    CaseEntry, SplitMix64, fsync_raw, host_name, iso8601, remove_dir_all_bounded,
-};
+use crate::common::{CaseEntry, SplitMix64, fsync_raw, host_name, iso8601, remove_dir_all_bounded};
 use log::{info, warn};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -95,9 +93,7 @@ fn sha256_file(path: &Path) -> Result<(u64, String), String> {
     let mut buf = [0u8; 65536];
     let mut total = 0u64;
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let n = f.read(&mut buf).map_err(|e| format!("read {}: {e}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -141,10 +137,7 @@ fn walk_snapshot(root: &Path) -> Result<TreeSnap, String> {
         })
         .collect();
     link_groups.sort();
-    Ok(TreeSnap {
-        entries,
-        link_groups,
-    })
+    Ok(TreeSnap { entries, link_groups })
 }
 
 fn walk_rec(
@@ -164,13 +157,8 @@ fn walk_rec(
             continue;
         }
         let p = ent.path();
-        let rel = p
-            .strip_prefix(root)
-            .unwrap_or(&p)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let meta =
-            fs::symlink_metadata(&p).map_err(|e| format!("lstat {}: {e}", p.display()))?;
+        let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+        let meta = fs::symlink_metadata(&p).map_err(|e| format!("lstat {}: {e}", p.display()))?;
         let ft = meta.file_type();
         if ft.is_dir() {
             out.insert(
@@ -252,11 +240,7 @@ fn join_rel(dir_rel: &str, leaf: &str) -> String {
 }
 
 fn run_tree_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value), String> {
-    let oracle = std::env::temp_dir().join(format!(
-        "fstest-fsrand-oracle-{}-{}",
-        std::process::id(),
-        args.seed
-    ));
+    let oracle = std::env::temp_dir().join(format!("fstest-fsrand-oracle-{}-{}", std::process::id(), args.seed));
     let _ = fs::remove_dir_all(&oracle);
     fs::create_dir_all(&oracle).map_err(|e| e.to_string())?;
 
@@ -264,8 +248,8 @@ fn run_tree_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value
     let names: Vec<String> = (0..48).map(|i| format!("f{i:03}")).collect();
     let mut dirs: Vec<String> = vec![".".into()];
     let ops = [
-        "mkdir", "write", "pwrite", "append", "rename", "hardlink", "symlink", "chmod",
-        "fsync", "unlink", "rmdir", "truncate",
+        "mkdir", "write", "pwrite", "append", "rename", "hardlink", "symlink", "chmod", "fsync", "unlink", "rmdir",
+        "truncate",
     ];
     let mut failures = Vec::new();
     let mut checks_run = 0u64;
@@ -356,11 +340,7 @@ fn run_tree_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value
                 }
             }
             "rename" => {
-                if o_src
-                    .symlink_metadata()
-                    .map(|m| !m.is_dir())
-                    .unwrap_or(false)
-                {
+                if o_src.symlink_metadata().map(|m| !m.is_dir()).unwrap_or(false) {
                     let dst_dir = dirs[rng.range(dirs.len())].clone();
                     let dst_leaf = &names[rng.range(names.len())];
                     let dst_rel = join_rel(&dst_dir, dst_leaf);
@@ -390,9 +370,10 @@ fn run_tree_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value
                         let l2 = fs::hard_link(&m_src, &m_dst);
                         // Tolerate mounts that explicitly disable hardlinks (`EOPNOTSUPP`/`EMLINK`/`EXDEV`),
                         // otherwise require exact parity.
-                        let unsupported = l2.as_ref().err().and_then(|e| e.raw_os_error()).is_some_and(|c| {
-                            matches!(c, libc::EOPNOTSUPP | libc::ENOSYS | libc::EXDEV | libc::EPERM)
-                        });
+                        let unsupported =
+                            l2.as_ref().err().and_then(|e| e.raw_os_error()).is_some_and(|c| {
+                                matches!(c, libc::EOPNOTSUPP | libc::ENOSYS | libc::EXDEV | libc::EPERM)
+                            });
                         if unsupported {
                             let _ = fs::remove_file(&o_dst);
                         } else if l1.is_ok() != l2.is_ok() {
@@ -410,9 +391,7 @@ fn run_tree_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value
                     let s1 = std::os::unix::fs::symlink(&sym_target, &o_src);
                     let s2 = std::os::unix::fs::symlink(&sym_target, &m_src);
                     if s1.is_ok() != s2.is_ok() {
-                        failures.push(format!(
-                            "step {step} symlink({rel}): oracle={s1:?} mount={s2:?}"
-                        ));
+                        failures.push(format!("step {step} symlink({rel}): oracle={s1:?} mount={s2:?}"));
                         break;
                     }
                 }
@@ -432,10 +411,7 @@ fn run_tree_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value
             }
             "fsync" => {
                 if m_src.symlink_metadata().map(|m| m.is_file()).unwrap_or(false) {
-                    let res = OpenOptions::new()
-                        .write(true)
-                        .open(&m_src)
-                        .and_then(|f| fsync_raw(&f));
+                    let res = OpenOptions::new().write(true).open(&m_src).and_then(|f| fsync_raw(&f));
                     if let Err(e) = res {
                         failures.push(format!("step {step} fsync({rel}) failed: {e}"));
                         break;
@@ -478,18 +454,10 @@ fn run_tree_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value
                     } else {
                         rng.range(64 * 1024) as u64
                     };
-                    let t1 = OpenOptions::new()
-                        .write(true)
-                        .open(&o_src)
-                        .and_then(|f| f.set_len(sz));
-                    let t2 = OpenOptions::new()
-                        .write(true)
-                        .open(&m_src)
-                        .and_then(|f| f.set_len(sz));
+                    let t1 = OpenOptions::new().write(true).open(&o_src).and_then(|f| f.set_len(sz));
+                    let t2 = OpenOptions::new().write(true).open(&m_src).and_then(|f| f.set_len(sz));
                     if t1.is_ok() != t2.is_ok() {
-                        failures.push(format!(
-                            "step {step} truncate({rel}, {sz}): oracle={t1:?} mount={t2:?}"
-                        ));
+                        failures.push(format!("step {step} truncate({rel}, {sz}): oracle={t1:?} mount={t2:?}"));
                         break;
                     }
                 }
@@ -548,8 +516,7 @@ fn run_rw_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value),
             .truncate(true)
             .open(&path)
             .map_err(|e| format!("create {}: {e}", path.display()))?;
-        f.write_all(&model)
-            .map_err(|e| format!("initial write: {e}"))?;
+        f.write_all(&model).map_err(|e| format!("initial write: {e}"))?;
         fsync_raw(&f).map_err(|e| format!("initial fsync: {e}"))?;
 
         let mut chunk = vec![0u8; max_io];
@@ -586,9 +553,7 @@ fn run_rw_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>, Value),
                     break;
                 }
                 if verify_buf[..vlen] != model[voff..voff + vlen] {
-                    failures.push(format!(
-                        "intermediate readback mismatch at step {step} offset {voff}"
-                    ));
+                    failures.push(format!("intermediate readback mismatch at step {step} offset {voff}"));
                     break;
                 }
             }
@@ -700,11 +665,7 @@ fn run_concurrent_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>,
                         Err(e) => local_errs.push(format!("read {}: {e}", part.display())),
                     }
                     if let Err(e) = fs::rename(&part, &final_path) {
-                        local_errs.push(format!(
-                            "rename {} -> {}: {e}",
-                            part.display(),
-                            final_path.display()
-                        ));
+                        local_errs.push(format!("rename {} -> {}: {e}", part.display(), final_path.display()));
                         continue;
                     }
                     match fs::read(&final_path) {
@@ -797,8 +758,7 @@ fn run_concurrent_mode(target: &Path, args: &Args) -> Result<(bool, Vec<String>,
 }
 
 pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
-    let meta = fs::symlink_metadata(mountpoint)
-        .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+    let meta = fs::symlink_metadata(mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()));
     }
@@ -924,11 +884,7 @@ pub fn run(mountpoint: &Path, args: &Args) -> Result<Value, String> {
             t0.elapsed().as_secs_f64()
         );
     } else {
-        warn!(
-            "fsrand: {} FAILED ({} divergences/errors)",
-            args.mode,
-            failures.len()
-        );
+        warn!("fsrand: {} FAILED ({} divergences/errors)", args.mode, failures.len());
     }
 
     let mut cases: Vec<CaseEntry> = failures
@@ -1004,15 +960,7 @@ mod tests {
         assert_eq!(r_all["status"], json!("ok"), "r_all: {r_all}");
 
         // Verify `concurrent` mode leaves exact `workers * files` `stress-*` files when `work_dir = .`.
-        let c_cli = TestCli::parse_from([
-            "fsrand",
-            "--mode",
-            "concurrent",
-            "--workers",
-            "2",
-            "--files",
-            "8",
-        ]);
+        let c_cli = TestCli::parse_from(["fsrand", "--mode", "concurrent", "--workers", "2", "--files", "8"]);
         let rc = run(&dir, &c_cli.args).expect("concurrent");
         assert_eq!(rc["status"], json!("ok"));
         let stress_files = fs::read_dir(&dir)

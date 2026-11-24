@@ -129,7 +129,10 @@ pub fn posix_fallocate_fd(fd: i32, offset: i64, len: i64) -> io::Result<()> {
         };
         if st.fst_length > 0 && unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut st) } == -1 {
             let err = io::Error::last_os_error();
-            if !matches!(err.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL)) {
+            if !matches!(
+                err.raw_os_error(),
+                Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL)
+            ) {
                 return Err(err);
             }
         }
@@ -198,11 +201,7 @@ pub fn passwd_home_dir() -> Option<PathBuf> {
         }
         let cstr = std::ffi::CStr::from_ptr((*pw).pw_dir);
         let s = cstr.to_str().ok()?;
-        if s.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(s))
-        }
+        if s.is_empty() { None } else { Some(PathBuf::from(s)) }
     }
 }
 
@@ -732,10 +731,7 @@ fn derive_cases(suite: &str, v: &Value) -> Vec<CaseEntry> {
                         out.push(CaseEntry {
                             id: lang.clone(),
                             outcome: "skip".into(),
-                            detail: lv["reason"]
-                                .as_str()
-                                .unwrap_or("toolchain unavailable")
-                                .to_string(),
+                            detail: lv["reason"].as_str().unwrap_or("toolchain unavailable").to_string(),
                         });
                         continue;
                     }
@@ -885,7 +881,10 @@ fn derive_cases(suite: &str, v: &Value) -> Vec<CaseEntry> {
             } else if v["status"].as_str().is_some_and(|s| s != "ok") {
                 failed_any = true;
                 let op = v["params"]["operation"].as_str().unwrap_or("smallfile");
-                let det = v["failure"].as_str().or_else(|| v["status"].as_str()).unwrap_or("failed");
+                let det = v["failure"]
+                    .as_str()
+                    .or_else(|| v["status"].as_str())
+                    .unwrap_or("failed");
                 out.push(CaseEntry {
                     id: op.to_string(),
                     outcome: "fail".into(),
@@ -1032,11 +1031,7 @@ fn derive_metrics(suite: &str, v: &Value) -> Map<String, Value> {
                     ("closeUsec", "close_avg_ms"),
                     ("unlinkUsec", "unlink_avg_ms"),
                 ] {
-                    let avg_us: f64 = iters
-                        .iter()
-                        .filter_map(|it| it[field]["avg"].as_f64())
-                        .sum::<f64>()
-                        / n;
+                    let avg_us: f64 = iters.iter().filter_map(|it| it[field]["avg"].as_f64()).sum::<f64>() / n;
                     insert_metric(&mut m, format!("fsmark.{name}"), Some(avg_us / 1000.0));
                 }
             }
@@ -1045,7 +1040,11 @@ fn derive_metrics(suite: &str, v: &Value) -> Map<String, Value> {
             if let Some(summary) = v["summary"].as_object() {
                 for (op_name, sv) in summary {
                     let slug = slugify(op_name);
-                    insert_metric(&mut m, format!("mdtest.{slug}.total_ops_per_sec"), sv["totalRate"].as_f64());
+                    insert_metric(
+                        &mut m,
+                        format!("mdtest.{slug}.total_ops_per_sec"),
+                        sv["totalRate"].as_f64(),
+                    );
                     insert_metric(
                         &mut m,
                         format!("mdtest.{slug}.mean_ops_per_sec"),
@@ -1092,14 +1091,22 @@ fn derive_metrics(suite: &str, v: &Value) -> Map<String, Value> {
                 for p in phases {
                     let op = slugify(p["operation"].as_str().unwrap_or("op"));
                     let r = &p["results"];
-                    insert_metric(&mut m, format!("smallfile.{op}.files_per_sec"), r["filesPerSec"].as_f64());
+                    insert_metric(
+                        &mut m,
+                        format!("smallfile.{op}.files_per_sec"),
+                        r["filesPerSec"].as_f64(),
+                    );
                     insert_metric(&mut m, format!("smallfile.{op}.iops"), r["IOPS"].as_f64());
                     insert_metric(&mut m, format!("smallfile.{op}.bw_mibps"), r["MiBps"].as_f64());
                 }
             } else if v["results"].is_object() {
                 let op = slugify(v["params"]["operation"].as_str().unwrap_or("op"));
                 let r = &v["results"];
-                insert_metric(&mut m, format!("smallfile.{op}.files_per_sec"), r["filesPerSec"].as_f64());
+                insert_metric(
+                    &mut m,
+                    format!("smallfile.{op}.files_per_sec"),
+                    r["filesPerSec"].as_f64(),
+                );
                 insert_metric(&mut m, format!("smallfile.{op}.iops"), r["IOPS"].as_f64());
                 insert_metric(&mut m, format!("smallfile.{op}.bw_mibps"), r["MiBps"].as_f64());
             }
@@ -1149,11 +1156,7 @@ fn derive_metrics(suite: &str, v: &Value) -> Map<String, Value> {
                     if let Some(u) = units
                         && dur_ms > 0.0
                     {
-                        insert_metric(
-                            &mut m,
-                            format!("fsrand.{mode}.ops_per_sec"),
-                            Some(u * 1000.0 / dur_ms),
-                        );
+                        insert_metric(&mut m, format!("fsrand.{mode}.ops_per_sec"), Some(u * 1000.0 / dur_ms));
                     }
                 }
             }
