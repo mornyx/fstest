@@ -10,9 +10,21 @@ One Rust binary that ports and wraps the community's filesystem test tools as un
 | functional | [pjdfstest](#pjdfstest) · [errno-diff](#errno-diff) · [fsx](#fsx) · [fsstress](#fsstress) · [fsrand](#fsrand) · [ltp](#ltp) · [stdfs](#stdfs) · [git](#git) · [sqlite](#sqlite) |
 | packaging | [bundle](#bundle) (compile-time self-contained multi-platform binary) |
 
-### Self-contained single-binary build (`linux-x86_64` · `linux-aarch64` · `macos-aarch64`)
+### Install
 
-Prebuilt self-contained binaries (`fstest-linux-amd64`, `fstest-linux-arm64` static musl, and `fstest-darwin-arm64`) are published on [GitHub Releases](https://github.com/mornyx/fstest/releases) (both tagged releases under `/releases/latest/download/` and rolling `main` builds under `fstest-latest`).
+Download the prebuilt self-contained binary from [GitHub Releases](https://github.com/mornyx/fstest/releases) (zero runtime dependencies; static `musl` on Linux `amd64`/`arm64`, native `arm64` on macOS):
+
+```sh
+# curl (auto-detects Linux amd64/arm64 or macOS arm64)
+curl -fsSL "https://github.com/mornyx/fstest/releases/latest/download/fstest-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')" -o fstest && chmod +x fstest
+
+# wget (auto-detects Linux amd64/arm64 or macOS arm64)
+wget -qO fstest "https://github.com/mornyx/fstest/releases/latest/download/fstest-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')" && chmod +x fstest
+```
+
+Move `fstest` onto your `PATH` (e.g. `sudo install -m 0755 fstest /usr/local/bin/fstest`), or fetch a specific asset / SHA-256 digest (`fstest-linux-amd64`, `fstest-linux-arm64`, `fstest-darwin-arm64`, `fstest-checksums.txt`; replace `latest/download` with `download/fstest-latest` for rolling `main` builds).
+
+### Self-contained single-binary build (`linux-x86_64` · `linux-aarch64` · `macos-aarch64`)
 
 To build from source, a plain `cargo build --release` automatically builds, caches (`~/.cache/fstest/target-bundles/<os>-<arch>-v5/bundle.tar.gz`), and embeds **every external suite and runtime** directly into the `fstest` binary for the target platform — no post-build packing step or external prepare scripts required:
 
