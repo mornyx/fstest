@@ -12,7 +12,9 @@ One Rust binary that ports and wraps the community's filesystem test tools as un
 
 ### Self-contained single-binary build (`linux-x86_64` · `linux-aarch64` · `macos-aarch64`)
 
-A plain `cargo build --release` automatically builds, caches (`~/.cache/fstest/target-bundles/<os>-<arch>-v5/bundle.tar.gz`), and embeds **every external suite and runtime** directly into the `fstest` binary for the target platform — no post-build packing step or external prepare scripts required:
+Prebuilt self-contained binaries (`fstest-linux-amd64`, `fstest-linux-arm64` static musl, and `fstest-darwin-arm64`) are published on [GitHub Releases](https://github.com/mornyx/fstest/releases) (both tagged releases under `/releases/latest/download/` and rolling `main` builds under `fstest-latest`).
+
+To build from source, a plain `cargo build --release` automatically builds, caches (`~/.cache/fstest/target-bundles/<os>-<arch>-v5/bundle.tar.gz`), and embeds **every external suite and runtime** directly into the `fstest` binary for the target platform — no post-build packing step or external prepare scripts required:
 
 - **macOS arm64 (`aarch64-apple-darwin`)**: `cargo build --release` (embeds 13/14 suites natively including `fio`, `git`, `stdfs`, `pjdfstest`, and `sqlite`; `ltp` reports `skip` cleanly on non-Linux).
 - **Linux x86_64 (`x86_64-unknown-linux-gnu` / `musl`) & arm64 (`aarch64-unknown-linux-gnu` / `musl`)**: `cargo build --release --target <triple>` (embeds all 14/14 suites including compiled `fio`, `ltp`, and `git`; when cross-compiling from macOS, `build.rs` automatically builds Linux C suites inside `debian:bullseye` via Docker for broad glibc ≥ 2.31 compatibility).

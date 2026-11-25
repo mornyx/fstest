@@ -1,0 +1,221 @@
+name: Release fstest binaries
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional version tag to publish as Latest (e.g. v0.1.0)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-fstest-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            artifact: fstest-linux-amd64
+            musl: true
+          - os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            artifact: fstest-linux-arm64
+            musl: true
+          - os: macos-15
+            rust_target: aarch64-apple-darwin
+            artifact: fstest-darwin-arm64
+            musl: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies (Linux static musl + embedded C suites)
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools build-essential pkgconf bison flex m4 xz-utils perl \
+            zlib1g-dev libaio-dev libacl1-dev libcap-dev libkeyutils-dev libnuma-dev uuid-dev libssl-dev attr
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.rust_target }}
+          components: rust-src
+
+      - name: Cache fstest target suite bundles
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fstest
+          key: fstest-bundle-v5-${{ matrix.rust_target }}-${{ hashFiles('build.rs', 'Cargo.lock', 'vendor/**') }}
+          restore-keys: |
+            fstest-bundle-v5-${{ matrix.rust_target }}-
+
+      - name: Run unit tests
+        env:
+          FSTEST_SKIP_BUNDLE: "1"
+        run: cargo test
+
+      - name: Build single-file stripped binary
+        run: |
+          mkdir -p dist
+          cargo build --release --target "${{ matrix.rust_target }}"
+          cp "target/${{ matrix.rust_target }}/release/fstest" "dist/${{ matrix.artifact }}"
+          chmod +x "dist/${{ matrix.artifact }}"
+
+      - name: Verify standalone single-binary & embedded suite bundle
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$(pwd)"
+          BIN="${REPO_ROOT}/dist/${{ matrix.artifact }}"
+          WORK_DIR="$(mktemp -d)"
+          CACHE_DIR="$(mktemp -d)"
+          export XDG_CACHE_HOME="$CACHE_DIR"
+          export FSTEST_CACHE_DIR="$CACHE_DIR/fstest"
+          cd "$WORK_DIR"
+
+          "$BIN" --version
+          "$BIN" bundle info > "$WORK_DIR/bundle-info.json"
+          python3 - "$WORK_DIR/bundle-info.json" "${{ matrix.musl }}" <<'PY'
+          import json, sys
+          info = json.load(open(sys.argv[1]))
+          is_linux = sys.argv[2] == "true"
+          assert info.get("status") == "ok", info
+          assert info.get("bundled") is True, info
+          assert info.get("payloadBytes", 0) > 10_000_000, info
+          comps = info.get("manifest", {}).get("components", {})
+          expected = {"go", "python", "node", "git", "fio"}
+          if is_linux:
+              expected.add("ltp")
+          missing = expected - set(comps.keys())
+          assert not missing, f"missing embedded bundle components: {missing} (got {list(comps.keys())})"
+          print(
+              f"Verified embedded bundle hash={info['hash']} "
+              f"payload={info['payloadBytes'] / 1048576:.1f} MiB "
+              f"components={sorted(comps.keys())}"
+          )
+          PY
+
+          mkdir -p "$WORK_DIR/mnt"
+          "$BIN" fsx -N 50 -S 42 --cleanup --json "$WORK_DIR/fsx.json" "$WORK_DIR/mnt" >/dev/null
+          "$BIN" sqlite --probes crud --json "$WORK_DIR/sqlite.json" "$WORK_DIR/mnt" >/dev/null
+          "$BIN" stdfs --lang go,rust --json "$WORK_DIR/stdfs.json" "$WORK_DIR/mnt" >/dev/null
+
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            if ldd "$BIN" 2>&1 | grep -Evq 'not a dynamic executable|statically linked'; then
+              echo "Expected static musl ELF, got:" >&2
+              ldd "$BIN" >&2 || true
+              exit 1
+            fi
+          fi
+
+          rm -rf "$WORK_DIR" "$CACHE_DIR"
+
+      - name: Upload matrix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish fstest Binaries
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums & version metadata
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f *.sha256 fstest-checksums.txt fstest-version
+          chmod +x fstest-*
+          sha256sum fstest-linux-amd64 fstest-linux-arm64 fstest-darwin-arm64 > fstest-checksums.txt
+          for f in fstest-linux-amd64 fstest-linux-arm64 fstest-darwin-arm64; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          echo "$GITHUB_SHA" > fstest-version
+          cat fstest-checksums.txt
+
+      - name: Publish rolling release (fstest-latest)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="fstest-latest"
+          NOTES="Automated standalone self-contained single-binary build of fstest from main (commit ${GITHUB_SHA::7}; embeds fio, pjdfstest, git, stdfs Go/Python/Node/Rust, sqlite, and Linux LTP)."
+          git push --force origin "${GITHUB_SHA}:refs/tags/${TAG}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --target "$GITHUB_SHA" --notes "$NOTES" --prerelease --latest=false
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "fstest (latest)" --notes "$NOTES" --prerelease --latest=false
+          fi
+          gh release upload "$TAG" \
+            dist/fstest-linux-amd64 dist/fstest-linux-amd64.sha256 \
+            dist/fstest-linux-arm64 dist/fstest-linux-arm64.sha256 \
+            dist/fstest-darwin-arm64 dist/fstest-darwin-arm64.sha256 \
+            dist/fstest-checksums.txt dist/fstest-version \
+            --clobber
+
+      - name: Publish versioned release
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          if [ -n "$INPUT_TAG" ]; then
+            git push --force origin "${GITHUB_SHA}:refs/tags/${TAG}"
+          fi
+          NOTES="Self-contained single-binary release of fstest ${TAG} (commit ${GITHUB_SHA::7}; static musl on Linux x86_64/arm64 + macOS arm64, with all external test suites embedded)."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --target "$GITHUB_SHA" --title "fstest ${TAG}" --notes "$NOTES" --prerelease=false --latest=true
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "fstest ${TAG}" --notes "$NOTES" --latest=true
+          fi
+          gh release upload "$TAG" \
+            dist/fstest-linux-amd64 dist/fstest-linux-amd64.sha256 \
+            dist/fstest-linux-arm64 dist/fstest-linux-arm64.sha256 \
+            dist/fstest-darwin-arm64 dist/fstest-darwin-arm64.sha256 \
+            dist/fstest-checksums.txt dist/fstest-version \
+            --clobber
